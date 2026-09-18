@@ -1,0 +1,448 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  Attachment,
+  ChangeNote,
+  CommentNote,
+  EMPTY_ATTACHMENT,
+  emptyMarkup,
+} from "../../shared/attachment";
+import { CommittedFile } from "../../shared/fileSource";
+import { NewMessage } from "../../shared/history";
+import { ChatMessage } from "../../sidecar/types";
+import { MAX_TOOL_ROUNDS, UNLIMITED_TOOL_ROUNDS, toolRoundLimitNotice } from "../../shared/tools";
+import { DEFAULT_SETTINGS } from "../settings";
+import { runTurn } from "./runTurn";
+
+const chatStream = vi.hoisted(() => vi.fn());
+const executeToolCall = vi.hoisted(() => vi.fn());
+
+vi.mock("../api", () => ({ chatStream }));
+vi.mock("./execute", () => ({ executeToolCall, beginToolTurn: vi.fn() }));
+
+type ChatBody = { messages: ChatMessage[]; tools?: unknown[] };
+
+function completion(partial: Partial<Awaited<ReturnType<typeof chatStream>>> = {}) {
+  return {
+    content: "",
+    reasoningContent: "",
+    toolCalls: [],
+    finishReason: "stop",
+    usage: null,
+    ...partial,
+  };
+}
+
+function toolCall(id: string, name: string, args = "{}") {
+  return { id, type: "function" as const, function: { name, arguments: args } };
+}
+
+const settings = {
+  ...DEFAULT_SETTINGS,
+  llmBaseUrl: "http://x/v1",
+  llmApiKey: "k",
+  searxngUrl: "http://s",
+};
+
+function attach(focus = "", body = ""): Attachment {
+  return {
+    ...EMPTY_ATTACHMENT,
+    scope: body ? "document" : focus ? "selection" : "none",
+    document: body,
+    paragraphs: body ? body.split("\n").length : 0,
+    focus,
+  };
+}
+
+function toolNames(callIndex = 0): string[] {
+  const tools = (chatStream.mock.calls[callIndex][0] as ChatBody).tools as {
+    function: { name: string };
+  }[];
+  return tools.map((tool) => tool.function.name);
+}
+
+async function run(instruction: string, selection = "") {
+  const sent: NewMessage[] = [];
+  const result = await runTurn({
+    settings,
+    instruction,
+    attachment: attach(selection),
+    history: [],
+    signal: new AbortController().signal,
+    onMessage: (message) => {
+      sent.push(message);
+    },
+  });
+  return { sent, result };
+}
+
+beforeEach(() => {
+  chatStream.mockReset();
+  executeToolCall.mockReset();
+  executeToolCall.mockResolvedValue({ content: "完了", ok: true });
+  chatStream.mockImplementation(
+    async (
+      _body,
+      opts?: { onDelta?: (s: { content: string; reasoningContent: string }) => void }
+    ) => {
+      const result = completion({ content: "はい。" });
+      opts?.onDelta?.({ content: result.content, reasoningContent: result.reasoningContent });
+      return result;
+    }
+  );
+});
+
+describe("runTurn", () => {
+  it("attaches the selection to the user message and reports usage", async () => {
+    chatStream.mockResolvedValue(
+      completion({
+        content: "整えました。",
+        usage: { promptTokens: 50, completionTokens: 10, totalTokens: 60, reasoningTokens: 4 },
+      })
+    );
+
+    const { sent, result } = await run("整えて", "甲は乙に委託する。");
+
+    expect(sent[0].role).toBe("user");
+    expect(sent[0].content).toContain("整えて");
+    expect(sent[0].content).toContain("甲は乙に委託する。");
+    expect(sent[1]).toMatchObject({ role: "assistant", content: "整えました。" });
+    expect(result.usage?.totalTokens).toBe(60);
+    expect(chatStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("omits the selection block when nothing is selected", async () => {
+    chatStream.mockResolvedValue(completion({ content: "はい。" }));
+    const { sent } = await run("契約の骨子を作って");
+    expect(sent[0].content).toBe("契約の骨子を作って");
+  });
+
+  it("sends the whole body, marked off from the instruction", async () => {
+    chatStream.mockResolvedValue(completion({ content: "読みました。" }));
+    await runTurn({
+      settings,
+      instruction: "全体を点検して",
+      attachment: attach("第2条（報酬）", "第1条（目的）\n第2条（報酬）"),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+    });
+
+    const user = (chatStream.mock.calls[0][0] as ChatBody).messages.at(-1);
+    expect(user?.content).toContain("--- 文書全体 ---");
+    expect(user?.content).toContain("第1条（目的）");
+    expect(user?.content).toContain("--- 選択範囲 ---");
+  });
+
+  it("stores a note instead of the body, since the body is read again next turn", async () => {
+    chatStream.mockResolvedValue(completion({ content: "読みました。" }));
+    const sent: NewMessage[] = [];
+    await runTurn({
+      settings,
+      instruction: "全体を点検して",
+      attachment: attach("", "第1条（目的）\n第2条（報酬）"),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: (message) => {
+        sent.push(message);
+      },
+    });
+
+    expect(sent[0].content).toContain("2 段落");
+    expect(sent[0].content).not.toContain("第1条（目的）");
+  });
+
+  it("holds back the selection tools when nothing is selected", async () => {
+    chatStream.mockResolvedValue(completion({ content: "はい。" }));
+    await run("第3条を短くして");
+
+    const names = toolNames();
+    expect(names).not.toContain("get_selection");
+    expect(names).not.toContain("replace_selection");
+    // The way to point at text without a selection.
+    expect(names).toContain("replace_quote");
+    expect(names).toContain("insert_blocks");
+  });
+
+  it("requires a quote from the comment tool when there is no selection to fall back on", async () => {
+    chatStream.mockResolvedValue(completion({ content: "はい。" }));
+    await run("点検して");
+
+    const tools = (chatStream.mock.calls[0][0] as ChatBody).tools as {
+      function: { name: string; parameters: { required?: string[] } };
+    }[];
+    const comment = tools.find((tool) => tool.function.name === "insert_comment");
+    expect(comment?.function.parameters.required).toEqual(["comment", "quote"]);
+  });
+
+  it("offers the selection tools once something is selected", async () => {
+    chatStream.mockResolvedValue(completion({ content: "はい。" }));
+    await run("これを短くして", "甲は乙に委託する。");
+
+    const names = toolNames();
+    expect(names).toContain("get_selection");
+    expect(names).toContain("replace_selection");
+  });
+
+  it("runs tool calls, feeds the results back, then answers", async () => {
+    chatStream
+      .mockResolvedValueOnce(
+        completion({
+          reasoningContent: "どこを直すか考える",
+          toolCalls: [toolCall("c1", "insert_comment"), toolCall("c2", "insert_comment")],
+          finishReason: "tool_calls",
+        })
+      )
+      .mockResolvedValueOnce(completion({ content: "コメントを 2 件付けました。" }));
+
+    const { sent } = await run("点検して", "本文");
+
+    expect(executeToolCall).toHaveBeenCalledTimes(2);
+    expect(sent.map((m) => m.role)).toEqual(["user", "assistant", "tool", "tool", "assistant"]);
+    expect(sent[1].reasoningContent).toBe("どこを直すか考える");
+    expect(sent[2].toolCallId).toBe("c1");
+
+    const second = chatStream.mock.calls[1][0] as ChatBody;
+    const assistantTurn = second.messages.find((m) => m.role === "assistant");
+    expect(assistantTurn?.tool_calls).toHaveLength(2);
+    // Qwen wants its own reasoning back alongside the tool replies.
+    expect(assistantTurn?.reasoning_content).toBe("どこを直すか考える");
+    expect(second.messages.filter((m) => m.role === "tool")).toHaveLength(2);
+  });
+
+  it("stops after the tool-round budget and tells the user, without a no-tools closing call", async () => {
+    chatStream.mockResolvedValue(
+      completion({ toolCalls: [toolCall("c1", "insert_comment")], finishReason: "tool_calls" })
+    );
+
+    const { sent } = await run("延々と調べて");
+
+    expect(chatStream).toHaveBeenCalledTimes(MAX_TOOL_ROUNDS);
+    expect((chatStream.mock.calls[MAX_TOOL_ROUNDS - 1][0] as ChatBody).tools).toBeDefined();
+    const assistants = sent.filter((m) => m.role === "assistant");
+    expect(assistants).toHaveLength(MAX_TOOL_ROUNDS + 1);
+    expect(assistants.at(-1)?.content).toBe(toolRoundLimitNotice(MAX_TOOL_ROUNDS));
+  });
+
+  it("honours a lower tool-round cap from settings", async () => {
+    chatStream.mockResolvedValue(
+      completion({ toolCalls: [toolCall("c1", "insert_comment")], finishReason: "tool_calls" })
+    );
+
+    const sent: NewMessage[] = [];
+    await runTurn({
+      settings: { ...settings, maxToolRounds: 2 },
+      instruction: "点検して",
+      attachment: EMPTY_ATTACHMENT,
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: (message) => {
+        sent.push(message);
+      },
+    });
+
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    expect(sent.filter((m) => m.role === "assistant").at(-1)?.content).toBe(
+      toolRoundLimitNotice(2)
+    );
+  });
+
+  it("keeps tools when the round cap is unlimited", async () => {
+    chatStream
+      .mockResolvedValueOnce(
+        completion({ toolCalls: [toolCall("c1", "insert_comment")], finishReason: "tool_calls" })
+      )
+      .mockResolvedValueOnce(
+        completion({ toolCalls: [toolCall("c2", "insert_comment")], finishReason: "tool_calls" })
+      )
+      .mockResolvedValueOnce(
+        completion({ toolCalls: [toolCall("c3", "insert_comment")], finishReason: "tool_calls" })
+      )
+      .mockResolvedValueOnce(completion({ content: "コメントを付けました。" }));
+
+    const sent: NewMessage[] = [];
+    await runTurn({
+      settings: { ...settings, maxToolRounds: UNLIMITED_TOOL_ROUNDS },
+      instruction: "点検して",
+      attachment: attach("本文"),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: (message) => {
+        sent.push(message);
+      },
+    });
+
+    expect(chatStream).toHaveBeenCalledTimes(4);
+    expect(chatStream.mock.calls.every((call) => (call[0] as ChatBody).tools)).toBe(true);
+    expect(sent.filter((m) => m.role === "assistant").at(-1)?.content).toBe(
+      "コメントを付けました。"
+    );
+    expect(sent.some((m) => m.content.includes("上限"))).toBe(false);
+  });
+
+  it("retries once without tools when the server rejects them", async () => {
+    chatStream
+      .mockRejectedValueOnce(new Error("MTPLX が 400 を返しました。tools is not supported"))
+      .mockResolvedValueOnce(completion({ content: "ツール無しで答えます。" }));
+
+    const { sent } = await run("点検して");
+
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    expect((chatStream.mock.calls[1][0] as ChatBody).tools).toBeUndefined();
+    expect(sent[1].content).toBe("ツール無しで答えます。");
+  });
+
+  it("passes other failures through", async () => {
+    chatStream.mockRejectedValue(new Error("MTPLX に接続できませんでした。"));
+    await expect(run("点検して")).rejects.toThrow(/接続できません/);
+  });
+
+  it("does not offer search tools when both providers are unset", async () => {
+    chatStream.mockResolvedValue(completion({ content: "はい。" }));
+    await runTurn({
+      settings: { ...settings, searxngUrl: "", argosBaseUrl: "" },
+      instruction: "調べて",
+      attachment: EMPTY_ATTACHMENT,
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+    });
+
+    const names = toolNames();
+    expect(names).not.toContain("search");
+    expect(names).not.toContain("search_index");
+    expect(names).not.toContain("insert_citation");
+  });
+
+  it("offers search_index and keeps the selected folders in the system prompt", async () => {
+    chatStream
+      .mockResolvedValueOnce(
+        completion({
+          toolCalls: [toolCall("c1", "search_index", '{"q":"民法"}')],
+          finishReason: "tool_calls",
+        })
+      )
+      .mockResolvedValueOnce(completion({ content: "見つかりました。" }));
+
+    await runTurn({
+      settings: { ...settings, searxngUrl: "", argosBaseUrl: "http://127.0.0.1:17890" },
+      instruction: "契約を探して",
+      attachment: EMPTY_ATTACHMENT,
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+      argosPathPrefixes: ["C:\\案件A"],
+    });
+
+    const first = chatStream.mock.calls[0][0] as ChatBody;
+    const names = toolNames();
+    expect(names).toContain("search_index");
+    expect(names).not.toContain("search");
+    expect(first.messages[0].content).toContain("C:\\案件A");
+    expect(executeToolCall).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      { argosPathPrefixes: ["C:\\案件A"] }
+    );
+  });
+
+  it("clears then reports live deltas for the current round", async () => {
+    const deltas: { content: string; reasoningContent: string }[] = [];
+    chatStream.mockImplementation(
+      async (
+        _body,
+        opts?: { onDelta?: (s: { content: string; reasoningContent: string }) => void }
+      ) => {
+        opts?.onDelta?.({ content: "こ", reasoningContent: "考" });
+        opts?.onDelta?.({ content: "こんにちは", reasoningContent: "考える" });
+        return completion({ content: "こんにちは", reasoningContent: "考える" });
+      }
+    );
+    await runTurn({
+      settings,
+      instruction: "挨拶して",
+      attachment: EMPTY_ATTACHMENT,
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+      onDelta: (snapshot) => deltas.push(snapshot),
+    });
+    expect(deltas[0]).toEqual({ content: "", reasoningContent: "" });
+    expect(deltas.at(-1)).toEqual({ content: "こんにちは", reasoningContent: "考える" });
+  });
+});
+
+function attachedFile(name: string, body: string): CommittedFile {
+  return {
+    id: name,
+    name,
+    origin: "text",
+    body,
+    comments: emptyMarkup<CommentNote>(),
+    changes: emptyMarkup<ChangeNote>(),
+    truncated: false,
+    size: body.length,
+    mtime: 1,
+  };
+}
+
+describe("runTurn with attached files", () => {
+  async function runWithFiles(files: CommittedFile[], over: Partial<typeof settings> = {}) {
+    const sent: NewMessage[] = [];
+    await runTurn({
+      settings: { ...settings, ...over },
+      instruction: "この資料を読んで",
+      attachment: EMPTY_ATTACHMENT,
+      files,
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: (message) => {
+        sent.push(message);
+      },
+    });
+    return { sent, body: chatStream.mock.calls[0][0] as ChatBody };
+  }
+
+  it("sends the text to the model and only a stub to the transcript", async () => {
+    const { sent, body } = await runWithFiles([attachedFile("覚書.pdf", "第1条 本覚書は…")]);
+    const asked = body.messages.at(-1)?.content || "";
+    expect(asked).toContain("第1条 本覚書は…");
+    expect(sent[0].content).toContain("覚書.pdf");
+    expect(sent[0].content).not.toContain("第1条 本覚書は…");
+  });
+
+  it("explains how to treat the material only when some rode along", async () => {
+    const { body } = await runWithFiles([attachedFile("覚書.pdf", "本文")]);
+    expect(body.messages[0].content).toContain("--- 添付ファイル ---");
+
+    chatStream.mockClear();
+    const bare = await runWithFiles([]);
+    expect(bare.body.messages[0].content).not.toContain("--- 添付ファイル ---");
+    expect(bare.sent[0].content).toBe("この資料を読んで");
+  });
+
+  /*
+   * The files sit in the current message, which `dropOldest` never drops, so a
+   * window too narrow to hold them has to be handled before the request goes.
+   */
+  it("cuts the text to the window rather than sending it over the limit", async () => {
+    const long = attachedFile("長い.txt", "あ".repeat(50_000));
+    const { sent, body } = await runWithFiles([long], { contextLimit: 4_096 });
+    const asked = body.messages.at(-1)?.content || "";
+    expect(asked.length).toBeLessThan(6_000);
+    expect(asked).toContain("--- 添付ファイル ---");
+    // The transcript records what actually rode along, not what was read.
+    expect(sent[0].content).toContain("長いので途中まで");
+  });
+
+  it("shares a tight budget between files instead of starving the later ones", async () => {
+    const { body } = await runWithFiles(
+      [attachedFile("小.txt", "い".repeat(50)), attachedFile("大.txt", "う".repeat(50_000))],
+      { contextLimit: 4_096 }
+    );
+    const asked = body.messages.at(-1)?.content || "";
+    expect(asked).toContain("[1] 小.txt");
+    expect(asked).toContain("[2] 大.txt");
+    expect(asked).toContain("い".repeat(50));
+  });
+});

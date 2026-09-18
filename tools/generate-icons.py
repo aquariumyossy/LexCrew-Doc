@@ -12,7 +12,8 @@ MASTER = 512
 GLYPH_RATIO = 0.70
 # Explorer picks 16 for details view, 20/24 at higher DPI, 32/48 for tiles.
 ICO_SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256]
-PNG_SIZES = [16, 32, 64, 80, 128, 256]
+# Word ribbon + IconUrl / HighResolutionIconUrl in manifest.xml.
+PNG_SIZES = [16, 32, 64, 80]
 
 
 def stroke_for(size: int) -> int:
@@ -45,16 +46,8 @@ def frame(size: int) -> Image.Image:
 
 
 def main() -> None:
-    plain = MASTERS[0]
-    plain.save(ASSETS / "guri-logo.png")
-    flat = Image.new("RGBA", plain.size, (255, 255, 255, 255))
-    flat.alpha_composite(plain)
-    flat.convert("RGB").save(ASSETS / "logo-filled.png")
-
     for size in PNG_SIZES:
-        img = frame(size)
-        img.save(ASSETS / f"icon-{size}.png")
-        img.save(ASSETS / f"guri-{size}.png")
+        frame(size).save(ASSETS / f"guri-{size}.png")
 
     # Pillow skips requested sizes larger than the base image, so save from the
     # largest frame. Explorer's small-icon path cannot read PNG-compressed ICO
@@ -70,7 +63,6 @@ def main() -> None:
     )
     for name, size in (
         ("32x32.png", 32),
-        ("64x64.png", 64),
         ("128x128.png", 128),
         ("128x128@2x.png", 256),
         ("icon.png", 512),

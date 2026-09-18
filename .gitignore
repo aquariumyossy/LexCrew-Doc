@@ -11,3 +11,4 @@ coverage/
 .env.*
 *.local
 agent-tools/
+tmp-*.png

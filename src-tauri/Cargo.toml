@@ -1,9 +1,9 @@
 [package]
 name = "guri"
-version = "0.1.1"
+version = "1.0.0"
 description = "GURI Word add-in sidecar"
-authors = ["GURI"]
-license = "MIT"
+authors = ["弁護士　吉田秀平"]
+license = "Elastic-2.0"
 edition = "2021"
 
 [lib]

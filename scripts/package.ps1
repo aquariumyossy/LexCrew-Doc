@@ -22,10 +22,10 @@ Check "npm run dist"
 $nsis = Join-Path $root "src-tauri\target\release\bundle\nsis"
 $found = @()
 if (Test-Path $nsis) {
-  $found = @(Get-ChildItem -Path $nsis -Filter "*-setup.exe" -File)
+  $found = @(Get-ChildItem -Path $nsis -Filter "*-setup.exe" -File | Where-Object { $_.Name -like "*_${version}_*" })
 }
 if ($found.Count -ne 1) {
-  throw "セットアップ exe は 1 つである必要があります（$nsis に $($found.Count) 個）。"
+  throw "セットアップ exe は version $version のものが 1 つである必要があります（$nsis に $($found.Count) 個）。"
 }
 
 $release = Join-Path $root "release"

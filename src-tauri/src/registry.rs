@@ -79,31 +79,6 @@ pub fn cleanup_electron_run_value() {
     }
 }
 
-pub fn installer_wants_autostart() -> bool {
-    #[cfg(not(windows))]
-    {
-        false
-    }
-    #[cfg(windows)]
-    {
-        if let Ok(key) = hkcu().open_subkey("Software\\GURI") {
-            let value: Result<String, _> = key.get_value("StartAtLogin");
-            return matches!(value.as_deref(), Ok("1"));
-        }
-        false
-    }
-}
-
-pub fn clear_installer_autostart_flag() {
-    #[cfg(windows)]
-    {
-        use winreg::enums::*;
-        if let Ok(key) = hkcu().open_subkey_with_flags("Software\\GURI", KEY_SET_VALUE) {
-            let _ = key.delete_value("StartAtLogin");
-        }
-    }
-}
-
 pub fn delete_guri_software_key() {
     #[cfg(windows)]
     {

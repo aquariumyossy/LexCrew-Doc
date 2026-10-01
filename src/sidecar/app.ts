@@ -1,3 +1,4 @@
+import path from "path";
 import express, { NextFunction, Request, Response } from "express";
 import { DEFAULT_MODEL, DEFAULT_TIMEOUT_MS, OCR_BODY_LIMIT_BYTES } from "../shared/constants";
 import { parseCommittedFiles } from "../shared/fileSource";
@@ -8,6 +9,17 @@ import { checkArgos, listArgosScopes, searchArgos } from "./argos";
 import { checkLlmHealth, chatCompletions, pipeChatStream, readImageText } from "./llm";
 import { logError, logInfo } from "./logger";
 import { checkSearxng, getSearchProvider } from "./search";
+import {
+  adoptConnection,
+  connectionFromBody,
+  connectionPath,
+  connectionPayload,
+  Connection,
+  readConnection,
+  resolveConnection,
+  saveConnection,
+  sweepConnectionTemps,
+} from "./connection";
 import {
   ArgosScopesRequestBody,
   ArgosSearchRequestBody,
@@ -31,7 +43,21 @@ function sendError(res: Response, status: number, error: string, hint?: string):
   res.status(status).json(hint ? { error, hint } : { error });
 }
 
-export function createApp(): express.Express {
+function textError(error: unknown): string {
+  return error instanceof Error ? error.message : "失敗しました。";
+}
+
+function activeConnection(file: string, body: unknown): Connection {
+  const record =
+    body && typeof body === "object"
+      ? (body as { llmBaseUrl?: unknown; llmApiKey?: unknown; searxngUrl?: unknown })
+      : {};
+  return resolveConnection(readConnection(file, (line) => logInfo(line)), record);
+}
+
+export function createApp(options: { connectionFile?: string } = {}): express.Express {
+  const connectionFile = options.connectionFile ?? connectionPath();
+  sweepConnectionTemps(path.dirname(connectionFile));
   const app = express();
   app.disable("x-powered-by");
 
@@ -52,10 +78,11 @@ export function createApp(): express.Express {
         return;
       }
       logInfo("POST /api/ocr", { status: "start" });
+      const connection = activeConnection(connectionFile, body);
       try {
         const text = await readImageText({
-          baseUrl: body.llmBaseUrl || "",
-          apiKey: body.llmApiKey || "",
+          baseUrl: connection.llmBaseUrl,
+          apiKey: connection.llmApiKey,
           model: body.model || DEFAULT_MODEL,
           image,
           timeoutMs: body.timeoutMs || DEFAULT_TIMEOUT_MS,
@@ -83,18 +110,41 @@ export function createApp(): express.Express {
   app.use(express.json({ limit: "2mb" }));
 
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true, service: "GURI" });
+    res.json({ ok: true, service: "LexCrew Doc" });
+  });
+
+  app.get("/api/connection", (_req, res) => {
+    res.json(connectionPayload(readConnection(connectionFile, (line) => logInfo(line))));
+  });
+
+  app.post("/api/connection", (req, res) => {
+    try {
+      res.json(connectionPayload(adoptConnection(connectionFile, connectionFromBody(req.body), (line) => logInfo(line))));
+    } catch (error) {
+      sendError(res, 500, textError(error));
+    }
+  });
+
+  app.put("/api/connection", (req, res) => {
+    try {
+      const next = connectionFromBody(req.body);
+      saveConnection(connectionFile, next);
+      res.json({ kind: "ready", ...next });
+    } catch (error) {
+      sendError(res, 500, textError(error));
+    }
   });
 
   app.post("/api/health", async (req: Request<unknown, unknown, HealthRequestBody>, res) => {
     const signal = clientSignal(res);
     const body = req.body || {};
+    const connection = activeConnection(connectionFile, body);
     logInfo("POST /api/health", { status: "start" });
     try {
-      const llm = await checkLlmHealth(body.llmBaseUrl || "", body.llmApiKey || "", signal);
+      const llm = await checkLlmHealth(connection.llmBaseUrl, connection.llmApiKey, signal);
       let searxng: { ok: boolean; error?: string } | undefined;
-      if ((body.searxngUrl || "").trim()) {
-        searxng = await checkSearxng(body.searxngUrl || "", signal);
+      if (connection.searxngUrl.trim()) {
+        searxng = await checkSearxng(connection.searxngUrl, signal);
       }
       let argos: { ok: boolean; error?: string } | undefined;
       if ((body.argosBaseUrl || "").trim()) {
@@ -121,9 +171,10 @@ export function createApp(): express.Express {
   app.post("/api/chat", async (req: Request<unknown, unknown, ChatRequestBody>, res) => {
     const signal = clientSignal(res);
     const body = req.body || {};
+    const connection = activeConnection(connectionFile, body);
     const call = {
-      baseUrl: body.llmBaseUrl || "",
-      apiKey: body.llmApiKey || "",
+      baseUrl: connection.llmBaseUrl,
+      apiKey: connection.llmApiKey,
       model: body.model || DEFAULT_MODEL,
       messages: body.messages || [],
       tools: body.tools,
@@ -162,8 +213,9 @@ export function createApp(): express.Express {
   app.post("/api/search", async (req: Request<unknown, unknown, SearchRequestBody>, res) => {
     const signal = clientSignal(res);
     const body = req.body || {};
+    const connection = activeConnection(connectionFile, body);
     try {
-      const results = await getSearchProvider().search(body.q || "", body.searxngUrl || "", signal);
+      const results = await getSearchProvider().search(body.q || "", connection.searxngUrl, signal);
       res.json({ provider: "searxng", results });
     } catch (error) {
       if (signal.aborted) {

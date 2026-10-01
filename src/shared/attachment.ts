@@ -59,6 +59,14 @@ export type Attachment = {
   markup: boolean;
   comments: MarkupList<CommentNote>;
   changes: MarkupList<ChangeNote>;
+  /** True when at least one attached paragraph carried a Word list mark. */
+  listMarks: boolean;
+  /** True when getReviewedText was unavailable and paragraph.text was shown instead. */
+  reviewedFallback?: boolean;
+  /** True when insert/delete/comments are inlined in the body (phase 2). */
+  inlineMarkup?: boolean;
+  /** Comments shown in the body as 〔注…〕 when inline markup is on. */
+  inlineCommentCount?: number;
 };
 
 export function emptyMarkup<T>(): MarkupList<T> {
@@ -97,6 +105,7 @@ export const EMPTY_ATTACHMENT: Attachment = {
   markup: false,
   comments: emptyMarkup(),
   changes: emptyMarkup(),
+  listMarks: false,
 };
 
 /**

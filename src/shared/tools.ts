@@ -1,4 +1,7 @@
 import { BLOCK_TYPES, DraftBlock, Severity, normalizeBlock } from "./blocks";
+import { ListStyle, isListStyle, listStyleEnum, listStyleToolDescription } from "./listStyles";
+
+export type { ListStyle } from "./listStyles";
 
 export const TOOL_SEARCH = "search";
 export const TOOL_SEARCH_INDEX = "search_index";
@@ -6,10 +9,13 @@ export const TOOL_GET_SELECTION = "get_selection";
 export const TOOL_REPLACE_SELECTION = "replace_selection";
 export const TOOL_REPLACE_QUOTE = "replace_quote";
 export const TOOL_INSERT_BLOCKS = "insert_blocks";
+export const TOOL_INSERT_BLANK_BEFORE = "insert_blank_before";
 export const TOOL_INSERT_COMMENT = "insert_comment";
 export const TOOL_INSERT_CITATION = "insert_citation";
 export const TOOL_FORMAT_TEXT = "format_text";
 export const TOOL_FORMAT_PARAGRAPH = "format_paragraph";
+export const TOOL_FORMAT_LIST = "format_list";
+export const TOOL_SET_OUTLINE = "set_outline_level";
 
 /** Default rounds of tool calls before the task pane stops and tells the user. */
 export const MAX_TOOL_ROUNDS = 8;
@@ -72,10 +78,21 @@ export type SearchArgs = { q: string };
 export type SearchIndexArgs = { q: string };
 export type GetSelectionArgs = Record<string, never>;
 export type ReplaceSelectionArgs = { text: string };
-export type ReplaceQuoteArgs = { quote: string; text: string };
+export type ReplaceQuoteArgs = { quote: string; text: string; paragraph?: number };
 export type InsertAtArg = "cursor" | "continue" | "end";
-export type InsertBlocksArgs = { blocks: DraftBlock[]; at?: InsertAtArg; quote?: string };
-export type InsertCommentArgs = { comment: string; quote: string; severity: Severity };
+export type InsertBlocksArgs = {
+  blocks: DraftBlock[];
+  at?: InsertAtArg;
+  quote?: string;
+  paragraph?: number;
+};
+export type InsertBlankBeforeArgs = { paragraphs: number[] };
+export type InsertCommentArgs = {
+  comment: string;
+  quote: string;
+  severity: Severity;
+  paragraph?: number;
+};
 export type InsertCitationArgs = {
   title: string;
   url: string;
@@ -84,6 +101,7 @@ export type InsertCitationArgs = {
 };
 export type FormatTextArgs = {
   quote: string;
+  paragraph?: number;
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
@@ -94,11 +112,37 @@ export type FormatTextArgs = {
 };
 export type FormatParagraphArgs = {
   quote: string;
+  paragraph?: number;
   alignment?: ParagraphAlignmentArg;
   firstLineIndent?: number;
   leftIndent?: number;
+  spaceBefore?: number;
   spaceAfter?: number;
   lineSpacing?: number;
+};
+
+export type ListAction = "apply" | "remove" | "restart";
+
+export type FormatListArgs = {
+  action: ListAction;
+  quote?: string;
+  paragraph?: number;
+  through?: number;
+  style?: ListStyle;
+  level?: number;
+  /** Begin a fresh list at 1 instead of joining the numbering above. */
+  start?: boolean;
+};
+
+export type OutlineAction = "set" | "clear";
+
+export type SetOutlineArgs = {
+  action: OutlineAction;
+  quote?: string;
+  paragraph?: number;
+  through?: number;
+  /** 1 to 9 when action is set. Absent when action is clear. */
+  level?: number;
 };
 
 export type ToolInvocation =
@@ -108,18 +152,64 @@ export type ToolInvocation =
   | { name: typeof TOOL_REPLACE_SELECTION; args: ReplaceSelectionArgs }
   | { name: typeof TOOL_REPLACE_QUOTE; args: ReplaceQuoteArgs }
   | { name: typeof TOOL_INSERT_BLOCKS; args: InsertBlocksArgs }
+  | { name: typeof TOOL_INSERT_BLANK_BEFORE; args: InsertBlankBeforeArgs }
   | { name: typeof TOOL_INSERT_COMMENT; args: InsertCommentArgs }
   | { name: typeof TOOL_INSERT_CITATION; args: InsertCitationArgs }
   | { name: typeof TOOL_FORMAT_TEXT; args: FormatTextArgs }
-  | { name: typeof TOOL_FORMAT_PARAGRAPH; args: FormatParagraphArgs };
+  | { name: typeof TOOL_FORMAT_PARAGRAPH; args: FormatParagraphArgs }
+  | { name: typeof TOOL_FORMAT_LIST; args: FormatListArgs }
+  | { name: typeof TOOL_SET_OUTLINE; args: SetOutlineArgs };
 
 export type ParsedTool = { ok: true; call: ToolInvocation } | { ok: false; error: string };
 
-const QUOTE_HINT = "対象にする本文の短い引用。省略すると選択範囲全体が対象。";
-const QUOTE_HINT_REQUIRED = "対象にする本文の短い引用。文書内で 1 か所だけに当たる引用にする。";
+const PARAGRAPH_HINT =
+  "対象の段落番号。添付された本文の行頭、または insert_blocks の結果にある [12] の数字をそのまま渡す。";
+const PARAGRAPH_HINT_INSERTED =
+  "対象の段落番号。このターンの insert_blocks の結果にある [12] の数字をそのまま渡す。それ以外の段落に番号は無いので quote で指す。";
+const QUOTE_HINT_NARROW =
+  "段落の中で対象をさらに絞る引用（任意）。添付された本文から字句どおりに写す。省略すると段落全体が対象。";
+const QUOTE_HINT_SELECTION = "対象にする本文の引用。省略すると選択範囲全体が対象。";
+const QUOTE_HINT_ONLY =
+  "対象にする本文の引用。添付された本文から字句どおりに写し、文書内で 1 か所だけに当たる長さにする。";
 
 function stringParam(description: string): Record<string, unknown> {
   return { type: "string", description };
+}
+
+/** How a tool is told where to work, which depends on what the turn carries. */
+type TargetHints = { properties: Record<string, unknown>; required: string[] };
+
+/**
+ * With a numbered body attached, a paragraph number is always available and is
+ * the address the model can copy without retyping the document, so it is asked
+ * for instead of a quote. `paragraph` is not offered at all when the body was not
+ * numbered: an address space the model was never given invites invented numbers.
+ * Once an insert has handed out numbers for its new paragraphs (`inserted`),
+ * those are offered too, beside the quote the rest of the document still needs.
+ */
+function targetHints(selection: boolean, numbered: boolean, inserted = false): TargetHints {
+  if (numbered) {
+    return {
+      properties: {
+        paragraph: { type: "number", description: PARAGRAPH_HINT },
+        quote: stringParam(QUOTE_HINT_NARROW),
+      },
+      required: selection ? [] : ["paragraph"],
+    };
+  }
+  if (inserted) {
+    return {
+      properties: {
+        paragraph: { type: "number", description: PARAGRAPH_HINT_INSERTED },
+        quote: stringParam(selection ? QUOTE_HINT_SELECTION : QUOTE_HINT_ONLY),
+      },
+      required: [],
+    };
+  }
+  return {
+    properties: { quote: stringParam(selection ? QUOTE_HINT_SELECTION : QUOTE_HINT_ONLY) },
+    required: selection ? [] : ["quote"],
+  };
 }
 
 function searchTool(): ToolDefinition {
@@ -188,43 +278,49 @@ function replaceSelectionTool(): ToolDefinition {
   };
 }
 
-function replaceQuoteTool(): ToolDefinition {
+function replaceQuoteTool(target: TargetHints, numbered: boolean): ToolDefinition {
   return {
     type: "function",
     function: {
       name: TOOL_REPLACE_QUOTE,
       description:
         "本文の特定の文字列だけを置き換える。修正履歴に残る。書き換えの基本はこのツール。" +
-        "選択があればその中を先に探し、無ければ本文全体から探す。",
+        (numbered
+          ? "paragraph で段落を指し、quote でその段落の中の置き換える文字列を渡す。quote を省くと段落全体を置き換える。"
+          : "選択があればその中を先に探し、無ければ本文全体から探す。"),
       parameters: {
         type: "object",
-        properties: {
-          quote: stringParam(
-            "置き換える本文の引用。添付された本文どおりに書き、文書内で 1 か所だけに当たる長さにする。"
-          ),
-          text: stringParam("置換後の本文"),
-        },
-        required: ["quote", "text"],
+        properties: { ...target.properties, text: stringParam("置換後の本文") },
+        // Always points somewhere: replacing the selection is replace_selection's
+        // job, and doing it here by omission would be an unasked-for edit.
+        required: [...(numbered ? ["paragraph"] : ["quote"]), "text"],
       },
     },
   };
 }
 
-function insertBlocksTool(): ToolDefinition {
+function insertBlocksTool(numbered: boolean): ToolDefinition {
   return {
     type: "function",
     function: {
       name: TOOL_INSERT_BLOCKS,
       description:
         "構造付きの段落を挿入する。修正履歴に残る。" +
-        "決まった場所の後ろに入れるときは quote を使う。quote には入れたい位置の直前の段落から取った引用を入れる。" +
+        (numbered
+          ? "決まった場所の後ろに入れるときは paragraph に段落番号を渡す。その段落の直後に入る。" +
+            "「第13条の次に」なら第13条の最後の項の番号を渡す。paragraph があるときは quote と at を見ない。"
+          : "") +
+        "quote を使うときは、入れたい位置の直前の段落から取った引用を入れる。" +
         "「第13条の次に」なら第13条の最後の項を引用する。quote があるときは at を見ない。" +
         "at は挿入位置。cursor（既定）はいまのカーソルの直後、continue は直前に挿入した段落の続き、end は文書の末尾。" +
         "長い原稿を分割するときは 2 回目以降を continue にし、条の若い順に続きだけを足す。" +
         "前のやりとりの続きを書くときも continue を指定する。cursor へ繰り返し入れると順序が逆になる。" +
-        "使い分け: title は文書タイトル（中央・太字）、heading は「請求の趣旨」などの見出し、" +
+        "使い分け: title は文書タイトル（中央・太字）、heading は「請求の趣旨」などの太字の見出し（ナビゲーションには出ない。出すなら set_outline_level）、" +
         "body は本文（先頭字下げはアドインが付けるので全角空白を足さない）、clause は条（label に「第○条」）、" +
-        "item は項・号、center は日付など、right は当事者名など。表・罫線・余白は出さない。",
+        "item は項・号（直前がリストなら番号を継ぐ。番号そのものは本文に書かない）、" +
+        "center は日付など、right は当事者名など。表・罫線・余白は出さない。" +
+        "番号の付け外しと 1 からの振り直しは format_list。" +
+        "結果に、入れた段落の番号 [12] が返る。同じターンでその段落を指すときは、quote ではなくその番号を paragraph / through に渡す。",
       parameters: {
         type: "object",
         properties: {
@@ -241,6 +337,15 @@ function insertBlocksTool(): ToolDefinition {
               required: ["type", "text"],
             },
           },
+          ...(numbered
+            ? {
+                paragraph: {
+                  type: "number",
+                  description:
+                    "入れたい位置の直前の段落の番号。添付された本文の行頭にある [12] の数字。その段落の後ろに入る。",
+                },
+              }
+            : {}),
           quote: {
             type: "string",
             description:
@@ -259,7 +364,34 @@ function insertBlocksTool(): ToolDefinition {
   };
 }
 
-function insertCommentTool(selection: boolean): ToolDefinition {
+function insertBlankBeforeTool(): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_INSERT_BLANK_BEFORE,
+      description:
+        "指定した段落の直前に、空の段落を 1 つずつ入れる。修正履歴に残る。段落の途中では割れない。" +
+        "本文が「第N条」で始まる段落、自動番号が〔第N〕または〔第N条〕の段落を paragraphs にまとめて渡す。" +
+        "章・節・項・号と、文中の「民法第415条」は、利用者がそう言ったときだけ入れる。" +
+        "〔1.〕〔（１）〕〔ア〕は、利用者がそれらもと言ったときだけ入れる。" +
+        "直前がすでに空行なら足さない。同じ番号は 1 回だけ。空行自体には番号が付かない。",
+      parameters: {
+        type: "object",
+        required: ["paragraphs"],
+        properties: {
+          paragraphs: {
+            type: "array",
+            description:
+              "空行を直前に入れる段落の番号。添付された本文の行頭、または insert_blocks の結果にある [12] の数字。",
+            items: { type: "number" },
+          },
+        },
+      },
+    },
+  };
+}
+
+function insertCommentTool(target: TargetHints): ToolDefinition {
   return {
     type: "function",
     function: {
@@ -270,15 +402,17 @@ function insertCommentTool(selection: boolean): ToolDefinition {
       parameters: {
         type: "object",
         properties: {
-          comment: stringParam("コメント本文。判例・条文番号を書くときは未確認と明記する。"),
-          quote: stringParam(selection ? QUOTE_HINT : QUOTE_HINT_REQUIRED),
+          comment: stringParam(
+            "コメント本文。判例・条文番号を書くときは未確認と明記する。吹き出しは短いので、指摘そのものを先に書き、前置きは書かない。段落番号や [12] は書かない。"
+          ),
+          ...target.properties,
           severity: {
             type: "string",
             enum: ["high", "medium", "low"],
             description: "重要度。既定は medium。",
           },
         },
-        required: selection ? ["comment"] : ["comment", "quote"],
+        required: ["comment", ...target.required],
       },
     },
   };
@@ -310,7 +444,7 @@ function insertCitationTool(): ToolDefinition {
   };
 }
 
-function formatTextTool(selection: boolean): ToolDefinition {
+function formatTextTool(target: TargetHints): ToolDefinition {
   return {
     type: "function",
     function: {
@@ -320,9 +454,9 @@ function formatTextTool(selection: boolean): ToolDefinition {
         "指定しなかった項目は元のまま。",
       parameters: {
         type: "object",
-        ...(selection ? {} : { required: ["quote"] }),
+        ...(target.required.length ? { required: target.required } : {}),
         properties: {
-          quote: stringParam(selection ? QUOTE_HINT : QUOTE_HINT_REQUIRED),
+          ...target.properties,
           bold: { type: "boolean", description: "太字" },
           italic: { type: "boolean", description: "斜体" },
           underline: { type: "boolean", description: "下線" },
@@ -336,28 +470,107 @@ function formatTextTool(selection: boolean): ToolDefinition {
   };
 }
 
-function formatParagraphTool(selection: boolean): ToolDefinition {
+function formatParagraphTool(target: TargetHints): ToolDefinition {
   return {
     type: "function",
     function: {
       name: TOOL_FORMAT_PARAGRAPH,
       description:
         "段落書式を変える。本文は変えない。修正履歴に書式変更として残る。" +
-        "指定しなかった項目は元のまま。余白・罫線は変えられない。",
+        "指定しなかった項目は元のまま。余白・罫線は変えられない。" +
+        "行間を指定すると、対象段落は行グリッドへの合わせを外す（狭くしても効くようにするため）。" +
+        "段落前・段落後の間隔を指定すると、「自動」を外してその値にする。" +
+        "左インデントは折り返し（2行目以降）の位置。1行目は正の値で字下げ、負の値でぶら下げ。" +
+        "本文12ptの左3字・ぶら下げ2字は、左36、1行目-24。",
       parameters: {
         type: "object",
-        ...(selection ? {} : { required: ["quote"] }),
+        ...(target.required.length ? { required: target.required } : {}),
         properties: {
-          quote: stringParam(selection ? QUOTE_HINT : QUOTE_HINT_REQUIRED),
+          ...target.properties,
           alignment: {
             type: "string",
             enum: ["left", "center", "right", "justify"],
             description: "揃え",
           },
-          firstLineIndent: { type: "number", description: "1 行目の字下げ（pt）" },
-          leftIndent: { type: "number", description: "左インデント（pt）" },
-          spaceAfter: { type: "number", description: "段落後の間隔（pt）" },
+          firstLineIndent: {
+            type: "number",
+            description:
+              "1行目の位置（pt）。左インデントからの差分。正は字下げ（1行目が右へ）、負はぶら下げ（1行目が左へ出る）。本文12ptでぶら下げ2字なら -24。",
+          },
+          leftIndent: {
+            type: "number",
+            description:
+              "左インデント（pt）。2行目以降の位置。本文12ptで3字なら 36。ぶら下げのとき、1行目はここより firstLineIndent の分だけ左。",
+          },
+          spaceBefore: {
+            type: "number",
+            description: "段落前の間隔（pt）。0 で詰める。指定すると「自動」を外す。",
+          },
+          spaceAfter: {
+            type: "number",
+            description: "段落後の間隔（pt）。0 で詰める。指定すると「自動」を外す。",
+          },
           lineSpacing: { type: "number", description: "行間（pt）" },
+        },
+      },
+    },
+  };
+}
+
+function formatListTool(target: TargetHints): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_FORMAT_LIST,
+      description:
+        "Word の自動番号（リスト番号）を付ける・外す・その段落から 1 に振り直す。" +
+        "本文には番号を書き込まない。修正履歴に書式変更として残る。" +
+        "continue は直前の番号リストの続き。間に号の本文・空行・箇条書きがあっても、その前の項番号を継ぐ。" +
+        "直前にリストが無いとき continue は 1. から始める。" +
+        "continue は直前と同じ段のときに使う。段を変えるときは style を付けた apply にする。" +
+        listStyleToolDescription() +
+        "箇条書き（添付の 〔•〕）に style を付けると番号に変わる。" +
+        "既にある項番号の見た目は変えない。変えるときは先に外す。" +
+        "through で文書上の区間をまとめて対象にする。空段落は飛ばす。" +
+        "level は 0 始まり。項が 0、号が 1、目が 2。" +
+        "style を付けた apply は、既定で直前の番号リストに加わる。" +
+        "同じ level なら次の番号、深い level なら 1 から始まり、浅い level に戻ると内側は 1 に戻る。" +
+        "だから同じ条の項・号・目はこれだけで正しく並ぶ。" +
+        "条が変わって番号を 1 から始めるときだけ start を true にする。" +
+        "戻り値の番号は、付けたあとに Word が実際に表示している番号。書式の見本ではない。",
+      parameters: {
+        type: "object",
+        required: ["action", ...(target.required.length ? target.required : [])],
+        properties: {
+          action: {
+            type: "string",
+            enum: ["apply", "remove", "restart"],
+            description:
+              "apply は番号を付ける、remove は外す、restart はその段落から 1 に振り直す。",
+          },
+          ...target.properties,
+          through: {
+            type: "number",
+            description:
+              "apply / remove のとき、paragraph（無ければ quote の段落）からこの段落番号までの区間（この番号を含む）。" +
+              "番号は添付本文の行頭か insert_blocks の結果の [12]。restart には使わない。",
+          },
+          style: {
+            type: "string",
+            enum: listStyleEnum(),
+            description: "apply のとき。省略は continue。restart / remove には付けない。",
+          },
+          level: {
+            type: "number",
+            description: "リストの段（0 始まり）。省略時 continue は直前の段、新規は 0。",
+          },
+          start: {
+            type: "boolean",
+            description:
+              "style を付けた apply のとき。true でここから新しい番号を 1 で始める。" +
+              "付けるのは条の最初の段落（第 1 項）だけ。号・目や 2 つ目以降の項には付けない。" +
+              "号・目は level を深くするだけで 1 から始まる。省略すると直前の番号の続きになる。",
+          },
         },
       },
     },
@@ -371,15 +584,23 @@ export type ToolSetOptions = {
   argos?: boolean;
   /** 選択が無いターンでは、選択を対象にするツールを出さない。 */
   selection?: boolean;
+  /** 番号付きの本文を添付したターンでは、段落番号で場所を指させる。 */
+  numbered?: boolean;
+  /** 添付に番号は無いが、このターンの insert_blocks が入れた段落には番号がある。 */
+  insertedNumbers?: boolean;
 };
 
 /**
  * Tools sent with every chat request. What the document offers decides the list:
  * a tool that would edit an empty selection is left out rather than allowed to
- * fail, and `quote` becomes required where the selection used to stand in.
+ * fail, and a place to work is asked for in the terms this turn can supply —
+ * a paragraph number when the body was numbered, a quote when it was not.
  */
 export function buildTools(options: ToolSetOptions = {}): ToolDefinition[] {
   const selection = Boolean(options.selection);
+  const numbered = Boolean(options.numbered);
+  const inserted = !numbered && Boolean(options.insertedNumbers);
+  const target = targetHints(selection, numbered, inserted);
   const tools: ToolDefinition[] = [];
   if (options.search) {
     tools.push(searchTool());
@@ -394,12 +615,57 @@ export function buildTools(options: ToolSetOptions = {}): ToolDefinition[] {
     tools.push(getSelectionTool());
     tools.push(replaceSelectionTool());
   }
-  tools.push(replaceQuoteTool());
-  tools.push(insertBlocksTool());
-  tools.push(insertCommentTool(selection));
-  tools.push(formatTextTool(selection));
-  tools.push(formatParagraphTool(selection));
+  tools.push(replaceQuoteTool(target, numbered));
+  tools.push(insertBlocksTool(numbered || inserted));
+  if (numbered || inserted) {
+    tools.push(insertBlankBeforeTool());
+  }
+  tools.push(insertCommentTool(target));
+  tools.push(formatTextTool(target));
+  tools.push(formatParagraphTool(target));
+  tools.push(formatListTool(target));
+  tools.push(setOutlineTool(target));
   return tools;
+}
+
+function setOutlineTool(target: TargetHints): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_SET_OUTLINE,
+      description:
+        "ナビゲーションウィンドウの「見出し」に出す。段落のアウトラインレベルだけを変える。" +
+        "スタイル、フォント、太字、配置は変えない。修正履歴に書式変更として残る。" +
+        "set の level は 1 から 9。外すときは clear。clear に level は付けない。" +
+        "見出し一覧に出る文言は段落全体なので、条の見出しと本文が同じ段落に入っている場所には使わない。" +
+        "短い見出し段落だけを対象にする。" +
+        "組み込みの見出し 1 から見出し 9 が付いている段落は、スタイルがレベルを固定しているので変えない。" +
+        "その見出しから、次の同じかより上位のレベルまでが、この見出しの下に入る。" +
+        "through で区間をまとめて対象にする。空段落は飛ばす。",
+      parameters: {
+        type: "object",
+        required: ["action", ...(target.required.length ? target.required : [])],
+        properties: {
+          action: {
+            type: "string",
+            enum: ["set", "clear"],
+            description: "set は見出しにする。clear は外して本文に戻す。",
+          },
+          ...target.properties,
+          through: {
+            type: "number",
+            description:
+              "paragraph（無ければ quote の段落）からこの段落番号までの区間（この番号を含む）。" +
+              "番号は添付本文の行頭か insert_blocks の結果の [12]。",
+          },
+          level: {
+            type: "number",
+            description: "set のとき必須。1 から 9 の整数。clear には付けない。",
+          },
+        },
+      },
+    },
+  };
 }
 
 function asRecord(input: unknown): Record<string, unknown> | null {
@@ -433,6 +699,108 @@ function num(row: Record<string, unknown>, key: string): number | undefined {
 function optionalString(row: Record<string, unknown>, key: string): string | undefined {
   const value = row[key];
   return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * A paragraph number must be a real address. A zero, a fraction or a stray
+ * string would otherwise land on a paragraph the model did not mean.
+ */
+function paragraphNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 1) {
+    return value;
+  }
+  if (
+    typeof value === "string" &&
+    value.trim() &&
+    Number.isInteger(Number(value)) &&
+    Number(value) >= 1
+  ) {
+    return Number(value);
+  }
+  return undefined;
+}
+
+function paragraphListOf(row: Record<string, unknown>): number[] | { error: string } {
+  const raw = row.paragraphs;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { error: "paragraphs に、空行を入れる段落の番号を 1 つ以上入れてください。" };
+  }
+  const numbers: number[] = [];
+  for (const item of raw) {
+    const number = paragraphNumber(item);
+    if (number === undefined) {
+      return {
+        error: "paragraphs は添付された本文の行頭にある [番号] の数字（1 以上の整数）の配列にしてください。",
+      };
+    }
+    numbers.push(number);
+  }
+  return numbers;
+}
+
+function paragraphOf(row: Record<string, unknown>): number | undefined | { error: string } {
+  const raw = row.paragraph;
+  if (raw === undefined || raw === null || raw === "") {
+    return undefined;
+  }
+  const value = num(row, "paragraph");
+  if (value === undefined || !Number.isInteger(value) || value < 1) {
+    return {
+      error: "paragraph は添付された本文の行頭にある [番号] の数字（1 以上の整数）にしてください。",
+    };
+  }
+  return value;
+}
+
+function throughOf(row: Record<string, unknown>): number | undefined | { error: string } {
+  const raw = row.through;
+  if (raw === undefined || raw === null || raw === "") {
+    return undefined;
+  }
+  const value = num(row, "through");
+  if (value === undefined || !Number.isInteger(value) || value < 1) {
+    return {
+      error: "through は添付された本文の行頭にある [番号] の数字（1 以上の整数）にしてください。",
+    };
+  }
+  return value;
+}
+
+function outlineActionOf(row: Record<string, unknown>): OutlineAction | { error: string } {
+  const value = row.action;
+  if (value === "set" || value === "clear") {
+    return value;
+  }
+  return { error: 'action は "set" か "clear" にしてください。' };
+}
+
+function listActionOf(row: Record<string, unknown>): ListAction | { error: string } {
+  const value = row.action;
+  // Models send the style name as the action. Continue is apply with the default style.
+  if (value === "continue") {
+    return "apply";
+  }
+  if (value === "apply" || value === "remove" || value === "restart") {
+    return value;
+  }
+  return { error: 'action は "apply"、"remove"、"restart" のどれかにしてください。' };
+}
+
+function listStyleOf(row: Record<string, unknown>): ListStyle | undefined | { error: string } {
+  const value = row.style;
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (isListStyle(value)) {
+    return value;
+  }
+  return {
+    error: `style は ${listStyleEnum().map((name) => `"${name}"`).join("、")} のどれかにしてください。`,
+  };
+}
+
+function isArgError(value: unknown): value is { error: string } {
+  return Boolean(value) && typeof value === "object" && "error" in (value as object);
 }
 
 function severityOf(row: Record<string, unknown>): Severity {
@@ -503,13 +871,27 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
     case TOOL_REPLACE_QUOTE: {
       const quote = text(row, "quote").trim();
       const value = text(row, "text");
-      if (!quote) {
-        return { ok: false, error: "quote が空です。置き換える本文の引用を入れてください。" };
+      const paragraph = paragraphOf(row);
+      if (isArgError(paragraph)) {
+        return { ok: false, error: paragraph.error };
+      }
+      if (!quote && paragraph === undefined) {
+        return {
+          ok: false,
+          error:
+            "対象が指定されていません。paragraph に段落番号を渡すか、quote に置き換える本文の引用を入れてください。",
+        };
       }
       if (!value.trim()) {
         return { ok: false, error: "text が空です。置換後の本文を入れてください。" };
       }
-      return { ok: true, call: { name: TOOL_REPLACE_QUOTE, args: { quote, text: value } } };
+      return {
+        ok: true,
+        call: {
+          name: TOOL_REPLACE_QUOTE,
+          args: { quote, text: value, ...(paragraph === undefined ? {} : { paragraph }) },
+        },
+      };
     }
     case TOOL_INSERT_BLOCKS: {
       const rawBlocks = row.blocks;
@@ -520,6 +902,10 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
       if (typeof at === "object") {
         return { ok: false, error: at.error };
       }
+      const paragraph = paragraphOf(row);
+      if (isArgError(paragraph)) {
+        return { ok: false, error: paragraph.error };
+      }
       const quote = text(row, "quote").trim();
       const blocks: DraftBlock[] = [];
       for (const item of rawBlocks) {
@@ -528,9 +914,17 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
           continue;
         }
         const block = normalizeBlock(record);
-        if (block) {
-          blocks.push(block);
+        if (!block) {
+          continue;
         }
+        if (!block.text.trim()) {
+          return {
+            ok: false,
+            error:
+              "blocks の text が空です。空行は insert_blank_before に、その段落の番号を渡してください。",
+          };
+        }
+        blocks.push(block);
       }
       if (!blocks.length) {
         return {
@@ -542,8 +936,23 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
         ok: true,
         call: {
           name: TOOL_INSERT_BLOCKS,
-          args: { blocks, ...(at ? { at } : {}), ...(quote ? { quote } : {}) },
+          args: {
+            blocks,
+            ...(at ? { at } : {}),
+            ...(quote ? { quote } : {}),
+            ...(paragraph === undefined ? {} : { paragraph }),
+          },
         },
+      };
+    }
+    case TOOL_INSERT_BLANK_BEFORE: {
+      const paragraphs = paragraphListOf(row);
+      if (isArgError(paragraphs)) {
+        return { ok: false, error: paragraphs.error };
+      }
+      return {
+        ok: true,
+        call: { name: TOOL_INSERT_BLANK_BEFORE, args: { paragraphs } },
       };
     }
     case TOOL_INSERT_COMMENT: {
@@ -551,11 +960,20 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
       if (!comment.trim()) {
         return { ok: false, error: "comment が空です。" };
       }
+      const paragraph = paragraphOf(row);
+      if (isArgError(paragraph)) {
+        return { ok: false, error: paragraph.error };
+      }
       return {
         ok: true,
         call: {
           name: TOOL_INSERT_COMMENT,
-          args: { comment, quote: text(row, "quote"), severity: severityOf(row) },
+          args: {
+            comment,
+            quote: text(row, "quote"),
+            severity: severityOf(row),
+            ...(paragraph === undefined ? {} : { paragraph }),
+          },
         },
       };
     }
@@ -582,8 +1000,13 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
       };
     }
     case TOOL_FORMAT_TEXT: {
+      const paragraph = paragraphOf(row);
+      if (isArgError(paragraph)) {
+        return { ok: false, error: paragraph.error };
+      }
       const args: FormatTextArgs = {
         quote: text(row, "quote"),
+        ...(paragraph === undefined ? {} : { paragraph }),
         bold: bool(row, "bold"),
         italic: bool(row, "italic"),
         underline: bool(row, "underline"),
@@ -609,11 +1032,17 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
       return { ok: true, call: { name: TOOL_FORMAT_TEXT, args } };
     }
     case TOOL_FORMAT_PARAGRAPH: {
+      const paragraph = paragraphOf(row);
+      if (isArgError(paragraph)) {
+        return { ok: false, error: paragraph.error };
+      }
       const args: FormatParagraphArgs = {
         quote: text(row, "quote"),
+        ...(paragraph === undefined ? {} : { paragraph }),
         alignment: alignmentOf(row),
         firstLineIndent: num(row, "firstLineIndent"),
         leftIndent: num(row, "leftIndent"),
+        spaceBefore: num(row, "spaceBefore"),
         spaceAfter: num(row, "spaceAfter"),
         lineSpacing: num(row, "lineSpacing"),
       };
@@ -621,12 +1050,116 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
         args.alignment === undefined &&
         args.firstLineIndent === undefined &&
         args.leftIndent === undefined &&
+        args.spaceBefore === undefined &&
         args.spaceAfter === undefined &&
         args.lineSpacing === undefined
       ) {
         return { ok: false, error: "変更する書式が指定されていません。" };
       }
+      if (args.spaceBefore !== undefined && args.spaceBefore < 0) {
+        return { ok: false, error: "spaceBefore は 0 以上にしてください。" };
+      }
+      if (args.spaceAfter !== undefined && args.spaceAfter < 0) {
+        return { ok: false, error: "spaceAfter は 0 以上にしてください。" };
+      }
       return { ok: true, call: { name: TOOL_FORMAT_PARAGRAPH, args } };
+    }
+    case TOOL_FORMAT_LIST: {
+      const action = listActionOf(row);
+      if (isArgError(action)) {
+        return { ok: false, error: action.error };
+      }
+      const paragraph = paragraphOf(row);
+      if (isArgError(paragraph)) {
+        return { ok: false, error: paragraph.error };
+      }
+      const through = throughOf(row);
+      if (isArgError(through)) {
+        return { ok: false, error: through.error };
+      }
+      const style = listStyleOf(row);
+      if (isArgError(style)) {
+        return { ok: false, error: style.error };
+      }
+      const actionWasContinue = row.action === "continue";
+      const resolvedStyle = actionWasContinue ? style || "continue" : style;
+      const level = num(row, "level");
+      if (level !== undefined && (!Number.isInteger(level) || level < 0 || level > 8)) {
+        return { ok: false, error: "level は 0 から 8 の整数にしてください。" };
+      }
+      const start = bool(row, "start");
+      if (action === "restart" && (resolvedStyle !== undefined || through !== undefined)) {
+        return { ok: false, error: "restart には style も through も付けません。" };
+      }
+      if (action === "remove" && resolvedStyle !== undefined) {
+        return { ok: false, error: "remove には style を付けません。" };
+      }
+      if (start && (resolvedStyle === undefined || resolvedStyle === "continue")) {
+        return {
+          ok: false,
+          error: "start は style を付けた apply のときだけ使えます。continue は直前の番号の続きです。",
+        };
+      }
+      if (through !== undefined && paragraph === undefined && !text(row, "quote").trim()) {
+        return {
+          ok: false,
+          error: "through を使うときは、区間の先頭を paragraph（または quote）で渡してください。",
+        };
+      }
+      if (through !== undefined && paragraph !== undefined && through < paragraph) {
+        return { ok: false, error: "through は paragraph と同じか、それより後ろの番号にしてください。" };
+      }
+      const args: FormatListArgs = {
+        action,
+        quote: text(row, "quote"),
+        ...(paragraph === undefined ? {} : { paragraph }),
+        ...(through === undefined ? {} : { through }),
+        ...(resolvedStyle === undefined ? {} : { style: resolvedStyle }),
+        ...(level === undefined ? {} : { level }),
+        ...(start ? { start } : {}),
+      };
+      return { ok: true, call: { name: TOOL_FORMAT_LIST, args } };
+    }
+    case TOOL_SET_OUTLINE: {
+      const action = outlineActionOf(row);
+      if (isArgError(action)) {
+        return { ok: false, error: action.error };
+      }
+      const paragraph = paragraphOf(row);
+      if (isArgError(paragraph)) {
+        return { ok: false, error: paragraph.error };
+      }
+      const through = throughOf(row);
+      if (isArgError(through)) {
+        return { ok: false, error: through.error };
+      }
+      const level = num(row, "level");
+      if (action === "clear" && level !== undefined) {
+        return { ok: false, error: "clear には level を付けません。" };
+      }
+      if (action === "set" && level === undefined) {
+        return { ok: false, error: "set には level（1 から 9）が必要です。" };
+      }
+      if (level !== undefined && (!Number.isInteger(level) || level < 1 || level > 9)) {
+        return { ok: false, error: "level は 1 から 9 の整数にしてください。" };
+      }
+      if (through !== undefined && paragraph === undefined && !text(row, "quote").trim()) {
+        return {
+          ok: false,
+          error: "through を使うときは、区間の先頭を paragraph（または quote）で渡してください。",
+        };
+      }
+      if (through !== undefined && paragraph !== undefined && through < paragraph) {
+        return { ok: false, error: "through は paragraph と同じか、それより後ろの番号にしてください。" };
+      }
+      const args: SetOutlineArgs = {
+        action,
+        quote: text(row, "quote"),
+        ...(paragraph === undefined ? {} : { paragraph }),
+        ...(through === undefined ? {} : { through }),
+        ...(level === undefined ? {} : { level }),
+      };
+      return { ok: true, call: { name: TOOL_SET_OUTLINE, args } };
     }
     default:
       return { ok: false, error: `${name} というツールはありません。` };
@@ -689,10 +1222,17 @@ function paragraphFormatParts(args: FormatParagraphArgs): string[] {
     parts.push(ALIGNMENT_LABELS[args.alignment]);
   }
   if (args.firstLineIndent !== undefined) {
-    parts.push(`字下げ ${args.firstLineIndent}pt`);
+    parts.push(
+      args.firstLineIndent < 0
+        ? `ぶら下げ ${Math.abs(args.firstLineIndent)}pt`
+        : `字下げ ${args.firstLineIndent}pt`
+    );
   }
   if (args.leftIndent !== undefined) {
     parts.push(`左インデント ${args.leftIndent}pt`);
+  }
+  if (args.spaceBefore !== undefined) {
+    parts.push(`段落前 ${args.spaceBefore}pt`);
   }
   if (args.spaceAfter !== undefined) {
     parts.push(`段落後 ${args.spaceAfter}pt`);
@@ -701,6 +1241,17 @@ function paragraphFormatParts(args: FormatParagraphArgs): string[] {
     parts.push(`行間 ${args.lineSpacing}pt`);
   }
   return parts;
+}
+
+/** Where the chip says the operation went, in whichever terms it was aimed. */
+function whereLabel(args: { quote?: string; paragraph?: number }): string {
+  if (args.quote?.trim()) {
+    return `「${shorten(args.quote, 12)}」に`;
+  }
+  if (args.paragraph !== undefined) {
+    return `段落 ${args.paragraph} に`;
+  }
+  return "";
 }
 
 /** Short Japanese label for the operation chips in the chat. */
@@ -720,9 +1271,14 @@ export function describeToolCall(name: string, rawArguments: string): string {
     case TOOL_REPLACE_SELECTION:
       return "選択範囲を置換";
     case TOOL_REPLACE_QUOTE:
-      return `「${shorten(call.args.quote, 12)}」を置換`;
+      return call.args.quote
+        ? `「${shorten(call.args.quote, 12)}」を置換`
+        : `段落 ${call.args.paragraph} を置換`;
     case TOOL_INSERT_BLOCKS: {
       const count = call.args.blocks.length;
+      if (call.args.paragraph !== undefined) {
+        return `段落 ${call.args.paragraph} の後ろに ${count} 段落を挿入`;
+      }
       if (call.args.quote) {
         return `「${shorten(call.args.quote, 12)}」の後ろに ${count} 段落を挿入`;
       }
@@ -731,14 +1287,52 @@ export function describeToolCall(name: string, rawArguments: string): string {
       }
       return call.args.at === "continue" ? `${count} 段落を続きに挿入` : `${count} 段落を挿入`;
     }
-    case TOOL_INSERT_COMMENT:
-      return call.args.quote ? `「${shorten(call.args.quote, 12)}」にコメント` : "コメントを追加";
+    case TOOL_INSERT_BLANK_BEFORE: {
+      const numbers = call.args.paragraphs;
+      if (numbers.length === 1) {
+        return `段落 ${numbers[0]} の直前に空行`;
+      }
+      return `${numbers.length} 段落の直前に空行`;
+    }
+    case TOOL_INSERT_COMMENT: {
+      const where = whereLabel(call.args);
+      return where ? `${where}コメント` : "コメントを追加";
+    }
     case TOOL_INSERT_CITATION:
       return call.args.as === "text" ? "出典を本文に挿入" : "出典をコメントに追加";
     case TOOL_FORMAT_TEXT:
       return `文字書式: ${textFormatParts(call.args).join("・")}`;
     case TOOL_FORMAT_PARAGRAPH:
       return `段落書式: ${paragraphFormatParts(call.args).join("・")}`;
+    case TOOL_FORMAT_LIST: {
+      const action =
+        call.args.action === "remove"
+          ? "番号を外す"
+          : call.args.action === "restart"
+            ? "番号を1から"
+            : "番号を付ける";
+      const notes =
+        call.args.action === "apply"
+          ? [
+              call.args.style && call.args.style !== "continue" ? call.args.style : "",
+              call.args.start ? "1 から" : "",
+            ].filter(Boolean)
+          : [];
+      const style = notes.length ? `（${notes.join("・")}）` : "";
+      const where = whereLabel({ quote: call.args.quote, paragraph: call.args.paragraph });
+      if (call.args.through !== undefined && call.args.paragraph !== undefined) {
+        return `${action}${style}（段落 ${call.args.paragraph}〜${call.args.through}）`;
+      }
+      return where ? `${where}${action}${style}` : `${action}${style}`;
+    }
+    case TOOL_SET_OUTLINE: {
+      const action = call.args.action === "clear" ? "見出しを外す" : `見出し ${call.args.level}`;
+      const where = whereLabel({ quote: call.args.quote, paragraph: call.args.paragraph });
+      if (call.args.through !== undefined && call.args.paragraph !== undefined) {
+        return `${action}（段落 ${call.args.paragraph}〜${call.args.through}）`;
+      }
+      return where ? `${where}${action}` : action;
+    }
     default:
       return name;
   }

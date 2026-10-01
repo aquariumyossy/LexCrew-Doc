@@ -153,7 +153,7 @@ export function foreignCharToolError(call: ToolInvocation): string | null {
   }
   return (
     `日本語で用いない文字が含まれています（${formatChars(chars)}）。` +
-    "その部分を日本語（常用漢字の新字体・ひらがな・カタカナ）で書き直してください。"
+    "その部分を日本語（漢字の新字体・ひらがな・カタカナ）で書き直してください。"
   );
 }
 

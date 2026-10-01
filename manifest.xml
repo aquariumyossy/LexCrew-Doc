@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <OfficeApp xmlns="http://schemas.microsoft.com/office/appforoffice/1.1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0" xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="TaskPaneApp">
   <Id>61e1060d-9903-425b-b6e8-8349101653ea</Id>
-  <Version>1.0.3.0</Version>
-  <ProviderName>GURI</ProviderName>
+  <Version>1.0.4.0</Version>
+  <ProviderName>LexCrew</ProviderName>
   <DefaultLocale>ja-JP</DefaultLocale>
-  <DisplayName DefaultValue="GURI"/>
+  <DisplayName DefaultValue="LexCrew"/>
   <Description DefaultValue="法律文書のレビュー・修正提案・ドラフト・調査（下書き・点検用）"/>
-  <IconUrl DefaultValue="https://localhost:28765/assets/guri-32.png"/>
-  <HighResolutionIconUrl DefaultValue="https://localhost:28765/assets/guri-64.png"/>
+  <IconUrl DefaultValue="https://localhost:28765/assets/lexcrew-32.png"/>
+  <HighResolutionIconUrl DefaultValue="https://localhost:28765/assets/lexcrew-64.png"/>
   <SupportUrl DefaultValue="https://learn.microsoft.com/office/dev/add-ins/"/>
   <AppDomains>
     <AppDomain>https://localhost:28765</AppDomain>
@@ -62,9 +62,9 @@
     </Hosts>
     <Resources>
       <bt:Images>
-        <bt:Image id="Icon.16x16" DefaultValue="https://localhost:28765/assets/guri-16.png"/>
-        <bt:Image id="Icon.32x32" DefaultValue="https://localhost:28765/assets/guri-32.png"/>
-        <bt:Image id="Icon.80x80" DefaultValue="https://localhost:28765/assets/guri-80.png"/>
+        <bt:Image id="Icon.16x16" DefaultValue="https://localhost:28765/assets/lexcrew-16.png"/>
+        <bt:Image id="Icon.32x32" DefaultValue="https://localhost:28765/assets/lexcrew-32.png"/>
+        <bt:Image id="Icon.80x80" DefaultValue="https://localhost:28765/assets/lexcrew-80.png"/>
       </bt:Images>
       <bt:Urls>
         <bt:Url id="GetStarted.LearnMoreUrl" DefaultValue="https://learn.microsoft.com/office/dev/add-ins/"/>
@@ -72,12 +72,12 @@
         <bt:Url id="Taskpane.Url" DefaultValue="https://localhost:28765/taskpane.html"/>
       </bt:Urls>
       <bt:ShortStrings>
-        <bt:String id="GetStarted.Title" DefaultValue="GURI を開始する"/>
-        <bt:String id="CommandsGroup.Label" DefaultValue="GURI"/>
-        <bt:String id="TaskpaneButton.Label" DefaultValue="GURI"/>
+        <bt:String id="GetStarted.Title" DefaultValue="LexCrew を開始する"/>
+        <bt:String id="CommandsGroup.Label" DefaultValue="LexCrew"/>
+        <bt:String id="TaskpaneButton.Label" DefaultValue="LexCrew"/>
       </bt:ShortStrings>
       <bt:LongStrings>
-        <bt:String id="GetStarted.Description" DefaultValue="ホームタブの GURI を押すと、レビュー・修正提案・ドラフト・調査の作業ウィンドウが開きます。"/>
+        <bt:String id="GetStarted.Description" DefaultValue="ホームタブの LexCrew を押すと、レビュー・修正提案・ドラフト・調査の作業ウィンドウが開きます。"/>
         <bt:String id="TaskpaneButton.Tooltip" DefaultValue="法律文書のレビュー・修正提案・ドラフト・調査"/>
       </bt:LongStrings>
     </Resources>

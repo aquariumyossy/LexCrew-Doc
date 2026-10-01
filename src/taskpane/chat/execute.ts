@@ -1,9 +1,11 @@
 import { mapBlocks, summarizeInsertedBlocks } from "../../shared/blocks";
 import { foreignCharToolError } from "../../shared/japaneseHan";
 import {
+  TOOL_FORMAT_LIST,
   TOOL_FORMAT_PARAGRAPH,
   TOOL_FORMAT_TEXT,
   TOOL_GET_SELECTION,
+  TOOL_INSERT_BLANK_BEFORE,
   TOOL_INSERT_BLOCKS,
   TOOL_INSERT_CITATION,
   TOOL_INSERT_COMMENT,
@@ -11,21 +13,25 @@ import {
   TOOL_REPLACE_SELECTION,
   TOOL_SEARCH,
   TOOL_SEARCH_INDEX,
+  TOOL_SET_OUTLINE,
   ToolCall,
   parseToolArguments,
 } from "../../shared/tools";
 import { search, searchArgosIndex } from "../api";
 import { Settings } from "../settings";
 import {
+  formatList,
   formatParagraph,
   formatText,
   getSelectionInfo,
   insertCitationComment,
   insertCitationText,
+  insertBlankBefore,
   insertComment,
   insertDraftParagraphs,
   replaceQuote,
   replaceSelection,
+  setOutlineLevel,
 } from "../word";
 
 /* global AbortSignal */
@@ -48,6 +54,8 @@ export type ToolOutcome = {
   /** Sent back to the model as the `role: "tool"` content. */
   content: string;
   ok: boolean;
+  /** True when the result handed the model paragraph numbers it did not have before. */
+  numbered?: boolean;
 };
 
 export type ExecuteOptions = {
@@ -56,6 +64,15 @@ export type ExecuteOptions = {
 
 function failed(message: string): ToolOutcome {
   return { content: `エラー: ${message}`, ok: false };
+}
+
+/**
+ * Where the operation actually landed. A number that pointed at a paragraph the
+ * model did not mean, or a quote that widened to the whole paragraph, is invisible
+ * in a bare success message and turns up later in the wrong clause.
+ */
+function withNote(message: string, note: string): string {
+  return note ? `${message}${note}` : message;
 }
 
 async function runSearch(q: string, settings: Settings, signal: AbortSignal): Promise<ToolOutcome> {
@@ -153,32 +170,46 @@ export async function executeToolCall(
         await replaceSelection(invocation.args.text);
         return { content: "選択範囲を置き換えました（変更履歴に記録）。", ok: true };
 
-      case TOOL_REPLACE_QUOTE:
-        await replaceQuote(invocation.args.quote, invocation.args.text);
-        return { content: "該当箇所を置き換えました（変更履歴に記録）。", ok: true };
+      case TOOL_REPLACE_QUOTE: {
+        const note = await replaceQuote(invocation.args);
+        return {
+          content: withNote("該当箇所を置き換えました（変更履歴に記録）。", note),
+          ok: true,
+        };
+      }
 
       case TOOL_INSERT_BLOCKS: {
         const specs = mapBlocks(invocation.args.blocks, {
           fontName: settings.fontName,
           bodyPt: settings.bodyPt,
           titlePt: settings.titlePt,
+          lineSpacingChars: settings.lineSpacingChars,
         });
         const at = invocation.args.at ?? (insertBlocksInTurn > 0 ? "continue" : "cursor");
         insertBlocksInTurn += 1;
-        const landing = await insertDraftParagraphs(specs, at, invocation.args.quote);
+        const landing = await insertDraftParagraphs(
+          specs,
+          at,
+          invocation.args.quote,
+          invocation.args.paragraph
+        );
         return {
-          content: `${summarizeInsertedBlocks(invocation.args.blocks, landing)}（変更履歴に記録）。`,
+          content: summarizeInsertedBlocks(invocation.args.blocks, landing),
           ok: true,
+          // The new paragraphs now have numbers; the next round's tools must offer them.
+          numbered: Boolean(landing?.numbers?.length),
         };
       }
 
-      case TOOL_INSERT_COMMENT:
-        await insertComment(
-          invocation.args.comment,
-          invocation.args.quote,
-          invocation.args.severity
-        );
-        return { content: "コメントを付けました。", ok: true };
+      case TOOL_INSERT_BLANK_BEFORE: {
+        const note = await insertBlankBefore(invocation.args.paragraphs);
+        return { content: note, ok: true };
+      }
+
+      case TOOL_INSERT_COMMENT: {
+        const note = await insertComment(invocation.args);
+        return { content: withNote("コメントを付けました。", note), ok: true };
+      }
 
       case TOOL_INSERT_CITATION: {
         const hit = {
@@ -194,13 +225,34 @@ export async function executeToolCall(
         return { content: "出典をコメントに入れました。", ok: true };
       }
 
-      case TOOL_FORMAT_TEXT:
-        await formatText(invocation.args);
-        return { content: "文字書式を変えました（変更履歴に書式変更として記録）。", ok: true };
+      case TOOL_FORMAT_TEXT: {
+        const note = await formatText(invocation.args);
+        return {
+          content: withNote("文字書式を変えました（変更履歴に書式変更として記録）。", note),
+          ok: true,
+        };
+      }
 
-      case TOOL_FORMAT_PARAGRAPH:
-        await formatParagraph(invocation.args);
-        return { content: "段落書式を変えました（変更履歴に書式変更として記録）。", ok: true };
+      case TOOL_FORMAT_PARAGRAPH: {
+        const note = await formatParagraph(invocation.args);
+        return {
+          content: withNote("段落書式を変えました（変更履歴に書式変更として記録）。", note),
+          ok: true,
+        };
+      }
+
+      case TOOL_FORMAT_LIST: {
+        const note = await formatList(invocation.args);
+        return {
+          content: withNote("リスト番号を変えました（変更履歴に書式変更として記録）。", note),
+          ok: true,
+        };
+      }
+
+      case TOOL_SET_OUTLINE: {
+        const note = await setOutlineLevel(invocation.args);
+        return { content: note, ok: true };
+      }
 
       default:
         return failed(`${call.function.name} は実行できません。`);

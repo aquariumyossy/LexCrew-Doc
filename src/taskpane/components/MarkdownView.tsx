@@ -4,6 +4,7 @@ import Markdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { argosScopeChipLabel } from "../../shared/argos";
+import { uiPx } from "../uiFont";
 
 const useStyles = makeStyles({
   root: {
@@ -22,10 +23,10 @@ const useStyles = makeStyles({
       color: tokens.colorBrandForeground1,
       fontWeight: tokens.fontWeightSemibold,
     },
-    "& h1": { fontSize: "16px" },
-    "& h2": { fontSize: "15px" },
-    "& h3": { fontSize: "14px" },
-    "& h4, & h5, & h6": { fontSize: "13px" },
+    "& h1": { fontSize: uiPx(16) },
+    "& h2": { fontSize: uiPx(15) },
+    "& h3": { fontSize: uiPx(14) },
+    "& h4, & h5, & h6": { fontSize: uiPx(13) },
     "& p": {
       marginTop: 0,
       marginBottom: "0.55em",
@@ -54,7 +55,7 @@ const useStyles = makeStyles({
     },
     "& code": {
       fontFamily: 'Consolas, "Yu Gothic UI", monospace',
-      fontSize: "12px",
+      fontSize: uiPx(12),
       backgroundColor: tokens.colorBrandBackground2,
       padding: "0 4px",
       borderRadius: "3px",
@@ -72,7 +73,7 @@ const useStyles = makeStyles({
     },
     "& table": {
       borderCollapse: "collapse",
-      fontSize: "12px",
+      fontSize: uiPx(12),
       width: "100%",
     },
     "& th, & td": {
@@ -100,7 +101,7 @@ const useStyles = makeStyles({
     verticalAlign: "baseline",
     maxWidth: "100%",
     color: tokens.colorNeutralForeground3,
-    fontSize: "12px",
+    fontSize: uiPx(12),
     wordBreak: "break-all",
   },
   summary: {

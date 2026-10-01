@@ -1,7 +1,11 @@
+import os from "os";
+import path from "path";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "./app";
 import { HistoryStore, openHistory, setHistoryForTests } from "./history";
+
+const absentConnection = path.join(os.tmpdir(), `guri-history-absent-${process.pid}`, "connection.json");
 
 let store: HistoryStore;
 
@@ -18,7 +22,7 @@ afterEach(() => {
 
 describe("conversation history", () => {
   it("creates, names, reads and deletes a conversation", async () => {
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
 
     const created = await request(app).post("/api/conversations").send({ documentKey: "docA" });
     expect(created.status).toBe(200);
@@ -56,7 +60,7 @@ describe("conversation history", () => {
   });
 
   it("lists conversations for one document, newest first", async () => {
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const first = await request(app).post("/api/conversations").send({ documentKey: "docA" });
     await request(app).post("/api/conversations").send({ documentKey: "docB" });
     const second = await request(app).post("/api/conversations").send({ documentKey: "docA" });
@@ -77,7 +81,7 @@ describe("conversation history", () => {
   });
 
   it("answers 404 for an unknown conversation", async () => {
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app)
       .post("/api/conversations/nope/messages")
       .send({ role: "user", content: "x" });
@@ -88,7 +92,7 @@ describe("conversation history", () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const created = await request(app).post("/api/conversations").send({ documentKey: "docA" });
     await request(app).post(`/api/conversations/${created.body.id}/messages`).send({
       role: "assistant",
@@ -104,7 +108,7 @@ describe("conversation history", () => {
   });
 
   it("stores Argos path prefixes on the conversation", async () => {
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const created = await request(app).post("/api/conversations").send({ documentKey: "docA" });
     expect(created.body.argosPathPrefix).toBe("");
 
@@ -116,7 +120,7 @@ describe("conversation history", () => {
   });
 
   it("keeps attached files on the conversation, not in every message", async () => {
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const created = await request(app).post("/api/conversations").send({ documentKey: "docA" });
     const id = created.body.id as string;
 
@@ -163,7 +167,7 @@ describe("conversation history", () => {
   });
 
   it("leaves file text out of the conversation list", async () => {
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const created = await request(app).post("/api/conversations").send({ documentKey: "docA" });
     await request(app)
       .put(`/api/conversations/${created.body.id}/files`)
@@ -177,7 +181,7 @@ describe("conversation history", () => {
   });
 
   it("drops a stored file that lost its name and takes the whole set away", async () => {
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const created = await request(app).post("/api/conversations").send({ documentKey: "docA" });
     const id = created.body.id as string;
 
@@ -197,13 +201,13 @@ describe("conversation history", () => {
   });
 
   it("answers 404 when the conversation for a file set is gone", async () => {
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app).put("/api/conversations/nope/files").send({ files: [] });
     expect(res.status).toBe(404);
   });
 
   it("stores the Word file path and backfills it for a document", async () => {
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const created = await request(app).post("/api/conversations").send({
       documentKey: "docA",
       documentPath: "file:///C:/案件/契約.docx",

@@ -122,6 +122,26 @@ export type DocumentGroup = {
   conversations: ConversationSummary[];
 };
 
+/** An empty key is not an open document, so nothing is current. */
+export function partitionConversations<T extends { documentKey: string }>(
+  conversations: T[],
+  documentKey: string
+): { here: T[]; elsewhere: T[] } {
+  if (!documentKey) {
+    return { here: [], elsewhere: conversations.slice() };
+  }
+  const here: T[] = [];
+  const elsewhere: T[] = [];
+  for (const conversation of conversations) {
+    if (conversation.documentKey === documentKey) {
+      here.push(conversation);
+    } else {
+      elsewhere.push(conversation);
+    }
+  }
+  return { here, elsewhere };
+}
+
 /** Keep newest-first order, grouping later rows into the first sighting of that document. */
 export function groupConversationsByDocument(
   conversations: ConversationSummary[]

@@ -1,6 +1,7 @@
 mod api;
 mod argos;
 mod certs;
+mod connection;
 mod constants;
 mod history;
 mod https;
@@ -28,7 +29,7 @@ fn wants_uninstall_hooks() -> bool {
 }
 
 fn show_error(app: &AppHandle, message: &str) {
-    let _ = app.dialog().message(message).title("GURI").blocking_show();
+    let _ = app.dialog().message(message).title("LexCrew Doc").blocking_show();
 }
 
 fn run_uninstall_hooks(app: &AppHandle) {
@@ -41,19 +42,9 @@ fn run_uninstall_hooks(app: &AppHandle) {
     log::info("uninstall hooks done", None);
 }
 
-fn apply_installer_autostart(app: &AppHandle) {
-    if registry::installer_wants_autostart() {
-        match app.autolaunch().enable() {
-            Ok(()) => log::info("login item enabled from installer", None),
-            Err(_) => log::error_name("login item enable failed", "error"),
-        }
-        registry::clear_installer_autostart_flag();
-    }
-}
-
 fn tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
-    let status = MenuItem::with_id(app, "status", "GURI 起動中", false, None::<&str>)?;
+    let status = MenuItem::with_id(app, "status", "LexCrew Doc 起動中", false, None::<&str>)?;
     let autostart = CheckMenuItem::with_id(
         app,
         "autostart",
@@ -87,7 +78,7 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let tray = TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
-        .tooltip("GURI 起動中")
+        .tooltip("LexCrew Doc 起動中")
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "autostart" => {
@@ -140,7 +131,7 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
         );
         show_error(
             app,
-            "HTTPS 証明書を現在のユーザーの信頼ストアに入れられませんでした。作業ウィンドウが白紙のときは、GURI を終了してから開き直してください。",
+            "HTTPS 証明書を現在のユーザーの信頼ストアに入れられませんでした。作業ウィンドウが白紙のときは、LexCrew Doc を終了してから開き直してください。",
         );
         let _ = error;
     }
@@ -150,7 +141,7 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
             log::error_name("add-in register failed", "error");
             show_error(
                 app,
-                "Word アドインの登録に失敗しました。Word を閉じてから GURI を開き直してください。",
+                "Word アドインの登録に失敗しました。Word を閉じてから LexCrew Doc を開き直してください。",
             );
             let _ = error;
         }
@@ -158,7 +149,7 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
         log::error_name("add-in register failed", "missing-manifest");
         show_error(
             app,
-            "Word アドインの登録に失敗しました。Word を閉じてから GURI を開き直してください。",
+            "Word アドインの登録に失敗しました。Word を閉じてから LexCrew Doc を開き直してください。",
         );
     }
 
@@ -170,7 +161,7 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
                 Some(json!({ "name": "error", "code": "EADDRINUSE" })),
             );
             return Err(
-                "ポート 28765 は既に使われています。旧 GURI または開発用サーバ（npm start）が起動していないか確認してください。"
+                "ポート 28765 は既に使われています。起動中の LexCrew Doc または開発用サーバ（npm start）を終了してください。"
                     .into(),
             );
         }
@@ -209,7 +200,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             app.dialog()
                 .message("既に起動しています。")
-                .title("GURI")
+                .title("LexCrew Doc")
                 .show(|_| {});
         }))
         .manage(TrayCell(Mutex::new(None)))
@@ -220,7 +211,6 @@ pub fn run() {
             }
 
             registry::cleanup_electron_run_value();
-            apply_installer_autostart(app.handle());
             hide_main_window(app.handle());
 
             if let Err(e) = setup_tray(app.handle()) {

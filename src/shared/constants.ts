@@ -14,6 +14,18 @@ export const DEFAULT_FONT_NAME = "游明朝";
 export const FALLBACK_FONT_NAME = "ＭＳ 明朝";
 export const DEFAULT_BODY_PT = 12;
 export const DEFAULT_TITLE_PT = 16;
+/** Line box height in ems of that paragraph's font. 1字 is the font size. */
+export const LINE_SPACING_CHARS = [1, 1.25, 1.5, 2] as const;
+export type LineSpacingChars = (typeof LINE_SPACING_CHARS)[number];
+export const DEFAULT_LINE_SPACING_CHARS: LineSpacingChars = 1;
+
+export function normalizeLineSpacingChars(value: unknown): LineSpacingChars {
+  return LINE_SPACING_CHARS.find((chars) => chars === value) ?? DEFAULT_LINE_SPACING_CHARS;
+}
+
+export function lineSpacingPt(fontPt: number, chars: number): number {
+  return fontPt * chars;
+}
 
 export const DEFAULT_THINKING_LEVEL = "medium";
 export const DEFAULT_THINKING_BUDGET = 2_048;
@@ -65,6 +77,3 @@ export const DOCUMENT_KEY_SETTING = "guri.documentId";
 /** Same-PC Argos loopback. Use 127.0.0.1; localhost may resolve to IPv6 only. */
 export const DEFAULT_ARGOS_BASE_URL = "http://127.0.0.1:17890";
 export const MAX_ARGOS_SCOPES = 8;
-
-export const DISCLAIMER =
-  "出力は下書き・点検用であり、法律意見ではありません。LLM が書いた判例・条文番号は未確認として扱ってください。Word に「出典」として入れるのは SearXNG のヒット（タイトル・URL）と Argos のヒット（タイトル・ファイルパス）だけです。";

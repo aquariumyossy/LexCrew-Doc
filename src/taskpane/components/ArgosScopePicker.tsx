@@ -24,6 +24,7 @@ import {
   sameArgosPath,
 } from "../../shared/argos";
 import { listArgosScopes } from "../api";
+import { uiPx } from "../uiFont";
 import { CompactDialogClose, useCompactDialogStyles } from "./compactDialog";
 
 const useStyles = makeStyles({
@@ -59,8 +60,8 @@ const useStyles = makeStyles({
     textAlign: "left",
     cursor: "pointer",
     fontFamily: "inherit",
-    fontSize: "12px",
-    lineHeight: "16px",
+    fontSize: uiPx(12),
+    lineHeight: uiPx(16),
     color: tokens.colorNeutralForeground1,
     "&:hover": {
       backgroundColor: tokens.colorNeutralBackground1Hover,
@@ -83,8 +84,8 @@ const useStyles = makeStyles({
   },
   badge: {
     flexShrink: 0,
-    fontSize: "10px",
-    lineHeight: "16px",
+    fontSize: uiPx(10),
+    lineHeight: uiPx(16),
     padding: "0 6px",
     borderRadius: "999px",
     border: `1px solid ${tokens.colorNeutralStroke2}`,
@@ -109,16 +110,16 @@ const useStyles = makeStyles({
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
     color: tokens.colorNeutralForeground3,
-    fontSize: "12px",
+    fontSize: uiPx(12),
   },
   muted: {
     color: tokens.colorNeutralForeground3,
-    fontSize: "12px",
+    fontSize: uiPx(12),
     padding: "8px 6px",
   },
   error: {
     color: tokens.colorPaletteRedForeground1,
-    fontSize: "12px",
+    fontSize: uiPx(12),
     whiteSpace: "pre-wrap",
   },
 });
@@ -265,7 +266,7 @@ const ArgosScopePicker: React.FC<ArgosScopePickerProps> = ({
         <DialogSurface className={dialog.surface} aria-label="検索範囲" data-guri="argos-scope">
           <DialogBody className={dialog.body}>
             <DialogTitle className={dialog.heading} action={<CompactDialogClose onClick={close} />}>
-              GURI に参照させるフォルダを選択してください。
+              LexCrew に参照させるフォルダを選択してください。
             </DialogTitle>
             <DialogContent className={dialog.content}>
               <Input

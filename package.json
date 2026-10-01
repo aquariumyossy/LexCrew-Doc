@@ -2,7 +2,7 @@
   "name": "guri",
   "version": "0.1.1",
   "private": true,
-  "description": "Word デスクトップ作業ウィンドウから MTPLX と SearXNG を使う法律文書アドイン",
+  "description": "LexCrew Doc。Word デスクトップ作業ウィンドウから MTPLX と SearXNG を使う法律文書アドイン",
   "license": "MIT",
   "author": "GURI",
   "config": {
@@ -23,7 +23,8 @@
     "test:watch": "vitest",
     "watch": "webpack --mode development --watch",
     "tauri": "tauri",
-    "dist": "tauri build"
+    "dist": "tauri build",
+    "package": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1"
   },
   "devDependencies": {
     "@babel/core": "^8.0.1",

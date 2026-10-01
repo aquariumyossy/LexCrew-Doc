@@ -26,6 +26,7 @@ import {
   filesChars,
   isReady,
 } from "../../shared/fileSource";
+import { uiPx } from "../uiFont";
 import { CompactDialogClose, useCompactDialogStyles } from "./compactDialog";
 
 const useStyles = makeStyles({
@@ -62,7 +63,7 @@ const useStyles = makeStyles({
     minWidth: 0,
     justifyContent: "flex-start",
     textAlign: "left",
-    fontSize: "12px",
+    fontSize: uiPx(12),
     "& .fui-Button__icon": {
       display: "none",
     },
@@ -93,22 +94,22 @@ const useStyles = makeStyles({
   preview: {
     whiteSpace: "pre-wrap",
     wordBreak: "break-word",
-    fontSize: "12px",
-    lineHeight: "17px",
+    fontSize: uiPx(12),
+    lineHeight: uiPx(17),
   },
   section: {
     color: tokens.colorNeutralForeground2,
-    fontSize: "11px",
+    fontSize: uiPx(11),
   },
   muted: {
     color: tokens.colorNeutralForeground3,
-    fontSize: "11px",
-    lineHeight: "16px",
+    fontSize: uiPx(11),
+    lineHeight: uiPx(16),
   },
   warning: {
     color: tokens.colorPaletteDarkOrangeForeground1,
-    fontSize: "11px",
-    lineHeight: "16px",
+    fontSize: uiPx(11),
+    lineHeight: uiPx(16),
   },
 });
 

@@ -2,12 +2,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SETTINGS } from "../settings";
 
 const insertDraftParagraphs = vi.hoisted(() => vi.fn());
+const insertBlankBefore = vi.hoisted(() => vi.fn());
 const replaceSelection = vi.hoisted(() => vi.fn());
 const insertComment = vi.hoisted(() => vi.fn());
 const insertCitationText = vi.hoisted(() => vi.fn());
+const formatList = vi.hoisted(() => vi.fn());
+const setOutlineLevel = vi.hoisted(() => vi.fn());
 
 vi.mock("../word", () => ({
   insertDraftParagraphs,
+  insertBlankBefore,
   getSelectionInfo: vi.fn(),
   replaceSelection,
   replaceQuote: vi.fn(),
@@ -16,6 +20,8 @@ vi.mock("../word", () => ({
   insertCitationText,
   formatText: vi.fn(),
   formatParagraph: vi.fn(),
+  formatList,
+  setOutlineLevel,
 }));
 
 vi.mock("../api", () => ({ search: vi.fn(), searchArgosIndex: vi.fn() }));
@@ -131,6 +137,7 @@ describe("foreign Han in tool arguments", () => {
     replaceSelection.mockReset();
     insertComment.mockReset();
     insertCitationText.mockReset();
+    formatList.mockReset();
     beginToolTurn();
   });
 
@@ -209,5 +216,78 @@ describe("foreign Han in tool arguments", () => {
     );
     expect(result.ok).toBe(true);
     expect(insertCitationText).toHaveBeenCalled();
+  });
+
+  it("runs format_list and tells the model where the number landed", async () => {
+    formatList.mockResolvedValue("「甲は委託する。」を対象にしました。番号は 〔1.〕 です。");
+    const result = await executeToolCall(
+      {
+        id: "c1",
+        type: "function" as const,
+        function: {
+          name: "format_list",
+          arguments: '{"action":"apply","paragraph":12,"style":"arabic"}',
+        },
+      },
+      DEFAULT_SETTINGS,
+      new AbortController().signal
+    );
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain("リスト番号");
+    expect(result.content).toContain("〔1.〕");
+    expect(formatList).toHaveBeenCalledWith({
+      action: "apply",
+      quote: "",
+      paragraph: 12,
+      style: "arabic",
+    });
+  });
+
+  it("runs set_outline_level without wrapping a second success sentence", async () => {
+    setOutlineLevel.mockResolvedValue(
+      "「請求の趣旨」をレベル 1 の見出しにしました（変更履歴に書式変更として記録）。"
+    );
+    const result = await executeToolCall(
+      {
+        id: "c1",
+        type: "function" as const,
+        function: {
+          name: "set_outline_level",
+          arguments: '{"action":"set","paragraph":4,"level":1}',
+        },
+      },
+      DEFAULT_SETTINGS,
+      new AbortController().signal
+    );
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe(
+      "「請求の趣旨」をレベル 1 の見出しにしました（変更履歴に書式変更として記録）。"
+    );
+    expect(setOutlineLevel).toHaveBeenCalledWith({
+      action: "set",
+      quote: "",
+      paragraph: 4,
+      level: 1,
+    });
+  });
+
+  it("inserts blank lines without handing out paragraph numbers", async () => {
+    insertBlankBefore.mockReset();
+    insertBlankBefore.mockResolvedValue(
+      "1 箇所の直前に空行を入れました（「第1条（目的）」）。変更履歴に記録しました。"
+    );
+    const result = await executeToolCall(
+      {
+        id: "c1",
+        type: "function" as const,
+        function: { name: "insert_blank_before", arguments: '{"paragraphs":[4]}' },
+      },
+      DEFAULT_SETTINGS,
+      new AbortController().signal
+    );
+    expect(result.ok).toBe(true);
+    expect(result.numbered).toBeUndefined();
+    expect(result.content).toContain("第1条（目的）");
+    expect(insertBlankBefore).toHaveBeenCalledWith([4]);
   });
 });

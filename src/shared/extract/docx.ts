@@ -10,7 +10,11 @@ import {
   clipNote,
 } from "../attachment";
 import { MAX_CHANGES_READ, MAX_COMMENTS_READ } from "../constants";
-import { FileText } from "../fileSource";
+import type { FileText } from "../fileSource";
+import { ListMark, wrapListMark } from "../listMark";
+import { formatParagraphRef } from "../paragraphRef";
+import { MARKUP_LEGEND, readMarkupBody } from "../markupText";
+import { paragraphListMarks } from "./numbering";
 import { scanXml, xmlAttr, xmlDate } from "./xml";
 
 /** The parts of a `.docx` worth reading. Headers, footers and footnotes are left out. */
@@ -19,6 +23,10 @@ export type DocxParts = {
   document: string;
   /** `word/comments.xml`; absent when the file carries no comments. */
   comments?: string;
+  /** `word/numbering.xml`; absent when the file has no list definitions. */
+  numbering?: string;
+  /** `word/styles.xml`; absent when the package has no styles part. */
+  styles?: string;
 };
 
 type Mark = { kind: ChangeKind; author: string; date: string; text: string[] };
@@ -27,8 +35,8 @@ type BodyRead = {
   paragraphs: string[];
   changes: ChangeNote[];
   changesTruncated: boolean;
-  /** Comment id to the text the comment is anchored to. */
-  anchors: Map<string, string>;
+  /** Comment id to paragraph number where the range ends. */
+  commentParagraphs: Map<string, number>;
 };
 
 function markKind(name: string): ChangeKind | null {
@@ -50,16 +58,29 @@ function markKind(name: string): ChangeKind | null {
  * already part of the body; a deletion is not, so it survives only as a note,
  * which is what places a proposal the body no longer shows.
  */
-function readBody(xml: string): BodyRead {
+/** List labels sit outside the body text, same brackets as a live Word attachment. */
+function showWithMark(text: string, mark: ListMark | null | undefined): string {
+  if (!mark?.isListItem) {
+    return text;
+  }
+  const badge = wrapListMark(mark);
+  if (!badge) {
+    return text;
+  }
+  return text ? `${badge}${text}` : badge;
+}
+
+function readBody(xml: string, listMarks: (ListMark | null)[]): BodyRead {
   const paragraphs: string[] = [];
   const changes: ChangeNote[] = [];
-  const anchors = new Map<string, string>();
+  const commentParagraphs = new Map<string, number>();
   const open = new Map<string, string[]>();
   const stack: string[] = [];
   const marks: Mark[] = [];
   let line: string[] = [];
   let pending: ChangeNote[] = [];
   let changesTruncated = false;
+  let paragraphCounter = 0;
 
   const keepChange = (note: ChangeNote) => {
     if (changes.length >= MAX_CHANGES_READ) {
@@ -98,10 +119,11 @@ function readBody(xml: string): BodyRead {
       }
       if (event.name === "w:p") {
         const text = line.join("").trim();
-        if (text) {
-          paragraphs.push(text);
+        const where = formatParagraphRef(paragraphCounter);
+        const shown = showWithMark(text, listMarks[paragraphCounter - 1]);
+        if (shown) {
+          paragraphs.push(shown);
         }
-        const where = clipNote(text, MAX_CHANGE_WHERE_CHARS);
         for (const note of pending) {
           keepChange({ ...note, where });
         }
@@ -120,6 +142,9 @@ function readBody(xml: string): BodyRead {
 
     switch (event.name) {
       case "w:p":
+        if (!event.empty) {
+          paragraphCounter += 1;
+        }
         line = [];
         break;
       case "w:tab":
@@ -136,7 +161,7 @@ function readBody(xml: string): BodyRead {
         const id = xmlAttr(event.attrs, "w:id");
         const buffer = open.get(id);
         if (buffer) {
-          anchors.set(id, buffer.join(""));
+          commentParagraphs.set(id, paragraphCounter);
           open.delete(id);
         }
         break;
@@ -168,17 +193,12 @@ function readBody(xml: string): BodyRead {
     }
   }
 
-  return { paragraphs, changes, changesTruncated, anchors };
+  return { paragraphs, changes, changesTruncated, commentParagraphs };
 }
 
-/**
- * Threading and the resolved flag live in `word/commentsExtended.xml`, which is
- * not read: a reply therefore arrives as its own note, carrying its author and
- * text but not what it answers.
- */
 function readComments(
   xml: string,
-  anchors: Map<string, string>
+  commentParagraphs: Map<string, number>
 ): { items: CommentNote[]; truncated: boolean } {
   const items: CommentNote[] = [];
   let truncated = false;
@@ -210,7 +230,7 @@ function readComments(
               author: current.author,
               date: current.date,
               resolved: false,
-              anchor: clipNote(anchors.get(current.id) || "", MAX_ANCHOR_CHARS),
+              anchor: formatParagraphRef(commentParagraphs.get(current.id) || 1),
               content,
               replies: [],
             });
@@ -237,10 +257,40 @@ function readComments(
 }
 
 export function extractDocx(parts: DocxParts): FileText {
-  const body = readBody(parts.document || "");
-  const comments = parts.comments
-    ? readComments(parts.comments, body.anchors)
+  const document = parts.document || "";
+  const marks = paragraphListMarks(document, parts.numbering || "", parts.styles || "");
+  const markup = readMarkupBody(document, parts.comments);
+  const bodyRead = readBody(document, marks);
+  const fullComments = parts.comments
+    ? readComments(parts.comments, bodyRead.commentParagraphs)
     : { items: [] as CommentNote[], truncated: false };
+
+  if (markup.hasInlineMarkup) {
+    const bodyLines = markup.markedParagraphs
+      .map((line, index) => showWithMark(line, marks[index]))
+      .filter((line) => line.trim());
+    const body = bodyLines.length ? `${MARKUP_LEGEND}\n\n${bodyLines.join("\n")}` : "";
+    return {
+      origin: "text",
+      body,
+      comments: {
+        items: fullComments.items
+          .filter((note) => note.replies.length > 0 || note.resolved)
+          .concat(markup.commentsForAppendix),
+        truncated: fullComments.truncated,
+        error: "",
+      },
+      changes: {
+        items: markup.changes,
+        truncated: markup.changesTruncated,
+        error: "",
+      },
+      truncated: false,
+      inlineCommentCount: markup.inlineCommentCount,
+    };
+  }
+
+  const comments = fullComments;
 
   const commentList: MarkupList<CommentNote> = {
     items: comments.items,
@@ -248,14 +298,14 @@ export function extractDocx(parts: DocxParts): FileText {
     error: "",
   };
   const changeList: MarkupList<ChangeNote> = {
-    items: body.changes,
-    truncated: body.changesTruncated,
+    items: bodyRead.changes,
+    truncated: bodyRead.changesTruncated,
     error: "",
   };
 
   return {
     origin: "text",
-    body: body.paragraphs.join("\n"),
+    body: bodyRead.paragraphs.join("\n"),
     comments: commentList,
     changes: changeList,
     truncated: false,

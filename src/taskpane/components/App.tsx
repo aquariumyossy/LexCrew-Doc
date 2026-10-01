@@ -24,8 +24,9 @@ import {
 } from "@fluentui/react-components";
 import {
   DismissRegular,
-  ErrorCircleRegular,
   HistoryRegular,
+  InfoRegular,
+  PlugConnectedRegular,
   SendRegular,
   SettingsRegular,
 } from "@fluentui/react-icons";
@@ -39,9 +40,10 @@ import {
 } from "../../shared/attachment";
 import {
   CHARS_PER_TOKEN,
-  DISCLAIMER,
   DOCUMENT_KEY_SETTING,
+  LINE_SPACING_CHARS,
   MAX_TIMEOUT_MS,
+  normalizeLineSpacingChars,
 } from "../../shared/constants";
 import {
   CommittedFile,
@@ -65,20 +67,25 @@ import {
   toolRoundPresetLabel,
 } from "../../shared/tools";
 import {
+  adoptStoredConnection,
   appendMessage,
   checkHealth,
   createConversation,
   deleteConversation,
+  fetchConnection,
   getConversation,
   listConversations,
   pingSidecar,
   rememberDocumentPath,
   setConversationArgosScope,
+  saveStoredConnection,
   setConversationFiles as saveConversationFiles,
 } from "../api";
 import { estimateTokens, messagesTokens, toChatMessages } from "../chat/context";
 import { runTurn } from "../chat/runTurn";
-import { FONT_CHOICES, Settings, clampTimeoutMs, loadSettings, saveSettings } from "../settings";
+import { applyAdopt } from "../connectionState";
+import { FONT_CHOICES, Settings, clampTimeoutMs, loadSettings, saveSettings, setKeepConnectionInStorage } from "../settings";
+import { UiFontSize, applyUiFont, normalizeUiFontSize, readUiFontScale, uiPx } from "../uiFont";
 import {
   DocumentStats,
   assertDocumentReady,
@@ -92,7 +99,9 @@ import {
 } from "../word";
 import { OcrRunner, useFileSources } from "../files/useFileSources";
 import { ocrFile } from "../files/ocr";
+import { aboutCopy } from "../about";
 import ChatPane, { ChatDraft } from "./ChatPane";
+import { AboutDialog } from "./AboutDialog";
 import ArgosScopePicker from "./ArgosScopePicker";
 import { FileAttachButton, FileBadges } from "./FileAttachBar";
 import ContextMeter from "./ContextMeter";
@@ -186,12 +195,12 @@ const useStyles = makeStyles({
     resize: "none",
     backgroundColor: "transparent",
     fontFamily: "inherit",
-    fontSize: "14px",
-    lineHeight: "21px",
+    fontSize: uiPx(14),
+    lineHeight: uiPx(21),
     color: tokens.colorNeutralForeground1,
     padding: "2px 4px",
-    minHeight: "21px",
-    maxHeight: "168px",
+    minHeight: uiPx(21),
+    maxHeight: uiPx(168),
     overflowY: "hidden",
     "&::placeholder": {
       color: tokens.colorNeutralForeground4,
@@ -206,26 +215,20 @@ const useStyles = makeStyles({
     justifyContent: "flex-end",
     gap: "6px",
   },
-  disclaimer: {
-    maxWidth: "260px",
-    fontSize: "12px",
-    lineHeight: "1.55",
-    color: tokens.colorNeutralForeground1,
-  },
   muted: {
     color: tokens.colorNeutralForeground3,
   },
   banner: {
-    fontSize: "12px",
-    lineHeight: "16px",
+    fontSize: uiPx(12),
+    lineHeight: uiPx(16),
     "& .fui-MessageBarBody": {
-      fontSize: "12px",
-      lineHeight: "16px",
+      fontSize: uiPx(12),
+      lineHeight: uiPx(16),
     },
   },
   bannerText: {
-    fontSize: "12px",
-    lineHeight: "16px",
+    fontSize: uiPx(12),
+    lineHeight: uiPx(16),
     whiteSpace: "pre-wrap",
   },
   bannerDismiss: {
@@ -242,18 +245,27 @@ const useStyles = makeStyles({
 
 type Banner = { intent: "info" | "success" | "warning" | "error"; text: string };
 
+type HeaderPanel = "connection" | "settings" | "about" | null;
+
 const COMPOSER_LINE_PX = 21;
 const COMPOSER_MAX_LINES = 8;
-const COMPOSER_MAX_PX = COMPOSER_LINE_PX * COMPOSER_MAX_LINES;
+
+const UI_FONT_CHOICES: { value: UiFontSize; label: string }[] = [
+  { value: "small", label: "小" },
+  { value: "medium", label: "標準" },
+  { value: "large", label: "大" },
+];
 
 function fitComposer(el: HTMLTextAreaElement | null): void {
   if (!el) {
     return;
   }
+  const line = COMPOSER_LINE_PX * readUiFontScale();
+  const max = line * COMPOSER_MAX_LINES;
   el.style.height = "auto";
-  const next = Math.min(el.scrollHeight, COMPOSER_MAX_PX);
-  el.style.height = `${Math.max(COMPOSER_LINE_PX, next)}px`;
-  el.style.overflowY = el.scrollHeight > COMPOSER_MAX_PX ? "auto" : "hidden";
+  const next = Math.min(el.scrollHeight, max);
+  el.style.height = `${Math.max(line, next)}px`;
+  el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
 }
 
 const StatusBanner: React.FC<{ banner: Banner; onDismiss: () => void }> = ({
@@ -300,7 +312,7 @@ const App: React.FC = () => {
   const [models, setModels] = React.useState<string[]>([]);
   const [banner, setBanner] = React.useState<Banner | null>(null);
   const [inWord, setInWord] = React.useState(false);
-  const [settingsOpen, setSettingsOpen] = React.useState(false);
+  const [panel, setPanel] = React.useState<HeaderPanel>(null);
   const [historyOpen, setHistoryOpen] = React.useState(false);
 
   const [documentKey, setDocumentKey] = React.useState("");
@@ -318,6 +330,7 @@ const App: React.FC = () => {
   const [selectionChars, setSelectionChars] = React.useState(0);
   const [stats, setStats] = React.useState<DocumentStats>({
     chars: 0,
+    attachChars: 0,
     comments: 0,
     changes: 0,
     changesAvailable: true,
@@ -339,6 +352,7 @@ const App: React.FC = () => {
           fontName: settings.fontName,
           bodyPt: settings.bodyPt,
           titlePt: settings.titlePt,
+          lineSpacingChars: settings.lineSpacingChars,
           search: Boolean(settings.searxngUrl.trim()),
           argos: Boolean(settings.argosBaseUrl.trim()),
           argosPathPrefix,
@@ -350,6 +364,7 @@ const App: React.FC = () => {
       settings.fontName,
       settings.bodyPt,
       settings.titlePt,
+      settings.lineSpacingChars,
       settings.searxngUrl,
       settings.argosBaseUrl,
       argosPathPrefix,
@@ -403,9 +418,11 @@ const App: React.FC = () => {
     withMarkup && stats.comments + stats.changes > 0
       ? markupCharBudget(attachBudget - attachedFocusChars)
       : 0;
+  // Against the attach size, not the plain body size: the paragraph numbers ride
+  // along, and a meter that ignores them reads low on a long contract.
   const attachedDocChars =
     scope === "document"
-      ? Math.max(0, Math.min(stats.chars, attachBudget - attachedFocusChars - markupChars))
+      ? Math.max(0, Math.min(stats.attachChars, attachBudget - attachedFocusChars - markupChars))
       : 0;
 
   /** What the next send would carry: the conversation's files plus ready badges. */
@@ -446,7 +463,7 @@ const App: React.FC = () => {
     scope,
     documentChars: attachedDocChars,
     focusChars: attachedFocusChars,
-    truncated: scope === "document" && attachedDocChars < stats.chars,
+    truncated: scope === "document" && attachedDocChars < stats.attachChars,
     markup: withMarkup,
     comments: stats.comments,
     changes: stats.changes,
@@ -554,6 +571,47 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const refreshConnection = async () => {
+    try {
+      const result = await fetchConnection();
+      if (result.kind !== "ready") return;
+      let next: Settings | null = null;
+      let keep = false;
+      setSettings((current) => {
+        const applied = applyAdopt(current, result);
+        next = applied.settings;
+        keep = applied.keepConnection;
+        return applied.settings;
+      });
+      if (next) {
+        setKeepConnectionInStorage(keep);
+        saveSettings(next);
+      }
+    } catch {
+      // 欄は今の画面の値で開く。
+    }
+  };
+
+  const saveConnection = async () => {
+    const fields = {
+      llmBaseUrl: settings.llmBaseUrl,
+      llmApiKey: settings.llmApiKey,
+      searxngUrl: settings.searxngUrl,
+    };
+    try {
+      await saveStoredConnection(fields);
+    } catch (error) {
+      setBanner({
+        intent: "error",
+        text: error instanceof Error ? error.message : "接続を保存できません。",
+      });
+      return;
+    }
+    const applied = applyAdopt(settings, { kind: "ready", ...fields });
+    setKeepConnectionInStorage(false);
+    await runHealth(applied.settings);
+  };
+
   React.useEffect(() => {
     const word = isWordHost();
     setInWord(word);
@@ -563,9 +621,25 @@ const App: React.FC = () => {
       if (!up) {
         setBanner({
           intent: "warning",
-          text: "ローカル側の API に届いていません。GURI のトレイ常駐を起動するか、開発時は npm start（または npm run dev-server）を実行してください。",
+          text: "ローカル側の API に届いていません。LexCrew Doc のトレイ常駐を起動するか、開発時は npm start（または npm run dev-server）を実行してください。",
         });
         return;
+      }
+
+      let current = loadSettings();
+      try {
+        const adopted = await adoptStoredConnection({
+          llmBaseUrl: current.llmBaseUrl,
+          llmApiKey: current.llmApiKey,
+          searxngUrl: current.searxngUrl,
+        });
+        const applied = applyAdopt(current, adopted);
+        setKeepConnectionInStorage(applied.keepConnection);
+        current = applied.settings;
+        setSettings(current);
+        if (adopted.kind === "ready") saveSettings(current);
+      } catch {
+        // ファイルを読めない起動では、今の localStorage を残す。
       }
 
       const key = word ? getDocumentKey(DOCUMENT_KEY_SETTING) : "";
@@ -582,7 +656,6 @@ const App: React.FC = () => {
         // No history yet is not an error.
       }
 
-      const current = loadSettings();
       if (current.llmBaseUrl && current.llmApiKey) {
         await runHealth(current);
       }
@@ -633,6 +706,11 @@ const App: React.FC = () => {
     };
   }, [inWord, refreshStats]);
 
+  React.useLayoutEffect(() => {
+    applyUiFont(settings.uiFontSize);
+    fitComposer(inputRef.current);
+  }, [settings.uiFontSize]);
+
   React.useEffect(() => {
     fitComposer(inputRef.current);
   }, [input]);
@@ -653,7 +731,11 @@ const App: React.FC = () => {
   }, []);
 
   const patch = (partial: Partial<Settings>) => {
-    setSettings((current) => ({ ...current, ...partial }));
+    setSettings((current) => {
+      const next = { ...current, ...partial };
+      saveSettings(next);
+      return next;
+    });
   };
 
   const cancel = () => {
@@ -858,11 +940,6 @@ const App: React.FC = () => {
       <div className={styles.header}>
         <ContextMeter tokens={estimated} limit={settings.contextLimit} />
         <div className={styles.headerActions}>
-          {settingsIncomplete && (
-            <Text className={styles.muted} size={200}>
-              未設定
-            </Text>
-          )}
           <Button
             appearance="subtle"
             size="small"
@@ -877,28 +954,39 @@ const App: React.FC = () => {
               })();
             }}
           />
+          {settingsIncomplete && (
+            <Text className={styles.muted} size={200}>
+              未設定
+            </Text>
+          )}
+          <Button
+            appearance="subtle"
+            size="small"
+            className={styles.headerButton}
+            icon={<PlugConnectedRegular />}
+            aria-label="接続"
+            onClick={() => {
+              setPanel("connection");
+              void refreshConnection();
+            }}
+          />
           <Button
             appearance="subtle"
             size="small"
             className={styles.headerButton}
             icon={<SettingsRegular />}
-            aria-label="接続と設定"
-            onClick={() => setSettingsOpen(true)}
+            aria-label="設定"
+            onClick={() => setPanel("settings")}
           />
-          <Popover withArrow positioning={{ position: "below", align: "end" }}>
-            <PopoverTrigger disableButtonEnhancement>
-              <Button
-                appearance="subtle"
-                size="small"
-                className={styles.headerButton}
-                icon={<ErrorCircleRegular />}
-                aria-label="免責を表示"
-              />
-            </PopoverTrigger>
-            <PopoverSurface>
-              <Text className={styles.disclaimer}>{DISCLAIMER}</Text>
-            </PopoverSurface>
-          </Popover>
+          <Button
+            appearance="subtle"
+            size="small"
+            className={styles.headerButton}
+            icon={<InfoRegular />}
+            aria-label={aboutCopy.buttonLabel}
+            title={aboutCopy.hint}
+            onClick={() => setPanel("about")}
+          />
         </div>
       </div>
 
@@ -1068,14 +1156,17 @@ const App: React.FC = () => {
         onDelete={(id) => void removeConversation(id)}
       />
 
-      <Dialog open={settingsOpen} onOpenChange={(_, data) => setSettingsOpen(data.open)}>
-        <DialogSurface className={dialog.surface} aria-label="接続と設定">
+      <Dialog
+        open={panel === "connection"}
+        onOpenChange={(_, data) => setPanel(data.open ? "connection" : null)}
+      >
+        <DialogSurface className={dialog.surface} aria-label="接続">
           <DialogBody className={dialog.body}>
             <DialogTitle
               className={dialog.heading}
-              action={<CompactDialogClose onClick={() => setSettingsOpen(false)} />}
+              action={<CompactDialogClose onClick={() => setPanel(null)} />}
             >
-              接続と設定
+              接続
             </DialogTitle>
             <DialogContent className={dialog.scrollContent}>
               {banner && <StatusBanner banner={banner} onDismiss={() => setBanner(null)} />}
@@ -1084,20 +1175,20 @@ const App: React.FC = () => {
                   <Input
                     size="small"
                     value={settings.llmBaseUrl}
-                    onChange={(_, d) => patch({ llmBaseUrl: d.value })}
+                    onChange={(_, d) => setSettings((current) => ({ ...current, llmBaseUrl: d.value }))}
                     placeholder="http://192.168.x.x:8000/v1"
                   />
                 </Field>
                 <Field
                   size="small"
                   label="APIキー"
-                  hint="文書には保存しません。この作業ウィンドウの localStorage のみです。"
+                  hint="文書には保存しません。LexCrew の接続ファイルが正です。"
                 >
                   <Input
                     size="small"
                     type="password"
                     value={settings.llmApiKey}
-                    onChange={(_, d) => patch({ llmApiKey: d.value })}
+                    onChange={(_, d) => setSettings((current) => ({ ...current, llmApiKey: d.value }))}
                     placeholder="mtplx の API キー"
                   />
                 </Field>
@@ -1128,33 +1219,13 @@ const App: React.FC = () => {
                 )}
                 <Field
                   size="small"
-                  label="タイムアウト（秒）"
-                  hint={`1 回の応答待ち。長い契約書は ${Math.round(MAX_TIMEOUT_MS / 1000)} 秒まで延ばせます。`}
-                >
-                  <Input
-                    size="small"
-                    type="number"
-                    value={String(Math.round(settings.timeoutMs / 1000))}
-                    onChange={(_, d) => {
-                      const seconds = Number(d.value);
-                      patch({
-                        timeoutMs:
-                          Number.isFinite(seconds) && seconds > 0
-                            ? clampTimeoutMs(seconds * 1000)
-                            : settings.timeoutMs,
-                      });
-                    }}
-                  />
-                </Field>
-                <Field
-                  size="small"
                   label="SearXNG URL"
                   hint="空にするとウェブ検索ツールをモデルに渡しません。"
                 >
                   <Input
                     size="small"
                     value={settings.searxngUrl}
-                    onChange={(_, d) => patch({ searxngUrl: d.value })}
+                    onChange={(_, d) => setSettings((current) => ({ ...current, searxngUrl: d.value }))}
                     placeholder="http://192.168.x.x:8080"
                   />
                 </Field>
@@ -1181,6 +1252,69 @@ const App: React.FC = () => {
                     value={settings.argosApiKey}
                     onChange={(_, d) => patch({ argosApiKey: d.value })}
                     placeholder="任意"
+                  />
+                </Field>
+                <Button
+                  appearance="primary"
+                  size="small"
+                  disabled={busy}
+                  onClick={() => void saveConnection()}
+                >
+                  保存して接続確認
+                </Button>
+              </div>
+            </DialogContent>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
+
+      <Dialog
+        open={panel === "settings"}
+        onOpenChange={(_, data) => setPanel(data.open ? "settings" : null)}
+      >
+        <DialogSurface className={dialog.surface} aria-label="設定">
+          <DialogBody className={dialog.body}>
+            <DialogTitle
+              className={dialog.heading}
+              action={<CompactDialogClose onClick={() => setPanel(null)} />}
+            >
+              設定
+            </DialogTitle>
+            <DialogContent className={dialog.scrollContent}>
+              <div className={dialog.stack}>
+                <Field
+                  size="small"
+                  label="画面の文字サイズ"
+                  hint="この画面の文字です。文書へ挿入する大きさとは別です。"
+                >
+                  <RadioGroup
+                    layout="horizontal"
+                    value={settings.uiFontSize}
+                    onChange={(_, d) => patch({ uiFontSize: normalizeUiFontSize(d.value) })}
+                  >
+                    {UI_FONT_CHOICES.map((choice) => (
+                      <Radio key={choice.value} value={choice.value} label={choice.label} />
+                    ))}
+                  </RadioGroup>
+                </Field>
+                <Field
+                  size="small"
+                  label="タイムアウト（秒）"
+                  hint={`1 回の応答待ち。長い契約書は ${Math.round(MAX_TIMEOUT_MS / 1000)} 秒まで延ばせます。`}
+                >
+                  <Input
+                    size="small"
+                    type="number"
+                    value={String(Math.round(settings.timeoutMs / 1000))}
+                    onChange={(_, d) => {
+                      const seconds = Number(d.value);
+                      patch({
+                        timeoutMs:
+                          Number.isFinite(seconds) && seconds > 0
+                            ? clampTimeoutMs(seconds * 1000)
+                            : settings.timeoutMs,
+                      });
+                    }}
                   />
                 </Field>
                 <Field
@@ -1261,11 +1395,29 @@ const App: React.FC = () => {
                   hint="游明朝が無ければ ＭＳ 明朝を選んでください。"
                 >
                   <RadioGroup
+                    layout="horizontal"
                     value={settings.fontName}
                     onChange={(_, d) => patch({ fontName: d.value })}
                   >
                     {FONT_CHOICES.map((name) => (
                       <Radio key={name} value={name} label={name} />
+                    ))}
+                  </RadioGroup>
+                </Field>
+                <Field
+                  size="small"
+                  label="行間"
+                  hint="挿入する段落の行の高さです。1字はその段落の文字サイズと同じです。"
+                >
+                  <RadioGroup
+                    layout="horizontal"
+                    value={String(settings.lineSpacingChars)}
+                    onChange={(_, d) =>
+                      patch({ lineSpacingChars: normalizeLineSpacingChars(Number(d.value)) })
+                    }
+                  >
+                    {LINE_SPACING_CHARS.map((chars) => (
+                      <Radio key={chars} value={String(chars)} label={`${chars}字`} />
                     ))}
                   </RadioGroup>
                 </Field>
@@ -1293,19 +1445,16 @@ const App: React.FC = () => {
                     />
                   </Field>
                 </div>
-                <Button
-                  appearance="primary"
-                  size="small"
-                  disabled={busy}
-                  onClick={() => void runHealth(settings)}
-                >
-                  保存して接続確認
-                </Button>
               </div>
             </DialogContent>
           </DialogBody>
         </DialogSurface>
       </Dialog>
+
+      <AboutDialog
+        open={panel === "about"}
+        onOpenChange={(open) => setPanel(open ? "about" : null)}
+      />
     </div>
   );
 };

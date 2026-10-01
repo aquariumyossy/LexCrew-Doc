@@ -27,60 +27,6 @@
       }
     },
     {
-      "label": "Debug: Excel Desktop",
-      "type": "shell",
-      "command": "npm",
-      "args": [
-        "run",
-        "start",
-        "--",
-        "desktop",
-        "--app",
-        "excel"
-      ],
-      "presentation": {
-        "clear": true,
-        "panel": "dedicated"
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "Debug: Outlook Desktop",
-      "type": "shell",
-      "command": "npm",
-      "args": [
-        "run",
-        "start",
-        "--",
-        "desktop",
-        "--app",
-        "outlook"
-      ],
-      "presentation": {
-        "clear": true,
-        "panel": "dedicated"
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "Debug: PowerPoint Desktop",
-      "type": "shell",
-      "command": "npm",
-      "args": [
-        "run",
-        "start",
-        "--",
-        "desktop",
-        "--app",
-        "powerpoint"
-      ],
-      "presentation": {
-        "clear": true,
-        "panel": "dedicated"
-      },
-      "problemMatcher": []
-    },
-    {
       "label": "Debug: Word Desktop",
       "type": "shell",
       "command": "npm",
@@ -105,17 +51,6 @@
       "presentation": {
         "clear": true,
         "panel": "dedicated"
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "Install",
-      "type": "npm",
-      "script": "install",
-      "presentation": {
-        "clear": true,
-        "panel": "shared",
-        "showReuseMessage": false
       },
       "problemMatcher": []
     },

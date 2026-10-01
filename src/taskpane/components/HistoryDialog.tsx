@@ -13,9 +13,12 @@ import {
 import { AddRegular, DeleteRegular } from "@fluentui/react-icons";
 import {
   ConversationSummary,
+  DocumentGroup,
   conversationDocumentLabel,
   groupConversationsByDocument,
+  partitionConversations,
 } from "../../shared/history";
+import { uiPx } from "../uiFont";
 import { CompactDialogClose, useCompactDialogStyles } from "./compactDialog";
 
 const useStyles = makeStyles({
@@ -47,20 +50,20 @@ const useStyles = makeStyles({
     padding: "0",
     textAlign: "left",
     justifyContent: "flex-start",
-    fontSize: "12px",
-    lineHeight: "16px",
+    fontSize: uiPx(12),
+    lineHeight: uiPx(16),
   },
   title: {
     display: "block",
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
-    fontSize: "12px",
-    lineHeight: "16px",
+    fontSize: uiPx(12),
+    lineHeight: uiPx(16),
   },
   empty: {
     color: tokens.colorNeutralForeground3,
-    fontSize: "12px",
+    fontSize: uiPx(12),
     padding: "8px 6px",
   },
   group: {
@@ -79,19 +82,16 @@ const useStyles = makeStyles({
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
-    fontSize: "11px",
-    lineHeight: "16px",
+    fontSize: uiPx(11),
+    lineHeight: uiPx(16),
     color: tokens.colorNeutralForeground2,
   },
-  badge: {
+  sectionHeading: {
     flexShrink: 0,
-    fontSize: "10px",
-    lineHeight: "16px",
-    padding: "0 6px",
-    borderRadius: "999px",
-    border: `1px solid ${tokens.colorNeutralStroke2}`,
-    color: tokens.colorNeutralForeground3,
-    backgroundColor: tokens.colorNeutralBackground1,
+    fontSize: uiPx(12),
+    lineHeight: uiPx(16),
+    fontWeight: tokens.fontWeightSemibold,
+    color: tokens.colorNeutralForeground1,
   },
   iconButton: {
     minWidth: "20px",
@@ -114,33 +114,126 @@ function formatDate(iso: string): string {
   });
 }
 
-export type HistoryDialogProps = {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
+export type HistoryConversationListProps = {
   conversations: ConversationSummary[];
   activeId: string | null;
   currentDocumentKey?: string;
   currentDocumentPath?: string;
   onSelect: (id: string) => void;
-  onNew: () => void;
   onDelete: (id: string) => void;
 };
 
-const HistoryDialog: React.FC<HistoryDialogProps> = ({
-  open,
-  onOpenChange,
+export type HistoryDialogProps = HistoryConversationListProps & {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onNew: () => void;
+};
+
+export const HistoryConversationList: React.FC<HistoryConversationListProps> = ({
   conversations,
   activeId,
   currentDocumentKey = "",
   currentDocumentPath = "",
   onSelect,
-  onNew,
   onDelete,
 }) => {
   const styles = useStyles();
   const dialog = useCompactDialogStyles();
+  const split = partitionConversations(conversations, currentDocumentKey);
+  const elsewhereGroups = groupConversationsByDocument(split.elsewhere);
+  const currentLabel = conversationDocumentLabel(
+    {
+      documentKey: currentDocumentKey,
+      documentPath: split.here[0]?.documentPath ?? "",
+    },
+    currentDocumentKey,
+    currentDocumentPath
+  );
+  const currentPath = currentDocumentPath || split.here[0]?.documentPath || "";
+
+  const conversationRow = (conversation: ConversationSummary) => (
+    <div
+      key={conversation.id}
+      className={`${styles.row} ${conversation.id === activeId ? styles.active : ""}`}
+    >
+      <Button
+        appearance="subtle"
+        size="small"
+        className={styles.pick}
+        onClick={() => onSelect(conversation.id)}
+      >
+        <span className={styles.title}>
+          <Text weight="semibold" block className={styles.title}>
+            {conversation.title}
+          </Text>
+          <Text className={dialog.muted} block>
+            {formatDate(conversation.updatedAt)} · {conversation.messageCount} 件
+          </Text>
+        </span>
+      </Button>
+      <Button
+        appearance="subtle"
+        size="small"
+        className={styles.iconButton}
+        icon={<DeleteRegular fontSize={14} />}
+        aria-label={`${conversation.title} を削除`}
+        onClick={() => onDelete(conversation.id)}
+      />
+    </div>
+  );
+
+  const documentGroup = (group: DocumentGroup) => {
+    const sample = group.conversations[0];
+    const fileLabel = conversationDocumentLabel(sample, currentDocumentKey, currentDocumentPath);
+    return (
+      <div key={group.documentKey || group.documentPath || sample.id} className={styles.group}>
+        <div className={styles.groupHeader} title={group.documentPath || fileLabel}>
+          <span className={styles.groupLabel}>{fileLabel}</span>
+        </div>
+        {group.conversations.map(conversationRow)}
+      </div>
+    );
+  };
+
+  return (
+    <div className={styles.list}>
+      {currentDocumentKey ? (
+        <>
+          <div className={styles.groupHeader} title={currentPath || currentLabel}>
+            <span className={styles.sectionHeading}>この文書</span>
+            <span className={styles.groupLabel}>{currentLabel}</span>
+          </div>
+          {split.here.length ? (
+            split.here.map(conversationRow)
+          ) : (
+            <Text className={styles.empty}>この文書の履歴はまだありません。</Text>
+          )}
+          {elsewhereGroups.length ? (
+            <>
+              <div className={styles.groupHeader}>
+                <span className={styles.sectionHeading}>ほかの文書</span>
+              </div>
+              {elsewhereGroups.map(documentGroup)}
+            </>
+          ) : null}
+        </>
+      ) : elsewhereGroups.length ? (
+        elsewhereGroups.map(documentGroup)
+      ) : (
+        <Text className={styles.empty}>まだ会話がありません。</Text>
+      )}
+    </div>
+  );
+};
+
+const HistoryDialog: React.FC<HistoryDialogProps> = ({
+  open,
+  onOpenChange,
+  onNew,
+  ...list
+}) => {
+  const dialog = useCompactDialogStyles();
   const close = () => onOpenChange(false);
-  const groups = groupConversationsByDocument(conversations);
 
   return (
     <Dialog open={open} onOpenChange={(_, data) => onOpenChange(data.open)}>
@@ -158,65 +251,7 @@ const HistoryDialog: React.FC<HistoryDialogProps> = ({
             >
               新しい会話
             </Button>
-            <div className={styles.list}>
-              {!conversations.length ? (
-                <Text className={styles.empty}>まだ会話がありません。</Text>
-              ) : null}
-              {groups.map((group) => {
-                const sample = group.conversations[0];
-                const fileLabel = conversationDocumentLabel(
-                  sample,
-                  currentDocumentKey,
-                  currentDocumentPath
-                );
-                const isCurrent =
-                  Boolean(currentDocumentKey) && group.documentKey === currentDocumentKey;
-                const pathHint = isCurrent
-                  ? currentDocumentPath || group.documentPath
-                  : group.documentPath;
-                return (
-                  <div
-                    key={group.documentKey || group.documentPath || sample.id}
-                    className={styles.group}
-                  >
-                    <div className={styles.groupHeader} title={pathHint || fileLabel}>
-                      <span className={styles.groupLabel}>{fileLabel}</span>
-                      {isCurrent ? <span className={styles.badge}>この文書</span> : null}
-                    </div>
-                    {group.conversations.map((conversation) => (
-                      <div
-                        key={conversation.id}
-                        className={`${styles.row} ${conversation.id === activeId ? styles.active : ""}`}
-                      >
-                        <Button
-                          appearance="subtle"
-                          size="small"
-                          className={styles.pick}
-                          onClick={() => onSelect(conversation.id)}
-                        >
-                          <span className={styles.title}>
-                            <Text weight="semibold" block className={styles.title}>
-                              {conversation.title}
-                            </Text>
-                            <Text className={dialog.muted} block>
-                              {formatDate(conversation.updatedAt)} · {conversation.messageCount} 件
-                            </Text>
-                          </span>
-                        </Button>
-                        <Button
-                          appearance="subtle"
-                          size="small"
-                          className={styles.iconButton}
-                          icon={<DeleteRegular fontSize={14} />}
-                          aria-label={`${conversation.title} を削除`}
-                          onClick={() => onDelete(conversation.id)}
-                        />
-                      </div>
-                    ))}
-                  </div>
-                );
-              })}
-            </div>
+            <HistoryConversationList {...list} />
             <Text className={dialog.muted}>
               会話は開いていた Word ファイルに紐づき、この PC のローカル
               DB（%APPDATA%\GURI\history.db）だけに保存されます。

@@ -5,6 +5,7 @@ import { foreignCharNoticeForAssistant } from "../../shared/japaneseHan";
 import { splitUserMessage } from "../../shared/prompts";
 import { TOOL_SEARCH, TOOL_SEARCH_INDEX, describeToolCall } from "../../shared/tools";
 import { SearchHit } from "../../sidecar/types";
+import { uiPx } from "../uiFont";
 import MarkdownView, { CollapsedLink } from "./MarkdownView";
 
 const useStyles = makeStyles({
@@ -72,7 +73,7 @@ const useStyles = makeStyles({
     borderRadius: "6px",
     padding: "6px 8px",
     color: tokens.colorNeutralForeground3,
-    fontSize: "12px",
+    fontSize: uiPx(12),
   },
   disclosureBody: {
     marginTop: "6px",
@@ -98,7 +99,7 @@ const useStyles = makeStyles({
   },
   warning: {
     color: tokens.colorPaletteDarkOrangeForeground1,
-    fontSize: "12px",
+    fontSize: uiPx(12),
     marginTop: "6px",
   },
 });

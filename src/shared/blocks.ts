@@ -1,4 +1,4 @@
-import { DEFAULT_BODY_PT, DEFAULT_FONT_NAME, DEFAULT_TITLE_PT } from "./constants";
+import { DEFAULT_BODY_PT, DEFAULT_FONT_NAME, DEFAULT_LINE_SPACING_CHARS, DEFAULT_TITLE_PT, lineSpacingPt } from "./constants";
 
 export type BlockType = "title" | "heading" | "body" | "clause" | "item" | "center" | "right";
 
@@ -33,6 +33,8 @@ export type ParagraphSpec = {
   bold: boolean;
   firstLineIndentPt: number;
   leftIndentPt: number;
+  /** Exact line box, in points. One 字 is this paragraph's font size. */
+  lineSpacingPt: number;
   runs: TextRun[];
 };
 
@@ -40,6 +42,7 @@ export type FontOptions = {
   fontName?: string;
   bodyPt?: number;
   titlePt?: number;
+  lineSpacingChars?: number;
 };
 
 export type Severity = "high" | "medium" | "low";
@@ -87,11 +90,16 @@ export function mapBlockToParagraph(block: DraftBlock, options: FontOptions = {}
   const fontName = options.fontName || DEFAULT_FONT_NAME;
   const bodyPt = options.bodyPt || DEFAULT_BODY_PT;
   const titlePt = options.titlePt || DEFAULT_TITLE_PT;
+  const chars = options.lineSpacingChars ?? DEFAULT_LINE_SPACING_CHARS;
   const em = bodyPt;
+  const finish = (spec: Omit<ParagraphSpec, "lineSpacingPt">): ParagraphSpec => ({
+    ...spec,
+    lineSpacingPt: lineSpacingPt(spec.fontSize, chars),
+  });
 
   switch (block.type) {
     case "title":
-      return {
+      return finish({
         type: "title",
         alignment: "center",
         fontName,
@@ -100,9 +108,9 @@ export function mapBlockToParagraph(block: DraftBlock, options: FontOptions = {}
         firstLineIndentPt: 0,
         leftIndentPt: 0,
         runs: [{ text: block.text, bold: true }],
-      };
+      });
     case "heading":
-      return {
+      return finish({
         type: "heading",
         alignment: "left",
         fontName,
@@ -111,9 +119,9 @@ export function mapBlockToParagraph(block: DraftBlock, options: FontOptions = {}
         firstLineIndentPt: 0,
         leftIndentPt: 0,
         runs: [{ text: block.text, bold: true }],
-      };
+      });
     case "body":
-      return {
+      return finish({
         type: "body",
         alignment: "left",
         fontName,
@@ -122,9 +130,9 @@ export function mapBlockToParagraph(block: DraftBlock, options: FontOptions = {}
         firstLineIndentPt: em,
         leftIndentPt: 0,
         runs: [{ text: block.text, bold: false }],
-      };
+      });
     case "clause":
-      return {
+      return finish({
         type: "clause",
         alignment: "left",
         fontName,
@@ -133,9 +141,9 @@ export function mapBlockToParagraph(block: DraftBlock, options: FontOptions = {}
         firstLineIndentPt: 0,
         leftIndentPt: 0,
         runs: clauseRuns(block),
-      };
+      });
     case "item":
-      return {
+      return finish({
         type: "item",
         alignment: "left",
         fontName,
@@ -144,9 +152,9 @@ export function mapBlockToParagraph(block: DraftBlock, options: FontOptions = {}
         firstLineIndentPt: 0,
         leftIndentPt: em,
         runs: [{ text: block.text, bold: false }],
-      };
+      });
     case "center":
-      return {
+      return finish({
         type: "center",
         alignment: "center",
         fontName,
@@ -155,9 +163,9 @@ export function mapBlockToParagraph(block: DraftBlock, options: FontOptions = {}
         firstLineIndentPt: 0,
         leftIndentPt: 0,
         runs: [{ text: block.text, bold: false }],
-      };
+      });
     case "right":
-      return {
+      return finish({
         type: "right",
         alignment: "right",
         fontName,
@@ -166,9 +174,9 @@ export function mapBlockToParagraph(block: DraftBlock, options: FontOptions = {}
         firstLineIndentPt: 0,
         leftIndentPt: 0,
         runs: [{ text: block.text, bold: false }],
-      };
+      });
     default:
-      return {
+      return finish({
         type: "body",
         alignment: "left",
         fontName,
@@ -177,7 +185,7 @@ export function mapBlockToParagraph(block: DraftBlock, options: FontOptions = {}
         firstLineIndentPt: em,
         leftIndentPt: 0,
         runs: [{ text: block.text, bold: false }],
-      };
+      });
   }
 }
 
@@ -206,16 +214,30 @@ function clauseLabel(block: DraftBlock): string {
  * Where the insert actually started. Widens `InsertAtArg` in tools.ts (which
  * imports from this file) with the quoted-paragraph case.
  */
-export type InsertPlacement = "cursor" | "continue" | "end" | "quote";
+export type InsertPlacement = "cursor" | "continue" | "end" | "quote" | "paragraph";
+
+/** A paragraph the insert created, under the number this turn can point at it by. */
+export type InsertedParagraph = { number: number; text: string };
 
 /**
  * What the insert landed on. `after` is the paragraph the new text now follows,
  * which is the only way the model can tell it aimed at the wrong paragraph.
+ * `numbers` are the addresses handed out for the new paragraphs: they were not
+ * in the attachment, so without these the model can only quote them, and short
+ * items like 「数量　○○」 recur too often to quote.
  */
-export type InsertLanding = { placement: InsertPlacement; after: string };
+export type InsertLanding = {
+  placement: InsertPlacement;
+  after: string;
+  numbers?: InsertedParagraph[];
+};
+
+const NUMBERED_LINE_CHARS = 30;
 
 function placementLabel(placement: InsertPlacement): string {
   switch (placement) {
+    case "paragraph":
+      return "指定した段落の後ろに入れました";
     case "quote":
       return "引用した段落の後ろに入れました";
     case "end":
@@ -252,7 +274,20 @@ export function summarizeInsertedBlocks(
     parts.push(`入れた末尾は「${tail}」です`);
   }
   parts.push(
-    '意図と違う場所なら、続けずに報告してください。続きは at を "continue" にして足します'
+    '意図と違う場所なら、続けずに報告してください。続きは at を "continue" にして足します（変更履歴に記録）'
   );
-  return `${parts.join("。")}`;
+  const summary = `${parts.join("。")}。`;
+  if (!landing.numbers?.length) {
+    return summary;
+  }
+  // Kept as written (full-width spaces included): the model may quote from it.
+  const lines = landing.numbers.map((row) => {
+    const text = row.text.trim();
+    const clipped = text.length > NUMBERED_LINE_CHARS ? `${text.slice(0, NUMBERED_LINE_CHARS)}…` : text;
+    return `[${row.number}] ${clipped}`;
+  });
+  return (
+    `${summary}\n入れた段落の番号は次のとおりです。このターンでこれらの段落を指すときは、` +
+    `quote ではなくこの番号を paragraph / through に渡してください。\n${lines.join("\n")}`
+  );
 }

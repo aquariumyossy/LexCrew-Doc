@@ -54,18 +54,26 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   const { settings, signal } = options;
   const limit = settings.contextLimit;
   const hasSelection = Boolean(options.attachment.focus.trim());
+  // Numbers are only addresses if the model was handed them with the body.
+  const numbered = Boolean(options.attachment.document.trim());
   const system: ChatMessage = {
     role: "system",
     content: systemPrompt({
       fontName: settings.fontName,
       bodyPt: settings.bodyPt,
       titlePt: settings.titlePt,
+      lineSpacingChars: settings.lineSpacingChars,
       search: Boolean(settings.searxngUrl.trim()),
       argos: Boolean(settings.argosBaseUrl.trim()),
       argosPathPrefix: joinArgosScopes(options.argosPathPrefixes || []),
       selection: hasSelection,
+      numbered,
       markup: options.attachment.markup,
+      reviewedBody: Boolean(options.attachment.document.trim()) || options.attachment.scope !== "none",
+      reviewedFallback: options.attachment.reviewedFallback === true,
+      inlineMarkup: options.attachment.inlineMarkup === true,
       files: Boolean(options.files?.length),
+      listMarks: Boolean(options.attachment.listMarks),
     }),
   };
 
@@ -92,11 +100,18 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     content: userMessageForHistory(options.instruction, options.attachment, files),
   });
 
-  const tools = buildTools({
-    search: Boolean(settings.searxngUrl.trim()),
-    argos: Boolean(settings.argosBaseUrl.trim()),
-    selection: hasSelection,
-  });
+  // An insert hands out numbers for its new paragraphs, so from that round on
+  // the tools take a paragraph number even when the attachment had none.
+  let numbersHandedOut = false;
+  const toolsFor = () =>
+    buildTools({
+      search: Boolean(settings.searxngUrl.trim()),
+      argos: Boolean(settings.argosBaseUrl.trim()),
+      selection: hasSelection,
+      numbered,
+      insertedNumbers: numbersHandedOut,
+    });
+  let tools = toolsFor();
   let toolsSupported = true;
   let lastUsage: Usage | null = null;
   beginToolTurn();
@@ -167,6 +182,10 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       });
       await options.onMessage({ role: "tool", content: outcome.content, toolCallId: call.id });
       messages.push({ role: "tool", content: outcome.content, tool_call_id: call.id });
+      if (outcome.numbered && !numbersHandedOut) {
+        numbersHandedOut = true;
+        tools = toolsFor();
+      }
     }
     round += 1;
   }

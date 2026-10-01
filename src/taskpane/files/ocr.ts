@@ -8,11 +8,11 @@ import { openPdf } from "./pdf";
 /* global AbortSignal, File, HTMLCanvasElement, document, FileReader */
 
 /**
- * Rendered wide enough that small print survives, and as JPEG so one page fits
- * a request with room to spare once base64 has grown it by 4/3.
+ * Wide enough that small print survives. JPEG at 0.92 keeps a thin stroke on a
+ * chart. 0.85 erased it, and one page still fits the OCR body after base64.
  */
 const RASTER_WIDTH = 1700;
-const RASTER_QUALITY = 0.85;
+const RASTER_QUALITY = 0.92;
 
 export type OcrSettings = {
   llmBaseUrl: string;

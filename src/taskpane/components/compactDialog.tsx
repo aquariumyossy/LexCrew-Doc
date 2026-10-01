@@ -1,6 +1,7 @@
 import * as React from "react";
 import { Button, makeStyles, tokens } from "@fluentui/react-components";
 import { DismissRegular } from "@fluentui/react-icons";
+import { uiPx } from "../uiFont";
 
 /** Shared chrome for history, settings, and Argos dialogs. */
 export const useCompactDialogStyles = makeStyles({
@@ -8,8 +9,8 @@ export const useCompactDialogStyles = makeStyles({
     maxWidth: "100%",
     width: "calc(100vw - 16px)",
     padding: "8px",
-    fontSize: "12px",
-    lineHeight: "16px",
+    fontSize: uiPx(12),
+    lineHeight: uiPx(16),
     "& .fui-DialogBody": {
       padding: "0",
       gap: "6px",
@@ -19,13 +20,13 @@ export const useCompactDialogStyles = makeStyles({
       margin: "0",
     },
     "& .fui-DialogTitle": {
-      fontSize: "11px",
-      lineHeight: "16px",
+      fontSize: uiPx(11),
+      lineHeight: uiPx(16),
       fontWeight: tokens.fontWeightRegular,
       color: tokens.colorNeutralForeground2,
     },
     "& .fui-Button": {
-      fontSize: "12px",
+      fontSize: uiPx(12),
     },
     "& .fui-Button__icon": {
       fontSize: "14px",
@@ -41,30 +42,30 @@ export const useCompactDialogStyles = makeStyles({
       gap: "2px",
     },
     "& .fui-Label, & .fui-Field__label": {
-      fontSize: "12px",
-      lineHeight: "16px",
+      fontSize: uiPx(12),
+      lineHeight: uiPx(16),
     },
     "& .fui-Field__hint": {
-      fontSize: "11px",
-      lineHeight: "16px",
+      fontSize: uiPx(11),
+      lineHeight: uiPx(16),
     },
     "& .fui-Input": {
       minHeight: "24px",
-      fontSize: "12px",
+      fontSize: uiPx(12),
     },
     "& .fui-Input__input": {
-      fontSize: "12px",
+      fontSize: uiPx(12),
     },
     "& .fui-Radio, & .fui-Radio__label": {
-      fontSize: "12px",
-      lineHeight: "16px",
+      fontSize: uiPx(12),
+      lineHeight: uiPx(16),
     },
     "& .fui-RadioGroup": {
       gap: "4px",
     },
     "& .fui-Text": {
-      fontSize: "12px",
-      lineHeight: "16px",
+      fontSize: uiPx(12),
+      lineHeight: uiPx(16),
     },
   },
   body: {
@@ -72,8 +73,8 @@ export const useCompactDialogStyles = makeStyles({
     padding: "0",
   },
   heading: {
-    fontSize: "11px",
-    lineHeight: "16px",
+    fontSize: uiPx(11),
+    lineHeight: uiPx(16),
     fontWeight: tokens.fontWeightRegular,
     color: tokens.colorNeutralForeground2,
     whiteSpace: "normal",
@@ -110,8 +111,8 @@ export const useCompactDialogStyles = makeStyles({
   },
   muted: {
     color: tokens.colorNeutralForeground3,
-    fontSize: "12px",
-    lineHeight: "16px",
+    fontSize: uiPx(12),
+    lineHeight: uiPx(16),
   },
 });
 

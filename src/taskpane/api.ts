@@ -11,6 +11,7 @@ import { Completion } from "../shared/stripThinking";
 import { ThinkingLevel } from "../shared/thinking";
 import { ToolDefinition } from "../shared/tools";
 import { ChatMessage, SearchHit } from "../sidecar/types";
+import { ConnectionFields, ConnectionView } from "./connectionState";
 
 /* global fetch, Response, RequestInit, AbortSignal */
 
@@ -34,7 +35,7 @@ export type ChatResponse = Completion & {
 };
 
 const STALE_SIDECAR =
-  "GURI のローカル側が古いままです。トレイ常駐または npm start を起動し直してください。";
+  "LexCrew Doc のローカル側が古いままです。トレイ常駐または npm start を起動し直してください。";
 
 function looksLikeHtml(text: string): boolean {
   const trimmed = text.trimStart();
@@ -56,7 +57,7 @@ export function httpErrorMessage(text: string, status: number): string {
     if (/\/api\/argos/i.test(trimmed)) {
       return STALE_SIDECAR;
     }
-    return `ローカル側が ${status} を返しました。GURI を起動し直してください。`;
+    return `ローカル側が ${status} を返しました。LexCrew Doc を起動し直してください。`;
   }
   try {
     const parsed = JSON.parse(trimmed) as { error?: string };
@@ -85,6 +86,34 @@ export async function pingSidecar(signal?: AbortSignal): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export async function fetchConnection(): Promise<ConnectionView> {
+  const res = await fetch("/api/connection");
+  const payload = await parseJson<ConnectionView & { error?: string }>(res);
+  if (!res.ok) throw new Error(payload.error || `通信に失敗しました。${res.status}`);
+  return payload;
+}
+
+export async function adoptStoredConnection(fields: ConnectionFields): Promise<ConnectionView> {
+  const res = await fetch("/api/connection", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(fields),
+  });
+  const payload = await parseJson<ConnectionView & { error?: string }>(res);
+  if (!res.ok) throw new Error(payload.error || `通信に失敗しました。${res.status}`);
+  return payload;
+}
+
+export async function saveStoredConnection(fields: ConnectionFields): Promise<void> {
+  const res = await fetch("/api/connection", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(fields),
+  });
+  const payload = await parseJson<{ error?: string }>(res);
+  if (!res.ok) throw new Error(payload.error || `通信に失敗しました。${res.status}`);
 }
 
 export async function checkHealth(
@@ -240,8 +269,8 @@ export async function readImage(body: OcrBody, signal?: AbortSignal): Promise<st
       throw error;
     }
     // `fetch` throws a bare "Failed to fetch" when it cannot reach anything,
-    // and the thing it could not reach here is GURI itself, not the LLM.
-    throw new Error("GURI のローカル側に繋がりませんでした。起動し直してください。");
+    // and the thing it could not reach here is the local sidecar, not the LLM.
+    throw new Error("LexCrew Doc のローカル側に繋がりませんでした。起動し直してください。");
   }
   const data = await parseJson<{ text?: string; error?: string; hint?: string }>(res);
   if (!res.ok) {

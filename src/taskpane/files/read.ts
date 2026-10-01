@@ -51,7 +51,12 @@ async function readDocx(bytes: ArrayBuffer): Promise<FileText> {
   if (!document) {
     throw new FileReadError("Word の本文が見つかりませんでした。");
   }
-  return extractDocx({ document, comments: await zipText(zip, "word/comments.xml") });
+  return extractDocx({
+    document,
+    comments: await zipText(zip, "word/comments.xml"),
+    numbering: await zipText(zip, "word/numbering.xml"),
+    styles: await zipText(zip, "word/styles.xml"),
+  });
 }
 
 /** Sheet order comes from the workbook, not from the file names inside the zip. */

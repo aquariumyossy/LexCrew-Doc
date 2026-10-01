@@ -41,6 +41,14 @@ describe("foreignChars", () => {
     expect(foreignChars("国会学体来与門発國學")).toEqual([]);
   });
 
+  it("keeps JIS X 0208 拡張新字体 that Unihan lists as simplified Chinese", () => {
+    expect(foreignChars("嘘をつく")).toEqual([]);
+    expect(foreignChars("侠客の躯を掴み、麹と蝉と泪")).toEqual([]);
+    expect(isJapaneseHan("嘘".codePointAt(0)!)).toBe(true);
+    expect(isJapaneseHan("噓".codePointAt(0)!)).toBe(true);
+    expect(isJapaneseHan("个".codePointAt(0)!)).toBe(false);
+  });
+
   it("ignores kana, punctuation, latin and greek", () => {
     expect(foreignChars("はい。OK 123 「引用」")).toEqual([]);
     expect(foreignChars("α版　μm　ＡＩツール　ｱｲｳ")).toEqual([]);

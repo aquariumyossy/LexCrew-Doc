@@ -3,6 +3,7 @@ import {
   DEFAULT_BODY_PT,
   DEFAULT_CONTEXT_LIMIT,
   DEFAULT_FONT_NAME,
+  DEFAULT_LINE_SPACING_CHARS,
   DEFAULT_MODEL,
   DEFAULT_THINKING_BUDGET,
   DEFAULT_TIMEOUT_MS,
@@ -10,12 +11,16 @@ import {
   FALLBACK_FONT_NAME,
   LEGACY_DEFAULT_CONTEXT_LIMIT,
   LEGACY_DEFAULT_TIMEOUT_MS,
+  LineSpacingChars,
   MAX_TIMEOUT_MS,
   MIN_TIMEOUT_MS,
+  normalizeLineSpacingChars,
   SETTINGS_STORAGE_KEY,
 } from "../shared/constants";
 import { ThinkingLevel, normalizeThinkingBudget, normalizeThinkingLevel } from "../shared/thinking";
 import { MAX_TOOL_ROUNDS, normalizeMaxToolRounds } from "../shared/tools";
+import { settingsForStorage } from "./connectionState";
+import { UiFontSize, normalizeUiFontSize } from "./uiFont";
 
 /* global localStorage */
 
@@ -30,11 +35,13 @@ export type Settings = {
   fontName: string;
   bodyPt: number;
   titlePt: number;
+  lineSpacingChars: LineSpacingChars;
   thinkingLevel: ThinkingLevel;
   thinkingBudget: number;
   contextLimit: number;
   /** 0 means no cap. */
   maxToolRounds: number;
+  uiFontSize: UiFontSize;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -48,10 +55,12 @@ export const DEFAULT_SETTINGS: Settings = {
   fontName: DEFAULT_FONT_NAME,
   bodyPt: DEFAULT_BODY_PT,
   titlePt: DEFAULT_TITLE_PT,
+  lineSpacingChars: DEFAULT_LINE_SPACING_CHARS,
   thinkingLevel: "medium",
   thinkingBudget: DEFAULT_THINKING_BUDGET,
   contextLimit: DEFAULT_CONTEXT_LIMIT,
   maxToolRounds: MAX_TOOL_ROUNDS,
+  uiFontSize: "medium",
 };
 
 export const FONT_CHOICES = [DEFAULT_FONT_NAME, FALLBACK_FONT_NAME];
@@ -96,16 +105,27 @@ export function loadSettings(): Settings {
     return {
       ...merged,
       timeoutMs: migrateTimeoutMs(merged.timeoutMs),
+      lineSpacingChars: normalizeLineSpacingChars(merged.lineSpacingChars),
       thinkingLevel: normalizeThinkingLevel(merged.thinkingLevel),
       thinkingBudget: normalizeThinkingBudget(merged.thinkingBudget),
       contextLimit: migrateContextLimit(merged.contextLimit),
       maxToolRounds: normalizeMaxToolRounds(merged.maxToolRounds),
+      uiFontSize: normalizeUiFontSize(parsed.uiFontSize),
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
 }
 
+let keepConnectionInStorage = true;
+
+export function setKeepConnectionInStorage(keep: boolean): void {
+  keepConnectionInStorage = keep;
+}
+
 export function saveSettings(settings: Settings): void {
-  localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  localStorage.setItem(
+    SETTINGS_STORAGE_KEY,
+    JSON.stringify(settingsForStorage(settings, keepConnectionInStorage))
+  );
 }

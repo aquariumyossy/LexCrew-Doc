@@ -20,12 +20,48 @@ import {
 import {
   InsertLanding,
   InsertPlacement,
+  InsertedParagraph,
   ParagraphSpec,
   Severity,
   specPlainText,
 } from "../shared/blocks";
 import { MAX_CHANGES_READ, MAX_COMMENTS_READ, MAX_COMMENT_CHARS } from "../shared/constants";
-import { FormatParagraphArgs, FormatTextArgs, InsertAtArg } from "../shared/tools";
+import { ParagraphFormatOptions, patchParagraphFormat } from "../shared/lineGrid";
+import {
+  commentsXmlFromPackage,
+  documentXmlFromPackage,
+  MARKUP_LEGEND,
+  neutralizeLiteralMarkup,
+  readMarkupBody,
+  stripInlineMarkup,
+} from "../shared/markupText";
+import { formatParagraphRef, isParagraphRef } from "../shared/paragraphRef";
+import {
+  formatAttachedLine,
+  formatSelectionLine,
+  LIST_MARK_AVG_CHARS,
+  ListMark,
+  isBulletMark,
+  isNumberMark,
+  stripListMarks,
+  wrapListMark,
+} from "../shared/listMark";
+import {
+  isBuiltinListStyle,
+  listLevelNumberFormat,
+  listStyleNamesForApply,
+  listStyleSpec,
+  type ListStyle,
+} from "../shared/listStyles";
+import {
+  FormatListArgs,
+  FormatParagraphArgs,
+  FormatTextArgs,
+  InsertAtArg,
+  InsertCommentArgs,
+  ReplaceQuoteArgs,
+  SetOutlineArgs,
+} from "../shared/tools";
 import { SearchHit } from "../sidecar/types";
 
 /* global Office, Word */
@@ -129,28 +165,88 @@ export function canReadChanges(): boolean {
   }
 }
 
+/** Reviewed body text is WordApi 1.4, the same floor as comments. */
+export function canReadReviewed(): boolean {
+  try {
+    return isWordHost() && Office.context.requirements.isSetSupported("WordApi", "1.4");
+  } catch {
+    return false;
+  }
+}
+
+function canSeparateList(): boolean {
+  try {
+    return isWordHost() && Office.context.requirements.isSetSupported("WordApiDesktop", "1.4");
+  } catch {
+    return false;
+  }
+}
+
+/** Layout page of a range. WordApiDesktop 1.2; older Word simply has no pages. */
+function canReadLayoutPage(): boolean {
+  try {
+    return isWordHost() && Office.context.requirements.isSetSupported("WordApiDesktop", "1.2");
+  } catch {
+    return false;
+  }
+}
+
+function canApplyBuiltinListStyles(): boolean {
+  try {
+    return isWordHost() && Office.context.requirements.isSetSupported("WordApiDesktop", "1.3");
+  } catch {
+    return false;
+  }
+}
+
 export type DocumentStats = {
   chars: number;
+  /** The body plus its paragraph labels: what the attachment would really cost. */
+  attachChars: number;
   comments: number;
   changes: number;
   /** False when this Word is too old to read tracked changes at all. */
   changesAvailable: boolean;
 };
 
+/** 「[123] 」 as an average; the meter only needs to stop under-reading. */
+const PARAGRAPH_LABEL_CHARS = 6;
+
 /**
  * Sizes for the context meter and the composer readout. Cheap enough to run when
  * the pane opens, after a turn and when the picker opens, but not on every click.
  */
 export async function getDocumentStats(): Promise<DocumentStats> {
-  const empty = { chars: 0, comments: 0, changes: 0, changesAvailable: canReadChanges() };
+  const empty = {
+    chars: 0,
+    attachChars: 0,
+    comments: 0,
+    changes: 0,
+    changesAvailable: canReadChanges(),
+  };
   if (!isWordHost()) {
     return empty;
   }
-  const chars = await Word.run(async (context) => {
+  // The paragraph count comes free with the text: Word ends each one with a
+  // carriage return. Loading the paragraph collection would read the body twice.
+  const size = await Word.run(async (context) => {
     const body = context.document.body;
     body.load("text");
+    const paragraphs = body.paragraphs;
+    paragraphs.load("items/isListItem");
     await context.sync();
-    return (body.text || "").length;
+    const text = body.text || "";
+    const numbered = text.split("\r").filter((line) => line.trim()).length;
+    let lists = 0;
+    try {
+      lists = paragraphs.items.filter((paragraph) => paragraph.isListItem).length;
+    } catch {
+      lists = 0;
+    }
+    return {
+      chars: text.length,
+      attachChars: text.length + numbered * PARAGRAPH_LABEL_CHARS + lists * LIST_MARK_AVG_CHARS,
+    };
   });
   // Counting markup must not stop the meter: a document with a tracked move can
   // fail the whole tracked-change call (office-js#5535).
@@ -168,43 +264,333 @@ export async function getDocumentStats(): Promise<DocumentStats> {
         return list.items.length;
       }).catch(() => 0)
     : 0;
-  return { ...empty, chars, comments, changes };
+  return { ...empty, ...size, comments, changes };
 }
 
-export type DocumentText = { text: string; paragraphs: number; truncated: boolean };
+export type DocumentText = {
+  text: string;
+  paragraphs: number;
+  truncated: boolean;
+  listMarks: boolean;
+};
+
+type AttachedParagraph = {
+  /** Raw `paragraph.text`; used to locate a numbered paragraph again. */
+  text: string;
+  /** What the model sees: reviewed text, or marked text in phase 2. */
+  shown: string;
+  listString: string;
+  isListItem: boolean;
+};
+
+/** Every paragraph number to raw text, including blanks skipped from the attachment. */
+let allParagraphRawTexts = new Map<number, string>();
+/** Set when getReviewedText could not be used for the body this turn. */
+let attachmentReviewedFallback = false;
+/** Set when inline markup was embedded in the body this turn. */
+let attachmentUsesInlineMarkup = false;
+/** Inline markup read from the last body read, when phase 2 succeeded. */
+let lastInlineChanges: ChangeNote[] = [];
+let lastInlineChangesTruncated = false;
+let lastInlineAppendixComments: CommentNote[] = [];
+let lastInlineCommentCount = 0;
+
+export function lastAttachmentReviewedFallback(): boolean {
+  return attachmentReviewedFallback;
+}
+
+export function lastAttachmentUsesInlineMarkup(): boolean {
+  return attachmentUsesInlineMarkup;
+}
+
+/** The address the model uses instead of a quote. */
+function paragraphLabel(number: number): string {
+  return `[${number}] `;
+}
+
+const PARAGRAPH_LABEL = /^\s*\[(\d+)\]\s*/;
+const PARAGRAPH_LABEL_ONLY = /^\s*\[(\d+)\]\s*$/;
 
 /**
- * The body, one paragraph per line, up to the budget. `paragraph.text` is the
- * same text `search` matches against, so a quote taken from here resolves later;
- * `getReviewedText` would read cleaner but would not.
+ * Word ends a paragraph with a carriage return, marks a soft break with a
+ * vertical tab and a table cell with a bell.
  */
-export async function readDocumentText(maxChars: number): Promise<DocumentText> {
+function paragraphText(paragraph: { text?: string }): string {
+  return (paragraph.text || "")
+    .replaceAll("\r", "")
+    .replaceAll("\u0007", "")
+    .replaceAll("\u000b", " ");
+}
+
+function listKindOf(paragraph: Word.Paragraph): ListMark["kind"] {
+  try {
+    const list = paragraph.listOrNullObject;
+    if (!list || list.isNullObject) {
+      return undefined;
+    }
+    const types = list.levelTypes as unknown;
+    const level = listLevelOf(paragraph);
+    const type = Array.isArray(types) ? types[level] : undefined;
+    const bullet = (typeof Word !== "undefined" && Word.ListLevelType?.bullet) || "Bullet";
+    const number = (typeof Word !== "undefined" && Word.ListLevelType?.number) || "Number";
+    if (type === bullet || type === "Bullet" || type === "bullet") {
+      return "bullet";
+    }
+    if (type === number || type === "Number" || type === "number") {
+      return "number";
+    }
+  } catch {
+    // Fall back to the listString glyph.
+  }
+  return undefined;
+}
+
+function listMarkOf(paragraph: Word.Paragraph): ListMark {
+  try {
+    if (!paragraph.isListItem) {
+      return { isListItem: false, listString: "" };
+    }
+  } catch {
+    return { isListItem: false, listString: "" };
+  }
+  try {
+    const item = paragraph.listItemOrNullObject;
+    if (!item || item.isNullObject) {
+      return { isListItem: true, listString: "", kind: listKindOf(paragraph) };
+    }
+    return {
+      isListItem: true,
+      listString: item.listString || "",
+      kind: listKindOf(paragraph),
+    };
+  } catch {
+    return { isListItem: true, listString: "", kind: listKindOf(paragraph) };
+  }
+}
+
+async function loadListStrings(
+  context: Word.RequestContext,
+  paragraphs: Word.Paragraph[]
+): Promise<void> {
+  const listed: Word.Paragraph[] = [];
+  for (const paragraph of paragraphs) {
+    try {
+      if (paragraph.isListItem) {
+        listed.push(paragraph);
+      }
+    } catch {
+      // isListItem unread: treat as not a list.
+    }
+  }
+  if (!listed.length) {
+    return;
+  }
+  try {
+    for (const paragraph of listed) {
+      paragraph.listItemOrNullObject.load("listString,level");
+      paragraph.listOrNullObject.load("id,levelTypes");
+    }
+    await context.sync();
+  } catch {
+    // The body still stands. Marks become 〔番号あり〕 or stay off.
+  }
+}
+
+/**
+ * The lines handed to the model this turn, by paragraph number. A number is
+ * resolved back through this table rather than used as a plain index: an insert
+ * earlier in the document moves everything below it, and the model must not be
+ * asked to do that arithmetic while it works.
+ */
+let attachedParagraphs = new Map<number, AttachedParagraph>();
+/** How many paragraphs the document had when those numbers were handed over. */
+let attachedParagraphCount = 0;
+
+function forgetParagraphNumbers(): void {
+  attachedParagraphs = new Map();
+  attachedParagraphCount = 0;
+  allParagraphRawTexts = new Map();
+  attachmentReviewedFallback = false;
+  attachmentUsesInlineMarkup = false;
+  lastInlineChanges = [];
+  lastInlineChangesTruncated = false;
+  lastInlineAppendixComments = [];
+  lastInlineCommentCount = 0;
+}
+
+function resolveLocationText(rawParagraphText: string): string {
+  const target = compact(paragraphText({ text: rawParagraphText }));
+  if (!target) {
+    for (const [number, raw] of allParagraphRawTexts) {
+      if (!compact(raw)) {
+        return formatParagraphRef(number);
+      }
+    }
+    return clipNote(rawParagraphText, MAX_CHANGE_WHERE_CHARS);
+  }
+  for (const [number, raw] of allParagraphRawTexts) {
+    const dense = compact(raw);
+    if (dense === target || (target.length >= 4 && dense.includes(target))) {
+      return formatParagraphRef(number);
+    }
+  }
+  for (const [number, row] of attachedParagraphs) {
+    const dense = compact(row.text);
+    if (dense === target || (target.length >= 4 && dense.includes(target))) {
+      return formatParagraphRef(number);
+    }
+  }
+  return clipNote(rawParagraphText, MAX_CHANGE_WHERE_CHARS);
+}
+
+function resolveMarkupLocations(
+  comments: MarkupList<CommentNote>,
+  changes: MarkupList<ChangeNote>
+): void {
+  for (const note of comments.items) {
+    if (note.anchor && !isParagraphRef(note.anchor)) {
+      note.anchor = resolveLocationText(note.anchor);
+    }
+  }
+  for (const note of changes.items) {
+    if (note.where && !isParagraphRef(note.where)) {
+      note.where = resolveLocationText(note.where);
+    }
+  }
+}
+
+type ReadDocumentOptions = {
+  markup?: boolean;
+  markupBudget?: number;
+};
+
+/**
+ * The body handed to the model. `shown` is reviewed (or marked) text; `text`
+ * on each attached row stays raw so paragraph numbers still resolve through
+ * `search`.
+ */
+export async function readDocumentText(
+  maxChars: number,
+  options: ReadDocumentOptions = {}
+): Promise<DocumentText> {
+  forgetParagraphNumbers();
   if (!isWordHost() || maxChars <= 0) {
-    return { text: "", paragraphs: 0, truncated: false };
+    return { text: "", paragraphs: 0, truncated: false, listMarks: false };
   }
   return Word.run(async (context) => {
     const paragraphs = context.document.body.paragraphs;
-    paragraphs.load("items/text");
+    paragraphs.load("items/text,items/isListItem");
     await context.sync();
+    await loadListStrings(context, paragraphs.items);
+
+    const useReviewed = canReadReviewed();
+    type ReviewedTextResult = { value: string };
+    const reviewed: ReviewedTextResult[] = [];
+    if (useReviewed) {
+      for (const paragraph of paragraphs.items) {
+        reviewed.push(
+          paragraph.getReviewedText(Word.ChangeTrackingVersion.current) as ReviewedTextResult
+        );
+      }
+      try {
+        await context.sync();
+      } catch {
+        attachmentReviewedFallback = true;
+        reviewed.length = 0;
+      }
+    } else {
+      attachmentReviewedFallback = true;
+    }
+
+    let inlineMarked: string[] | null = null;
+    let inlineChanges: ChangeNote[] = [];
+    let inlineChangesTruncated = false;
+    let appendixComments: CommentNote[] = [];
+    if (options.markup && !attachmentReviewedFallback) {
+      try {
+        const pkg = context.document.body.getOoxml();
+        await context.sync();
+        const documentXml = documentXmlFromPackage(pkg.value || "");
+        const commentsXml = commentsXmlFromPackage(pkg.value || "");
+        const parsed = readMarkupBody(documentXml, commentsXml);
+        if (parsed.paragraphCount === paragraphs.items.length) {
+          const overhead = parsed.markupOverhead;
+          const budget = options.markupBudget ?? maxChars;
+          if (!parsed.hasInlineMarkup || overhead <= budget) {
+            inlineMarked = parsed.markedParagraphs;
+            inlineChanges = parsed.changes;
+            inlineChangesTruncated = parsed.changesTruncated;
+            appendixComments = parsed.commentsForAppendix;
+            lastInlineCommentCount = parsed.inlineCommentCount;
+            attachmentUsesInlineMarkup = parsed.hasInlineMarkup;
+          }
+        }
+      } catch {
+        // Fall back to reviewed text without inline markers.
+      }
+    }
 
     const lines: string[] = [];
+    const attached = new Map<number, AttachedParagraph>();
+    allParagraphRawTexts = new Map();
     let used = 0;
     let truncated = false;
-    for (const paragraph of paragraphs.items) {
-      // Word ends a paragraph with a carriage return, marks a soft break with a
-      // vertical tab and a table cell with a bell.
-      const line = (paragraph.text || "")
-        .replaceAll("\r", "")
-        .replaceAll("\u0007", "")
-        .replaceAll("\u000b", " ");
-      if (used + line.length + 1 > maxChars) {
+    let listMarks = false;
+    let number = 0;
+    for (let index = 0; index < paragraphs.items.length; index += 1) {
+      const paragraph = paragraphs.items[index];
+      number += 1;
+      const raw = paragraphText(paragraph);
+      allParagraphRawTexts.set(number, raw);
+      const reviewedText =
+        !attachmentReviewedFallback && reviewed[index]
+          ? paragraphText({ text: reviewed[index].value || "" })
+          : raw;
+
+      let display = inlineMarked ? inlineMarked[index] ?? reviewedText : neutralizeLiteralMarkup(reviewedText);
+      if (!display.trim() && !raw.trim() && !reviewedText.trim()) {
+        continue;
+      }
+      if (!display.trim()) {
+        continue;
+      }
+      const mark = listMarkOf(paragraph);
+      const numbered = formatAttachedLine(number, display, mark);
+      if (used + numbered.length + 1 > maxChars) {
         truncated = true;
         break;
       }
-      lines.push(line);
-      used += line.length + 1;
+      lines.push(numbered);
+      attached.set(number, {
+        text: raw,
+        shown: display,
+        listString: mark.listString,
+        isListItem: mark.isListItem,
+      });
+      if (mark.isListItem) {
+        listMarks = true;
+      }
+      used += numbered.length + 1;
     }
-    return { text: lines.join("\n"), paragraphs: lines.length, truncated };
+
+    if (inlineMarked && attachmentUsesInlineMarkup) {
+      const legend = `${MARKUP_LEGEND}\n\n`;
+      if (used + legend.length <= maxChars) {
+        lines.unshift(legend.trimEnd());
+        used += legend.length;
+      }
+    }
+
+    attachedParagraphs = attached;
+    attachedParagraphCount = paragraphs.items.length;
+
+    if (attachmentUsesInlineMarkup) {
+      lastInlineChanges = inlineChanges;
+      lastInlineChangesTruncated = inlineChangesTruncated;
+      lastInlineAppendixComments = appendixComments;
+    }
+
+    return { text: lines.join("\n"), paragraphs: lines.length, truncated, listMarks };
   });
 }
 
@@ -388,11 +774,13 @@ export async function readAttachment(
   markup: boolean
 ): Promise<Attachment> {
   if (!isWordHost() || scope === "none") {
+    // No numbers were handed over, so last turn's must not stay resolvable.
+    forgetParagraphNumbers();
     return { ...EMPTY_ATTACHMENT, scope };
   }
-  const selected = await getSelectionText();
-  const focus = selected.slice(0, Math.max(0, budget));
-  const focusCut = focus.length < selected.length;
+  const selected = await readSelectionAttachment();
+  const focus = selected.text.slice(0, Math.max(0, budget));
+  const focusCut = focus.length < selected.text.length;
 
   const forMarkup = markup ? markupCharBudget(budget - focus.length) : 0;
   // Comments take half; changes take the rest, which is the denser of the two.
@@ -406,6 +794,10 @@ export async function readAttachment(
   const markupUsed = commentsUsed + usedChars(changes, changeChars);
 
   if (scope === "selection") {
+    forgetParagraphNumbers();
+    if (markup) {
+      resolveMarkupLocations(comments, changes);
+    }
     return {
       scope,
       document: "",
@@ -415,10 +807,28 @@ export async function readAttachment(
       markup,
       comments,
       changes,
+      listMarks: selected.listMarks,
+      reviewedFallback: attachmentReviewedFallback,
+      inlineMarkup: false,
     };
   }
   const remaining = budget - focus.length - markupUsed;
-  const body = await readDocumentText(remaining);
+  const body = await readDocumentText(remaining, {
+    markup,
+    markupBudget: forMarkup,
+  });
+
+  if (markup) {
+    resolveMarkupLocations(comments, changes);
+    if (attachmentUsesInlineMarkup) {
+      changes.items = lastInlineChanges;
+      changes.truncated = lastInlineChangesTruncated;
+      comments.items = comments.items
+        .filter((note) => note.replies.length > 0 || note.resolved)
+        .concat(lastInlineAppendixComments);
+    }
+  }
+
   return {
     scope,
     document: body.text,
@@ -429,6 +839,10 @@ export async function readAttachment(
     markup,
     comments,
     changes,
+    listMarks: body.listMarks || selected.listMarks,
+    reviewedFallback: attachmentReviewedFallback,
+    inlineMarkup: attachmentUsesInlineMarkup,
+    inlineCommentCount: attachmentUsesInlineMarkup ? lastInlineCommentCount : undefined,
   };
 }
 
@@ -441,11 +855,87 @@ export async function getSelectionText(): Promise<string> {
   });
 }
 
+/**
+ * Selection text the model sees. List marks are added here, not in
+ * `getSelectionText`, which the pane uses to tell an empty caret from a range.
+ */
+async function readSelectionAttachment(): Promise<{
+  text: string;
+  listMarks: boolean;
+  paragraphs: number;
+}> {
+  if (!isWordHost()) {
+    return { text: "", listMarks: false, paragraphs: 0 };
+  }
+  try {
+    return await Word.run(async (context) => {
+      const range = context.document.getSelection();
+      range.load("text");
+      const collection = range.paragraphs;
+      collection.load("items/text,items/isListItem");
+      await context.sync();
+      const raw = range.text || "";
+      const paragraphs = raw.split(/\r\n?|\n/).filter((line) => line.trim()).length;
+      if (!raw.trim()) {
+        return { text: raw, listMarks: false, paragraphs };
+      }
+      await loadListStrings(context, collection.items);
+
+      const useReviewed = canReadReviewed();
+      type ReviewedTextResult = { value: string };
+      const reviewed: ReviewedTextResult[] = [];
+      if (useReviewed) {
+        for (const paragraph of collection.items) {
+          reviewed.push(
+            paragraph.getReviewedText(Word.ChangeTrackingVersion.current) as ReviewedTextResult
+          );
+        }
+        try {
+          await context.sync();
+        } catch {
+          attachmentReviewedFallback = true;
+          reviewed.length = 0;
+        }
+      } else {
+        attachmentReviewedFallback = true;
+      }
+
+      const lines: string[] = [];
+      let listMarks = false;
+      for (let index = 0; index < collection.items.length; index += 1) {
+        const paragraph = collection.items[index];
+        const line =
+          !attachmentReviewedFallback && reviewed[index]
+            ? paragraphText({ text: reviewed[index].value || "" })
+            : paragraphText(paragraph);
+        if (!line.trim()) {
+          continue;
+        }
+        const mark = listMarkOf(paragraph);
+        if (mark.isListItem) {
+          listMarks = true;
+        }
+        lines.push(formatSelectionLine(line, mark));
+      }
+      return {
+        text: lines.length ? lines.join("\r") : raw,
+        listMarks,
+        paragraphs: lines.length || paragraphs,
+      };
+    });
+  } catch {
+    const raw = await getSelectionText().catch(() => "");
+    return {
+      text: raw,
+      listMarks: false,
+      paragraphs: raw.split(/\r\n?|\n/).filter((line) => line.trim()).length,
+    };
+  }
+}
+
 export async function getSelectionInfo(): Promise<{ text: string; paragraphs: number }> {
-  const text = await getSelectionText();
-  // Word separates paragraphs with CR inside a range's text.
-  const paragraphs = text.split(/\r\n?|\n/).filter((line) => line.trim()).length;
-  return { text, paragraphs };
+  const read = await readSelectionAttachment();
+  return { text: read.text, paragraphs: read.paragraphs };
 }
 
 /**
@@ -456,14 +946,42 @@ function startTracking(context: Word.RequestContext): void {
   context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
 }
 
+function quoteBlockedByDeletion(where: string): Error {
+  return new Error(
+    `${where}には削除中の文字が挟まっているため、引用で絞り込めません。` +
+      `quote を省いて段落全体を対象にするか、Word の校閲タブで削除を確定してください。`
+  );
+}
+
+async function paragraphHasDeletionChanges(
+  context: Word.RequestContext,
+  paragraph: Word.Paragraph
+): Promise<boolean> {
+  if (!canReadChanges()) {
+    return false;
+  }
+  try {
+    const list = paragraph.getTrackedChanges();
+    list.load("items/type");
+    await context.sync();
+    return list.items.some((change) => String(change.type || "") === "Deleted");
+  } catch {
+    return false;
+  }
+}
+
 function assertSearchable(quote: string): void {
   if (quote.length > MAX_SEARCH_CHARS) {
     throw new Error(
-      `引用が長すぎます（${MAX_SEARCH_CHARS}字まで）。短い引用にするか、選択範囲全体を対象にしてください。`
+      `引用が ${MAX_SEARCH_CHARS} 字を超えています。Word の検索の上限です。` +
+        `paragraph で段落を指すか、その段落の中の一続きだけを引用してください。` +
+        `引用を縮めるときも、本文どおりに写した一続きにしてください。`
     );
   }
   if (/[\r\n]/.test(quote)) {
-    throw new Error("引用が段落をまたいでいます。1 段落に収まる短い引用にしてください。");
+    throw new Error(
+      "引用が段落をまたいでいます。paragraph で段落を指すか、1 段落（添付本文の 1 行）に収まる引用にしてください。"
+    );
   }
 }
 
@@ -475,8 +993,105 @@ function assertSearchable(quote: string): void {
  */
 function ambiguousQuote(needle: string, count: number, where: string): Error {
   return new Error(
-    `「${needle}」が${where}に ${count} 箇所あります。どれか 1 箇所だけに当たるように、` +
-      `同じ段落の中で前後を足した ${MAX_SEARCH_CHARS} 字までの引用にしてください。`
+    `「${needle}」が${where}に ${count} 箇所あります。paragraph で段落を指すか、` +
+      `同じ段落の中で前後を足して 1 か所だけに当たる ${MAX_SEARCH_CHARS} 字までの引用にしてください。`
+  );
+}
+
+/** The label belongs to the attachment, not to the document. */
+function stripParagraphLabel(quote: string): string {
+  return quote.replace(PARAGRAPH_LABEL, "").trim();
+}
+
+function quoteNeedle(raw: string, paragraph?: number): string {
+  let needle = stripParagraphLabel(raw);
+  const listString =
+    paragraph === undefined ? undefined : attachedParagraphs.get(paragraph)?.listString;
+  needle = stripListMarks(needle, listString);
+  needle = stripInlineMarkup(needle);
+  return needle;
+}
+
+function replacementText(text: string, paragraph?: number): string {
+  return quoteNeedle(text, paragraph);
+}
+
+const MAX_CANDIDATES = 3;
+const CANDIDATE_CHARS = 120;
+/** Below this, a shared pair or two is coincidence rather than a near miss. */
+const CANDIDATE_SCORE = 0.2;
+
+function compact(text: string): string {
+  return text.replace(/[\s\u3000]/g, "");
+}
+
+function bigrams(text: string): Set<string> {
+  const dense = compact(text);
+  const out = new Set<string>();
+  for (let i = 0; i + 1 < dense.length; i += 1) {
+    out.add(dense.slice(i, i + 2));
+  }
+  if (!out.size && dense) {
+    out.add(dense);
+  }
+  return out;
+}
+
+/**
+ * How alike two strings are, by the character pairs they share. Cheap enough to
+ * run over every paragraph of a long contract, which a longest-common-substring
+ * score is not.
+ */
+function dice(a: Set<string>, b: Set<string>): number {
+  if (!a.size || !b.size) {
+    return 0;
+  }
+  let shared = 0;
+  for (const gram of a) {
+    if (b.has(gram)) {
+      shared += 1;
+    }
+  }
+  return (2 * shared) / (a.size + b.size);
+}
+
+/**
+ * The attached paragraphs that look most like a quote that did not match. Read
+ * from the attachment rather than the document because that is what the model
+ * was quoting from, and because a failed call should not cost another full read.
+ */
+function nearestParagraphs(needle: string): string[] {
+  const wanted = bigrams(needle);
+  return [...attachedParagraphs.entries()]
+    .map(([number, row]) => ({
+      number,
+      row,
+      score: dice(wanted, bigrams(row.text)),
+    }))
+    .filter((entry) => entry.score >= CANDIDATE_SCORE)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, MAX_CANDIDATES)
+    .map((entry) =>
+      formatAttachedLine(entry.number, clipNote(entry.row.shown, CANDIDATE_CHARS), {
+        isListItem: entry.row.isListItem,
+        listString: entry.row.listString,
+      })
+    );
+}
+
+/**
+ * The quote missed. Length is almost never the reason, so the message does not
+ * say "shorter": it says the quote must be copied as it stands, and hands over
+ * the paragraphs that come closest so the next call can use a number.
+ */
+function quoteNotFound(needle: string, where: string): Error {
+  const candidates = nearestParagraphs(needle);
+  const advice = candidates.length
+    ? `近い段落は次のものです。paragraph にその番号を渡すのが確実です。\n${candidates.join("\n")}`
+    : "似た段落もありません。その文言は文書に無いので、あるものとして扱わず、無いことを利用者に伝えてください。";
+  return new Error(
+    `「${needle}」は${where}にありません。引用は添付された本文から字句どおりに写してください` +
+      `（要約・言い換え・助詞の違いは当たりません）。${advice}`
   );
 }
 
@@ -505,14 +1120,170 @@ async function findQuote(
   return loose.items;
 }
 
+/** What an operation says it applies to. */
+export type TargetRef = { paragraph?: number; quote?: string };
+
 /**
- * Resolve what an operation applies to: the quoted text when given, otherwise
- * the whole selection. Quotes are looked for inside the selection first so a
- * repeated phrase elsewhere in the document is not hit by accident.
+ * `paragraph` widens to the whole paragraph when the narrowing quote misses,
+ * `refuse` stops instead. A comment on the whole paragraph is still the comment
+ * the user asked for; a replacement on the whole paragraph is not.
  */
-async function resolveTarget(context: Word.RequestContext, quote: string): Promise<Word.Range> {
+type MissMode = "paragraph" | "refuse";
+
+/** The resolved range plus what to tell the model about where it landed. */
+type Target = { range: Word.Range; note: string };
+
+type PagedRange = Word.Range & {
+  pages?: { load: (propertyNames: string) => void; items: Array<{ index?: number }> };
+};
+
+/**
+ * First layout page of a hit, counted from the start of the document.
+ * A footer that restarts at 1 is a different number; if Word cannot say, say nothing.
+ */
+async function layoutPageSentence(context: Word.RequestContext, range: Word.Range): Promise<string> {
+  if (!canReadLayoutPage()) {
+    return "";
+  }
+  try {
+    const pages = (range as PagedRange).pages;
+    if (!pages) {
+      return "";
+    }
+    pages.load("items/index");
+    await context.sync();
+    const index = pages.items[0]?.index;
+    if (typeof index !== "number" || !Number.isFinite(index) || index < 1) {
+      return "";
+    }
+    return `文書の${index}ページ目です。`;
+  } catch {
+    return "";
+  }
+}
+
+function withLayoutPage(note: string, page: string): string {
+  return page ? `${note}${page}` : note;
+}
+
+/**
+ * The paragraph a number points at. The number describes the document as it was
+ * when the attachment was read, so the remembered text is used to find it again:
+ * an insert made earlier in this same turn would otherwise shift the target down
+ * by however many paragraphs were added.
+ */
+function locateParagraph(
+  items: Word.Paragraph[],
+  number: number
+): { paragraph: Word.Paragraph; text: string; index: number } {
+  if (!items.length) {
+    throw new Error("本文に段落がありません。");
+  }
+
+  const texts = items.map((item) => paragraphText(item));
+  const wanted = attachedParagraphs.get(number);
+  if (wanted) {
+    const dense = texts.map(compact);
+    const target = compact(wanted.text);
+    const from = Math.min(Math.max(number - 1, 0), items.length - 1);
+    for (let step = 0; step < items.length; step += 1) {
+      const after = from + step;
+      if (after < items.length && dense[after] === target) {
+        return { paragraph: items[after], text: texts[after], index: after };
+      }
+      const before = from - step;
+      if (before >= 0 && dense[before] === target) {
+        return { paragraph: items[before], text: texts[before], index: before };
+      }
+    }
+  }
+
+  if (attachedParagraphCount && items.length !== attachedParagraphCount) {
+    throw new Error(
+      `段落 ${number} が、添付したときと同じ文言で見つかりません。このターンで段落の数が変わったため、` +
+        `番号だけでは位置を特定できません。quote に本文どおりの引用を渡して指し直すか、` +
+        `どこを直すつもりだったかを利用者に伝えてください。`
+    );
+  }
+  const index = number - 1;
+  if (index < 0 || index >= items.length) {
+    throw new Error(
+      `段落 ${number} はありません。番号は添付された本文の行頭の [番号] から取り、` +
+        `1〜${items.length} の範囲で指してください。`
+    );
+  }
+  return { paragraph: items[index], text: texts[index], index };
+}
+
+async function paragraphByNumber(
+  context: Word.RequestContext,
+  number: number
+): Promise<{ paragraph: Word.Paragraph; text: string }> {
+  const paragraphs = context.document.body.paragraphs;
+  paragraphs.load("items/text");
+  await context.sync();
+  const found = locateParagraph(paragraphs.items, number);
+  return { paragraph: found.paragraph, text: found.text };
+}
+
+/**
+ * Resolve what an operation applies to. A paragraph number wins, because it is
+ * the one address the model can copy without retyping the document; a quote then
+ * narrows inside that paragraph. With no number, the quote is looked for inside
+ * the selection first so a repeated phrase elsewhere is not hit by accident.
+ */
+async function resolveTarget(
+  context: Word.RequestContext,
+  ref: TargetRef,
+  onMiss: MissMode = "refuse"
+): Promise<Target> {
+  const raw = (ref.quote || "").trim();
+  const labelOnly = raw.match(PARAGRAPH_LABEL_ONLY);
+  const number = ref.paragraph ?? (labelOnly ? Number(labelOnly[1]) : undefined);
+  // Models paste the label and the list mark back with the line they copied.
+  const needle = quoteNeedle(raw, number);
+
+  if (number !== undefined) {
+    const found = await paragraphByNumber(context, number);
+    const where = `段落 ${number}「${clipNote(found.text, 24)}」`;
+    if (!needle) {
+      const range = found.paragraph.getRange();
+      const page = await layoutPageSentence(context, range);
+      return { range, note: withLayoutPage(`${where}を対象にしました。`, page) };
+    }
+    assertSearchable(needle);
+    const hits = await findQuote(context, (options) => found.paragraph.search(needle, options));
+    if (hits.length === 1) {
+      const page = await layoutPageSentence(context, hits[0]);
+      return {
+        range: hits[0],
+        note: withLayoutPage(`${where}の「${clipNote(needle, 20)}」を対象にしました。`, page),
+      };
+    }
+    if (onMiss === "paragraph") {
+      const why = hits.length
+        ? `引用が段落の中に ${hits.length} 箇所あった`
+        : "引用が段落の中に無かった";
+      const range = found.paragraph.getRange();
+      const page = await layoutPageSentence(context, range);
+      return { range, note: withLayoutPage(`${why}ので、${where}の全体にしました。`, page) };
+    }
+    if (hits.length > 1) {
+      throw new Error(
+        `「${needle}」は${where}の中に ${hits.length} 箇所あります。` +
+          `前後を足して 1 か所に絞るか、quote を省いて段落全体を対象にしてください。`
+      );
+    }
+    if (hits.length === 0 && (await paragraphHasDeletionChanges(context, found.paragraph))) {
+      throw quoteBlockedByDeletion(where);
+    }
+    throw new Error(
+      `「${needle}」は${where}の中にありません。この段落の文言は「${clipNote(found.text, 80)}」です。` +
+        `字句どおりに写すか、quote を省いて段落全体を対象にしてください。`
+    );
+  }
+
   const selection = context.document.getSelection();
-  const needle = quote.trim();
   selection.load("text");
   await context.sync();
 
@@ -520,10 +1291,10 @@ async function resolveTarget(context: Word.RequestContext, quote: string): Promi
     // Without a selection an empty range would edit nothing and report success.
     if (!(selection.text || "").trim()) {
       throw new Error(
-        "選択範囲がありません。quote に本文どおりの短い引用を入れて、対象を指してください。"
+        "対象が指定されていません。paragraph に添付本文の段落番号を渡すか、quote に本文どおりの引用を入れてください。"
       );
     }
-    return selection;
+    return { range: selection, note: "" };
   }
   assertSearchable(needle);
 
@@ -533,7 +1304,7 @@ async function resolveTarget(context: Word.RequestContext, quote: string): Promi
       throw ambiguousQuote(needle, inSelection.length, "選択範囲");
     }
     if (inSelection.length === 1) {
-      return inSelection[0];
+      return { range: inSelection[0], note: "" };
     }
   }
 
@@ -543,23 +1314,23 @@ async function resolveTarget(context: Word.RequestContext, quote: string): Promi
     throw ambiguousQuote(needle, inBody.length, "本文");
   }
   if (inBody.length === 1) {
-    return inBody[0];
+    return { range: inBody[0], note: "" };
   }
 
-  throw new Error(
-    `「${needle}」が本文に見つかりませんでした。本文どおりの短い引用にしてください。`
-  );
+  throw quoteNotFound(needle, "本文");
 }
 
-export async function insertComment(
-  comment: string,
-  quote: string,
-  severity: Severity
-): Promise<void> {
-  await Word.run(async (context) => {
-    const target = await resolveTarget(context, quote);
-    target.insertComment(truncateComment(formatComment(comment, severity)));
+/**
+ * Returns where the comment landed. A comment that ended up on a different
+ * paragraph than intended is invisible in a success message, and the user finds
+ * it later in the margin of the wrong clause.
+ */
+export async function insertComment(args: InsertCommentArgs): Promise<string> {
+  return Word.run(async (context) => {
+    const target = await resolveTarget(context, args, "paragraph");
+    target.range.insertComment(truncateComment(formatComment(args.comment, args.severity)));
     await context.sync();
+    return target.note;
   });
 }
 
@@ -577,12 +1348,13 @@ export async function replaceSelection(text: string): Promise<void> {
   });
 }
 
-export async function replaceQuote(quote: string, text: string): Promise<void> {
-  await Word.run(async (context) => {
+export async function replaceQuote(args: ReplaceQuoteArgs): Promise<string> {
+  return Word.run(async (context) => {
     startTracking(context);
-    const target = await resolveTarget(context, quote);
-    target.insertText(text, Word.InsertLocation.replace);
+    const target = await resolveTarget(context, args);
+    target.range.insertText(replacementText(args.text, args.paragraph), Word.InsertLocation.replace);
     await context.sync();
+    return target.note;
   });
 }
 
@@ -604,6 +1376,7 @@ function styleParagraph(paragraph: Word.Paragraph, spec: ParagraphSpec): void {
   paragraph.font.bold = spec.bold;
   paragraph.firstLineIndent = spec.firstLineIndentPt;
   paragraph.leftIndent = spec.leftIndentPt;
+  paragraph.lineSpacing = spec.lineSpacingPt;
 }
 
 /**
@@ -616,11 +1389,16 @@ function styleParagraph(paragraph: Word.Paragraph, spec: ParagraphSpec): void {
 async function resolveInsertStart(
   context: Word.RequestContext,
   at: InsertAtArg,
-  quote: string
+  quote: string,
+  paragraph?: number
 ): Promise<{ paragraph: Word.Paragraph; placement: InsertPlacement }> {
+  if (paragraph !== undefined) {
+    const found = await paragraphByNumber(context, paragraph);
+    return { paragraph: found.paragraph, placement: "paragraph" };
+  }
   if (quote.trim()) {
-    const target = await resolveTarget(context, quote);
-    return { paragraph: target.paragraphs.getFirst(), placement: "quote" };
+    const target = await resolveTarget(context, { quote });
+    return { paragraph: target.range.paragraphs.getFirst(), placement: "quote" };
   }
   if (at === "end") {
     return { paragraph: context.document.body.paragraphs.getLast(), placement: "end" };
@@ -646,16 +1424,19 @@ async function resolveInsertStart(
 export async function insertDraftParagraphs(
   specs: ParagraphSpec[],
   at: InsertAtArg = "cursor",
-  quote = ""
+  quote = "",
+  paragraph?: number
 ): Promise<InsertLanding> {
+  const asked: InsertPlacement =
+    paragraph !== undefined ? "paragraph" : quote.trim() ? "quote" : at;
   if (!specs.length) {
-    return { placement: quote ? "quote" : at, after: "" };
+    return { placement: asked, after: "" };
   }
 
-  let landing: InsertLanding = { placement: quote ? "quote" : at, after: "" };
+  let landing: InsertLanding = { placement: asked, after: "" };
   await Word.run(async (context) => {
     startTracking(context);
-    const resolved = await resolveInsertStart(context, at, quote);
+    const resolved = await resolveInsertStart(context, at, quote, paragraph);
     resolved.paragraph.load("text");
     await context.sync();
     landing = { placement: resolved.placement, after: resolved.paragraph.text || "" };
@@ -671,6 +1452,26 @@ export async function insertDraftParagraphs(
     }
 
     await context.sync();
+
+    if (created.some((entry) => entry.spec.lineSpacingPt > 0)) {
+      await rewriteParagraphOoxml(
+        context,
+        created.map((entry) => entry.paragraph),
+        { unsetLineGrid: true }
+      );
+    }
+
+    for (const { paragraph, spec } of created) {
+      if (spec.type !== "item") {
+        paragraph.load("isListItem");
+      }
+    }
+    await context.sync();
+    for (const { paragraph, spec } of created) {
+      if (spec.type !== "item" && paragraph.isListItem) {
+        paragraph.detachFromList();
+      }
+    }
 
     const boldHits: Word.RangeCollection[] = [];
     for (const { paragraph, spec } of created) {
@@ -700,8 +1501,230 @@ export async function insertDraftParagraphs(
     last.getRange().insertBookmark(DRAFT_TAIL_BOOKMARK);
     last.select(Word.SelectionMode.end);
     await context.sync();
+
+    try {
+      const numbers = await numberInsertedParagraphs(
+        context,
+        created.map((entry) => entry.paragraph)
+      );
+      if (numbers.length) {
+        landing = { ...landing, numbers };
+      }
+    } catch {
+      // The insert stands; the model can still quote the new paragraphs.
+    }
   });
   return landing;
+}
+
+type HandedParagraph = {
+  number: number;
+  paragraph: Word.Paragraph;
+  index: number;
+  text: string;
+};
+
+/**
+ * A paragraph the model was shown. Numbers that were never handed out are
+ * refused, because locateParagraph's index fallback would blank a neighbor.
+ */
+function findHandedParagraph(items: Word.Paragraph[], number: number): HandedParagraph {
+  const wanted = attachedParagraphs.get(number);
+  if (!wanted) {
+    throw new Error(
+      `段落 ${number} は今回の添付にありません。渡された [番号] だけを paragraphs に入れてください。空行は入れていません。`
+    );
+  }
+  if (!items.length) {
+    throw new Error("本文に段落がありません。空行は入れていません。");
+  }
+  const texts = items.map((item) => paragraphText(item));
+  const dense = texts.map(compact);
+  const target = compact(wanted.text);
+  const from = Math.min(Math.max(number - 1, 0), items.length - 1);
+  for (let step = 0; step < items.length; step += 1) {
+    const after = from + step;
+    if (after < items.length && dense[after] === target) {
+      return { number, paragraph: items[after], text: texts[after], index: after };
+    }
+    const before = from - step;
+    if (before >= 0 && dense[before] === target) {
+      return { number, paragraph: items[before], text: texts[before], index: before };
+    }
+  }
+  throw new Error(
+    `段落 ${number} が、添付したときと同じ文言で見つかりません。空行は入れていません。`
+  );
+}
+
+function previousIsBlank(items: Word.Paragraph[], index: number): boolean {
+  if (index <= 0) {
+    return false;
+  }
+  return !paragraphText(items[index - 1]).trim();
+}
+
+function styleBlankParagraph(paragraph: Word.Paragraph): void {
+  // A copied heading style stays in the navigation pane. Outline level cannot override it.
+  paragraph.styleBuiltIn = Word.BuiltInStyleName.normal;
+  paragraph.firstLineIndent = 0;
+  paragraph.leftIndent = 0;
+  paragraph.spaceBefore = 0;
+  paragraph.spaceAfter = 0;
+  paragraph.lineUnitBefore = 0;
+  paragraph.lineUnitAfter = 0;
+}
+
+function quotedHeads(rows: { text: string }[]): string {
+  return rows.map((row) => `「${clipNote(row.text, 24)}」`).join("、");
+}
+
+function blankLineNote(inserted: { text: string }[], skipped: { text: string }[]): string {
+  const parts: string[] = [];
+  if (inserted.length) {
+    parts.push(
+      `${inserted.length} 箇所の直前に空行を入れました（${quotedHeads(inserted)}）。変更履歴に記録しました。`
+    );
+  } else {
+    parts.push("空行は入れていません。");
+  }
+  if (skipped.length) {
+    parts.push(`${skipped.length} 箇所は直前が空行だったので足していません（${quotedHeads(skipped)}）。`);
+  }
+  return parts.join("");
+}
+
+/**
+ * One empty paragraph immediately before each addressed paragraph. An existing
+ * blank immediately above is left as it is, including when several are already
+ * there. The paragraphs below keep their list.
+ */
+export async function insertBlankBefore(paragraphs: number[]): Promise<string> {
+  return Word.run(async (context) => {
+    startTracking(context);
+    const collection = context.document.body.paragraphs;
+    collection.load("items/text");
+    await context.sync();
+    const items = collection.items;
+
+    const addressed: HandedParagraph[] = [];
+    const seen = new Set<number>();
+    for (const number of paragraphs) {
+      if (seen.has(number)) {
+        continue;
+      }
+      seen.add(number);
+      const found = findHandedParagraph(items, number);
+      if (addressed.some((row) => row.index === found.index)) {
+        throw new Error(
+          `段落 ${number} は、別の番号と同じ段落を指しています。空行は入れていません。`
+        );
+      }
+      addressed.push(found);
+    }
+
+    const skipped = addressed.filter((row) => previousIsBlank(items, row.index));
+    const pending = addressed.filter((row) => !previousIsBlank(items, row.index));
+    const created: Word.Paragraph[] = [];
+    const descending = [...pending].sort((a, b) => b.index - a.index);
+    for (const row of descending) {
+      created.push(row.paragraph.insertParagraph("", Word.InsertLocation.before));
+    }
+    if (created.length) {
+      for (const blank of created) {
+        styleBlankParagraph(blank);
+        blank.load("isListItem");
+      }
+      await context.sync();
+      for (const blank of created) {
+        if (isListed(blank)) {
+          blank.detachFromList();
+        }
+      }
+      await context.sync();
+    }
+    return blankLineNote(pending, skipped);
+  });
+}
+
+/**
+ * Hand out paragraph numbers for what an insert just created, so the same turn
+ * can point at those paragraphs the way it points at attached ones. Without
+ * this an empty document is numbered only from the next turn on, and the model
+ * has to quote each new 項 and 号 — short items like 「数量　○○」 recur, and
+ * `through` has nothing to count with.
+ *
+ * Numbers are body positions where nothing attached sits at or after the
+ * insert (an empty document, or an insert at the end). Otherwise the attached
+ * paragraphs below have moved down and their numbers are taken, so the new
+ * ones continue past the highest number handed out; either way a number is
+ * resolved through its text, never used as an index.
+ */
+async function numberInsertedParagraphs(
+  context: Word.RequestContext,
+  created: Word.Paragraph[]
+): Promise<InsertedParagraph[]> {
+  if (!created.length) {
+    return [];
+  }
+  const collection = context.document.body.paragraphs;
+  collection.load("items/text");
+  for (const paragraph of created) {
+    paragraph.load("text");
+  }
+  await context.sync();
+  const items = collection.items;
+  const dense = items.map((item) => compact(paragraphText(item)));
+  const wanted = created.map((paragraph) => compact(paragraphText(paragraph)));
+
+  const runs: number[] = [];
+  for (let start = 0; start + wanted.length <= items.length; start += 1) {
+    if (wanted.every((text, offset) => dense[start + offset] === text)) {
+      runs.push(start);
+    }
+  }
+  let start = runs[0];
+  if (runs.length > 1) {
+    // The same run of text more than once: ask Word which holds the new one.
+    const first = created[0].getRange();
+    const relations = runs.map((at) => items[at].getRange().compareLocationWith(first));
+    await context.sync();
+    const index = relations.findIndex(
+      (relation) => relation.value === Word.LocationRelation.equal
+    );
+    start = index < 0 ? undefined : runs[index];
+  }
+  if (start === undefined) {
+    return [];
+  }
+
+  const positional = start + 1;
+  const taken = [...attachedParagraphs.keys()];
+  const collides = taken.some((number) => number >= positional);
+  const base = collides ? Math.max(attachedParagraphCount, ...taken) + 1 : positional;
+
+  const numbers: InsertedParagraph[] = [];
+  created.forEach((paragraph, offset) => {
+    const raw = paragraphText(paragraph);
+    const number = base + offset;
+    if (!raw.trim()) {
+      // Blank lines consume a number and cannot be pointed at, as in the attachment.
+      return;
+    }
+    attachedParagraphs.set(number, {
+      text: raw,
+      shown: raw,
+      listString: "",
+      isListItem: false,
+    });
+    numbers.push({ number, text: raw });
+  });
+  if (!attachedParagraphCount) {
+    // First numbers this turn: from here on a change in paragraph count is
+    // something locateParagraph has to notice.
+    attachedParagraphCount = items.length;
+  }
+  return numbers;
 }
 
 /**
@@ -719,11 +1742,11 @@ export async function clearDraftAnchor(): Promise<void> {
   });
 }
 
-export async function formatText(args: FormatTextArgs): Promise<void> {
-  await Word.run(async (context) => {
+export async function formatText(args: FormatTextArgs): Promise<string> {
+  return Word.run(async (context) => {
     startTracking(context);
-    const target = await resolveTarget(context, args.quote);
-    const font = target.font;
+    const target = await resolveTarget(context, args);
+    const font = target.range.font;
     if (args.bold !== undefined) {
       font.bold = args.bold;
     }
@@ -747,6 +1770,7 @@ export async function formatText(args: FormatTextArgs): Promise<void> {
       font.highlightColor = args.highlightColor.trim() ? args.highlightColor : null;
     }
     await context.sync();
+    return target.note;
   });
 }
 
@@ -763,13 +1787,14 @@ function wordAlignment(alignment: NonNullable<FormatParagraphArgs["alignment"]>)
   }
 }
 
-export async function formatParagraph(args: FormatParagraphArgs): Promise<void> {
-  await Word.run(async (context) => {
+export async function formatParagraph(args: FormatParagraphArgs): Promise<string> {
+  return Word.run(async (context) => {
     startTracking(context);
-    const target = await resolveTarget(context, args.quote);
-    const paragraphs = target.paragraphs;
+    const target = await resolveTarget(context, args, "paragraph");
+    const paragraphs = target.range.paragraphs;
     paragraphs.load("items");
     await context.sync();
+    const wantsIndent = args.firstLineIndent !== undefined || args.leftIndent !== undefined;
 
     if (!paragraphs.items.length) {
       throw new Error("対象の段落が見つかりませんでした。");
@@ -785,14 +1810,841 @@ export async function formatParagraph(args: FormatParagraphArgs): Promise<void> 
       if (args.leftIndent !== undefined) {
         paragraph.leftIndent = args.leftIndent;
       }
+      if (args.spaceBefore !== undefined) {
+        paragraph.spaceBefore = args.spaceBefore;
+        paragraph.lineUnitBefore = 0;
+      }
       if (args.spaceAfter !== undefined) {
         paragraph.spaceAfter = args.spaceAfter;
+        paragraph.lineUnitAfter = 0;
       }
       if (args.lineSpacing !== undefined) {
         paragraph.lineSpacing = args.lineSpacing;
       }
+      if (wantsIndent) {
+        paragraph.font.load("size");
+        paragraph.load("isListItem");
+      }
     }
     await context.sync();
+    const listed = wantsIndent && paragraphs.items.some((paragraph) => isListed(paragraph));
+    const ooxml = paragraphOoxmlOptions(args);
+    if (!ooxml) {
+      return target.note;
+    }
+    const extra = await rewriteParagraphOoxml(context, paragraphs.items, ooxml);
+    const listNote = listed
+      ? "番号の位置はリストが持っているので、段落のインデントでは番号は動きません。"
+      : "";
+    const suffix = [extra, listNote].filter(Boolean).join(" ");
+    return suffix ? `${target.note} ${suffix}` : target.note;
+  });
+}
+
+function paragraphOoxmlOptions(args: FormatParagraphArgs): ParagraphFormatOptions | null {
+  const options: ParagraphFormatOptions = {};
+  if (args.lineSpacing !== undefined) {
+    options.unsetLineGrid = true;
+  }
+  if (args.spaceBefore !== undefined) {
+    options.spaceBeforePt = args.spaceBefore;
+  }
+  if (args.spaceAfter !== undefined) {
+    options.spaceAfterPt = args.spaceAfter;
+  }
+  if (args.leftIndent !== undefined || args.firstLineIndent !== undefined) {
+    options.indent = {
+      leftPt: args.leftIndent,
+      firstLinePt: args.firstLineIndent,
+      fontPt: 12,
+    };
+  }
+  if (
+    !options.unsetLineGrid &&
+    options.spaceBeforePt === undefined &&
+    options.spaceAfterPt === undefined &&
+    !options.indent
+  ) {
+    return null;
+  }
+  return options;
+}
+
+/**
+ * Line spacing below the document grid does nothing while snap-to-grid is on,
+ * and Auto before/after spacing ignores the point values Word.js writes.
+ * Office.js cannot clear those flags, so the paragraph OOXML is patched instead.
+ * Tracking is off for the rewrite so the clause is not recorded as delete+insert.
+ */
+async function rewriteParagraphOoxml(
+  context: Word.RequestContext,
+  paragraphs: Word.Paragraph[],
+  options: ParagraphFormatOptions
+): Promise<string> {
+  const reads = paragraphs.map((paragraph) => ({
+    paragraph,
+    ooxml: paragraph.getOoxml(),
+  }));
+  await context.sync();
+
+  const writes: { paragraph: Word.Paragraph; ooxml: string }[] = [];
+  let lineGrid = false;
+  let autoSpacing = false;
+  for (const read of reads) {
+    // getOoxml returns a ClientResult filled by the sync above.
+    // eslint-disable-next-line office-addins/load-object-before-read
+    const indent = options.indent
+      ? { ...options.indent, fontPt: fontPtOf(read.paragraph) }
+      : undefined;
+    const patched = patchParagraphFormat(read.ooxml.value || "", { ...options, indent });
+    if (patched.changed) {
+      writes.push({ paragraph: read.paragraph, ooxml: patched.ooxml });
+      lineGrid = lineGrid || patched.lineGrid;
+      autoSpacing = autoSpacing || patched.autoSpacing;
+    }
+  }
+  if (!writes.length) {
+    return "";
+  }
+
+  const notes: string[] = [];
+  if (lineGrid) {
+    notes.push("対象段落の行グリッドへの合わせは外しました。");
+  }
+  if (autoSpacing) {
+    notes.push("段落前・後の自動間隔を外して指定値にしました。");
+  }
+  let note = notes.join(" ");
+  context.document.changeTrackingMode = Word.ChangeTrackingMode.off;
+  try {
+    for (const write of writes) {
+      write.paragraph.insertOoxml(write.ooxml, Word.InsertLocation.replace);
+    }
+    await context.sync();
+  } catch {
+    note = ooxmlFailNote(options);
+  } finally {
+    startTracking(context);
+  }
+  try {
+    await context.sync();
+  } catch {
+    // The next edit turns tracking back on.
+  }
+  return note;
+}
+
+function fontPtOf(paragraph: Word.Paragraph): number {
+  try {
+    const size = paragraph.font.size;
+    return typeof size === "number" && size > 0 ? size : 12;
+  } catch {
+    return 12;
+  }
+}
+
+function ooxmlFailNote(options: ParagraphFormatOptions): string {
+  const grid = Boolean(options.unsetLineGrid);
+  const spacing = options.spaceBeforePt !== undefined || options.spaceAfterPt !== undefined;
+  if (grid && spacing) {
+    return "行グリッドまたは段落前後の間隔を変えられなかったので、見た目が変わらないことがあります。";
+  }
+  if (grid) {
+    return "行グリッドを外せなかったので、見た目の行間が変わらないことがあります。";
+  }
+  if (options.indent && !spacing) {
+    return "インデントを書き込めなかったので、字下げやぶら下げがずれることがあります。";
+  }
+  return "段落前後の自動間隔を外せなかったので、指定した間隔が効かないことがあります。";
+}
+
+function isListed(paragraph: Word.Paragraph): boolean {
+  try {
+    return Boolean(paragraph.isListItem);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The list `continue` joins, which may sit above blank lines or 号 paragraphs
+ * that are body text. The immediately previous paragraph is the wrong place
+ * to look: a second 項 then starts a new list at 1.
+ */
+function previousListParagraph(
+  items: Word.Paragraph[],
+  fromIndex: number
+): Word.Paragraph | null {
+  for (let index = fromIndex - 1; index >= 0; index -= 1) {
+    if (isNumberMark(listMarkOf(items[index]))) {
+      return items[index];
+    }
+  }
+  return null;
+}
+
+function listIdOf(paragraph: Word.Paragraph): number | null {
+  try {
+    if (!paragraph.isListItem) {
+      return null;
+    }
+    const list = paragraph.listOrNullObject;
+    if (!list || list.isNullObject) {
+      return null;
+    }
+    return list.id;
+  } catch {
+    return null;
+  }
+}
+
+function listLevelOf(paragraph: Word.Paragraph): number {
+  try {
+    if (!paragraph.isListItem) {
+      return 0;
+    }
+    const item = paragraph.listItemOrNullObject;
+    if (!item || item.isNullObject) {
+      return 0;
+    }
+    return item.level || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function shownListString(paragraph: Word.Paragraph): string {
+  return wrapListMark(listMarkOf(paragraph)) || "（なし）";
+}
+
+function setNumberingListStyle(list: Word.List, style: ListStyle, level: number): void {
+  const spec = listStyleSpec(style);
+  if (spec.numbering === "paren") {
+    list.setLevelNumbering(level, Word.ListNumbering.arabic, ["(", level, ")"]);
+    return;
+  }
+  if (spec.numbering === "lowerLetter") {
+    list.setLevelNumbering(level, Word.ListNumbering.lowerLetter);
+    return;
+  }
+  list.setLevelNumbering(level, Word.ListNumbering.arabic);
+}
+
+async function applyBuiltinListStyle(
+  context: Word.RequestContext,
+  paragraph: Word.Paragraph,
+  style: ListStyle,
+  level: number
+): Promise<void> {
+  const builtin = listStyleSpec(style).builtin;
+  if (!builtin) {
+    throw new Error(`内部エラー: ${style} は組み込み番号書式ではありません。`);
+  }
+  const listLevels = paragraph.getRange().listFormat.listTemplate.listLevels;
+  listLevels.load("items");
+  await context.sync();
+  const listLevel = listLevels.items[level];
+  if (!listLevel) {
+    throw new Error(`リストレベル ${level} が見つかりません。`);
+  }
+  // A bullet level only accepts a one-character label, and Word rewrites
+  // numberFormat whenever numberStyle changes. Both mean the style has to land
+  // first, in its own sync, before the label is worth setting.
+  listLevel.numberStyle = builtin.numberStyle as Word.ListBuiltInNumberStyle;
+  await context.sync();
+  listLevel.numberFormat = listLevelNumberFormat(builtin, level);
+  if (builtin.trailingCharacter) {
+    listLevel.trailingCharacter = builtin.trailingCharacter as Word.TrailingCharacter;
+  }
+  await context.sync();
+}
+
+function resolveApplyStyle(style: ListStyle): ListStyle {
+  return style === "continue" ? "arabic" : style;
+}
+
+/**
+ * Put `targets` on the list `previous` belongs to, at `level`. Word counts
+ * within one list, so this is what makes the second 項 read ２ and a 号 keep
+ * counting past its 目. The tool logs show attachToList doing exactly that
+ * (１→２→３, （１）→（２）, ①→②) whenever the paragraph above was actually found.
+ */
+function joinListOf(previous: Word.Paragraph, targets: Word.Paragraph[], level: number): void {
+  const id = listIdOf(previous);
+  if (id === null) {
+    throw new Error("直前の番号リストが読めませんでした。");
+  }
+  for (const paragraph of targets) {
+    paragraph.attachToList(id, level);
+  }
+}
+
+/**
+ * The object in `items` that stands for `paragraph`. A range found by quote
+ * hands back paragraph proxies of its own, and `items.indexOf` cannot see
+ * through them: it answered -1, so no "numbered paragraph above" was ever
+ * found for a quote-addressed paragraph, and each one began a list of its own
+ * and read １ / （１） / ① however far down its 条 it stood. Paragraph numbers
+ * come straight from `items` and never had the problem.
+ */
+async function anchorInBody(
+  context: Word.RequestContext,
+  items: Word.Paragraph[],
+  paragraph: Word.Paragraph
+): Promise<Word.Paragraph> {
+  if (items.includes(paragraph)) {
+    return paragraph;
+  }
+  const wanted = compact(paragraphText(paragraph));
+  const candidates = items.filter((item) => compact(paragraphText(item)) === wanted);
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+  if (!candidates.length) {
+    throw new Error(
+      "対象の段落を本文の中で特定できませんでした。paragraph に添付本文の段落番号を渡してください。"
+    );
+  }
+  // Same wording more than once: ask Word which of them is this very range.
+  const target = paragraph.getRange();
+  const relations = candidates.map((item) => item.getRange().compareLocationWith(target));
+  await context.sync();
+  const index = relations.findIndex(
+    (relation) => relation.value === Word.LocationRelation.equal
+  );
+  if (index < 0) {
+    throw new Error(
+      "同じ文言の段落が複数あり、どれかを特定できませんでした。paragraph に添付本文の段落番号を渡してください。"
+    );
+  }
+  return candidates[index];
+}
+
+function landingNote(paragraphs: Word.Paragraph[], joinedFrom: Word.Paragraph | null = null): string {
+  const first = paragraphs[0];
+  const last = paragraphs[paragraphs.length - 1];
+  const head = clipNote(paragraphText(first), 24);
+  const lead = joinedFrom ? `直前の ${shownListString(joinedFrom)} に続けました。` : "";
+  if (paragraphs.length === 1) {
+    return `${lead}「${head}」を対象にしました。いま Word に出ている番号は ${shownListString(first)} です。`;
+  }
+  const tail = clipNote(paragraphText(last), 24);
+  return (
+    `${lead}${paragraphs.length} 段落（「${head}」〜「${tail}」）を対象にしました。` +
+    `いま Word に出ている番号は、先頭が ${shownListString(first)}、末尾が ${shownListString(last)} です。`
+  );
+}
+
+async function loadListMembership(
+  context: Word.RequestContext,
+  paragraphs: Word.Paragraph[]
+): Promise<void> {
+  const listed: Word.Paragraph[] = [];
+  for (const paragraph of paragraphs) {
+    try {
+      if (paragraph.isListItem) {
+        listed.push(paragraph);
+      }
+    } catch {
+      // Membership stays unread.
+    }
+  }
+  if (!listed.length) {
+    return;
+  }
+  try {
+    for (const paragraph of listed) {
+      paragraph.listItemOrNullObject.load("listString,level");
+      paragraph.listOrNullObject.load("id,levelTypes");
+    }
+    await context.sync();
+  } catch {
+    // Membership stays unread. Callers treat missing ids as "not a list".
+  }
+}
+
+/**
+ * The non-blank paragraphs from `fromIndex` through `toIndex`. Each has to be
+ * one the model was shown — attached, or handed out by an insert this turn — so
+ * a span cannot number paragraphs past where the attachment was cut off. That
+ * is checked by wording, not by position: an insert above moves everything
+ * below it, so a body position no longer says which number a paragraph wore.
+ */
+function spanListTargets(
+  items: Word.Paragraph[],
+  fromIndex: number,
+  toIndex: number
+): Word.Paragraph[] {
+  if (toIndex < fromIndex) {
+    throw new Error("through は paragraph と同じか、それより後ろの番号にしてください。");
+  }
+  const shown = new Set([...attachedParagraphs.values()].map((row) => compact(row.text)));
+  const targets: Word.Paragraph[] = [];
+  for (let index = fromIndex; index <= toIndex; index += 1) {
+    const text = paragraphText(items[index]);
+    if (!text.trim()) {
+      continue;
+    }
+    if (shown.size > 0 && !shown.has(compact(text))) {
+      throw new Error(
+        `「${clipNote(text, 24)}」は今回の添付に無いので、番号を操作できません。` +
+          `添付されている番号の区間だけを through に渡してください。`
+      );
+    }
+    targets.push(items[index]);
+  }
+  if (!targets.length) {
+    throw new Error("対象の段落がありません。");
+  }
+  return targets;
+}
+
+/**
+ * Put `targets` on a numbered list at `level` and give that level its style.
+ * Joining the list above is what makes 項・号・目 one hierarchy: Word advances
+ * the outer counter and restarts the inner one only within a single list, so a
+ * 号 that starts its own list always reads （１）. `previous` is the numbered
+ * paragraph above whose list is joined; null only at the top of a 条, where
+ * the count is meant to begin again.
+ */
+async function buildNumberedList(
+  context: Word.RequestContext,
+  targets: Word.Paragraph[],
+  style: ListStyle,
+  level: number,
+  previous: Word.Paragraph | null
+): Promise<void> {
+  const applyStyle = resolveApplyStyle(style);
+  if (isBuiltinListStyle(applyStyle) && !canApplyBuiltinListStyles()) {
+    throw new Error(
+      `${applyStyle} などの番号書式には Word デスクトップが必要です。arabic / paren / lowerLetter を使うか、Word デスクトップで開いてください。`
+    );
+  }
+
+  // Styling a level rewrites the list template, which restarts that level's
+  // count — the one thing a joining paragraph must not do. The level is styled
+  // once, when it first comes into use; read before attaching, or it always
+  // looks used. levelExistences is true where the list already has an item.
+  let levelInUse = false;
+  let createdId: number | null = null;
+  if (previous === null) {
+    const created = targets[0].startNewList();
+    await context.sync();
+    created.load("id");
+    await context.sync();
+    createdId = created.id;
+  } else {
+    const joinedId = listIdOf(previous);
+    if (joinedId !== null) {
+      const joined = context.document.body.lists.getByIdOrNullObject(joinedId);
+      joined.load("isNullObject,levelExistences");
+      await context.sync();
+      levelInUse = !joined.isNullObject && joined.levelExistences[level] === true;
+    }
+  }
+  try {
+    if (previous === null) {
+      if (level) {
+        targets[0].listItem.level = level;
+      }
+      for (const paragraph of targets.slice(1)) {
+        paragraph.attachToList(createdId as number, level);
+      }
+    } else {
+      joinListOf(previous, targets, level);
+    }
+    // The paragraphs have to sit on the level before its template is rewritten,
+    // so that Word reads the label back onto them.
+    await context.sync();
+    if (!levelInUse) {
+      if (isBuiltinListStyle(applyStyle)) {
+        await applyBuiltinListStyle(context, targets[0], applyStyle, level);
+      } else {
+        setNumberingListStyle(targets[0].list, applyStyle, level);
+        await context.sync();
+      }
+    }
+  } catch (error) {
+    for (const paragraph of targets) {
+      try {
+        paragraph.detachFromList();
+      } catch {
+        // Already plain, or Word refused the detach.
+      }
+    }
+    try {
+      await context.sync();
+    } catch {
+      // The next edit sees whatever Word kept.
+    }
+    const reason = error instanceof Error ? error.message : "InvalidArgument";
+    throw new Error(
+      `番号の書式を付けられませんでした（${reason}）。箇条書きのまま残さないよう外しました。style を ${listStyleNamesForApply()} のいずれかにするか、1 段落ずつ付けてください。`
+    );
+  }
+}
+
+async function reloadListState(
+  context: Word.RequestContext,
+  paragraphs: Word.Paragraph[]
+): Promise<void> {
+  for (const paragraph of paragraphs) {
+    paragraph.load("isListItem");
+  }
+  await context.sync();
+  await loadListMembership(context, paragraphs);
+}
+
+/**
+ * Attach, detach or restart Word automatic numbering. The model points by
+ * paragraph number; Word list ids stay inside this function.
+ */
+export async function formatList(args: FormatListArgs): Promise<string> {
+  return Word.run(async (context) => {
+    startTracking(context);
+    const collection = context.document.body.paragraphs;
+    collection.load("items/text,items/isListItem");
+    await context.sync();
+    await loadListMembership(context, collection.items);
+    const items = collection.items;
+
+    let targets: Word.Paragraph[];
+    if (args.paragraph !== undefined) {
+      targets = [locateParagraph(items, args.paragraph).paragraph];
+    } else {
+      const target = await resolveTarget(context, args, "paragraph");
+      const ranged = target.range.paragraphs;
+      ranged.load("items/text,items/isListItem");
+      await context.sync();
+      const found = ranged.items.filter((paragraph) => paragraphText(paragraph).trim());
+      if (!found.length) {
+        throw new Error("対象の段落がありません。");
+      }
+      // Everything below reads list state and neighbours off `items`, so the
+      // targets have to be those objects, not the range's own proxies.
+      targets = [];
+      for (const paragraph of found) {
+        targets.push(await anchorInBody(context, items, paragraph));
+      }
+    }
+    if (args.through !== undefined) {
+      // The span runs from the first paragraph found, by number or by quote.
+      const fromIndex = items.indexOf(targets[0]);
+      const toIndex = locateParagraph(items, args.through).index;
+      targets = spanListTargets(items, fromIndex, toIndex);
+    }
+
+    if (args.action === "remove") {
+      for (const paragraph of targets) {
+        if (paragraph.isListItem) {
+          paragraph.detachFromList();
+        }
+      }
+      await context.sync();
+      await reloadListState(context, targets);
+      return landingNote(targets);
+    }
+
+    if (args.action === "restart") {
+      if (targets.length !== 1) {
+        throw new Error("restart は 1 段落だけを対象にします。");
+      }
+      const paragraph = targets[0];
+      if (!paragraph.isListItem) {
+        throw new Error(
+          "この段落に番号が無いので、1 から振り直せません。番号をここから 1 で始めるなら、apply に start を true で付けてください。"
+        );
+      }
+      if (isBulletMark(listMarkOf(paragraph))) {
+        throw new Error(
+          `この段落は箇条書きです。1 から振り直す操作は番号リスト向けです。番号にするときは ${listStyleNamesForApply()} を付けてください。`
+        );
+      }
+      const index = items.indexOf(paragraph);
+      const id = listIdOf(paragraph);
+      const previousListed = previousListParagraph(items, index);
+      const firstInList = !previousListed || listIdOf(previousListed) !== id;
+      if (firstInList) {
+        paragraph.list.setLevelStartingNumber(listLevelOf(paragraph), 1);
+        await context.sync();
+        await reloadListState(context, [paragraph]);
+        return landingNote([paragraph]);
+      }
+      if (canSeparateList()) {
+        paragraph.separateList();
+        await context.sync();
+        await reloadListState(context, [paragraph]);
+        return landingNote([paragraph]);
+      }
+      const following: Word.Paragraph[] = [];
+      for (let after = index + 1; after < items.length; after += 1) {
+        if (listIdOf(items[after]) === id) {
+          following.push(items[after]);
+        }
+      }
+      const level = listLevelOf(paragraph);
+      paragraph.detachFromList();
+      for (const next of following) {
+        next.detachFromList();
+      }
+      await context.sync();
+      await buildNumberedList(context, [paragraph, ...following], "arabic", level, null);
+      await reloadListState(context, [paragraph]);
+      return (
+        landingNote([paragraph]) +
+        " 元の番号の書式は保てなかったので、アラビア数字になっています。"
+      );
+    }
+
+    const style: ListStyle = args.style || "continue";
+    const first = targets[0];
+    const firstIndex = items.indexOf(first);
+    const previous = previousListParagraph(items, firstIndex);
+    const previousId = previous ? listIdOf(previous) : null;
+    const continueLevel =
+      args.level !== undefined
+        ? args.level
+        : previous
+          ? listLevelOf(previous)
+          : 0;
+
+    if (style !== "continue") {
+      if (targets.some((paragraph) => isNumberMark(listMarkOf(paragraph)))) {
+        throw new Error(
+          `既に項番号（1. や （１） や 第１ や 第１条 など）があります。外してから ${listStyleNamesForApply()} を付けるか、continue で続きにしてください。`
+        );
+      }
+      const bullets = targets.filter((paragraph) => isBulletMark(listMarkOf(paragraph)));
+      if (bullets.length) {
+        for (const paragraph of bullets) {
+          paragraph.detachFromList();
+        }
+        await context.sync();
+      }
+      // A new list is only right where the count starts over; otherwise the
+      // paragraph joins the numbering already running above it.
+      const joinedFrom = args.start || previousId === null ? null : previous;
+      await buildNumberedList(context, targets, style, args.level ?? 0, joinedFrom);
+      await reloadListState(context, targets);
+      return landingNote(targets, joinedFrom);
+    }
+
+    if (previousId !== null) {
+      for (const paragraph of targets) {
+        const id = listIdOf(paragraph);
+        if (id !== null && id !== previousId) {
+          throw new Error(
+            "対象は別のリストの番号があります。外してから続けるか、remove してから付け直してください。"
+          );
+        }
+      }
+      if (targets.every((paragraph) => listIdOf(paragraph) === previousId)) {
+        await reloadListState(context, targets);
+        return landingNote(targets);
+      }
+      // A level nobody has used yet still wears the template default, which
+      // startNewList leaves as a bullet. Joining it would hand back 〔•〕.
+      const joined = context.document.body.lists.getByIdOrNullObject(previousId);
+      joined.load("isNullObject,levelExistences");
+      await context.sync();
+      if (!joined.isNullObject && joined.levelExistences[continueLevel] !== true) {
+        throw new Error(
+          `段 ${continueLevel} にはまだ番号の書式がありません。continue は同じ段の続きに使い、段を変えるときは style を付けた apply にしてください。`
+        );
+      }
+      for (const paragraph of targets) {
+        if (paragraph.isListItem) {
+          paragraph.detachFromList();
+        }
+      }
+      await context.sync();
+      joinListOf(previous as Word.Paragraph, targets, continueLevel);
+      await context.sync();
+      await reloadListState(context, targets);
+      return landingNote(targets, previous);
+    }
+
+    const ids = targets.map((paragraph) => listIdOf(paragraph));
+    const listed = ids.filter((id) => id !== null);
+    if (listed.length === targets.length && new Set(listed).size === 1) {
+      return landingNote(targets);
+    }
+    if (listed.length) {
+      throw new Error(
+        "対象の一部にすでに番号があります。外してから付けるか、番号の無い段落だけを選んでください。"
+      );
+    }
+    await buildNumberedList(context, targets, "arabic", continueLevel, null);
+    await reloadListState(context, targets);
+    return landingNote(targets);
+  });
+}
+
+/** Body text. Levels 1 to 9 show in the navigation pane. Same numbers as WdOutlineLevel. */
+const OUTLINE_BODY_LEVEL = 10;
+
+const BUILTIN_HEADING_STYLES = new Set([
+  "Heading1",
+  "Heading2",
+  "Heading3",
+  "Heading4",
+  "Heading5",
+  "Heading6",
+  "Heading7",
+  "Heading8",
+  "Heading9",
+]);
+
+function readOutlineLevel(value: number | string): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (value === "OutlineLevelBodyText") {
+    return OUTLINE_BODY_LEVEL;
+  }
+  const match = /^OutlineLevel([1-9])$/.exec(value);
+  return match ? Number(match[1]) : null;
+}
+
+function isBuiltinHeadingStyle(style: string): boolean {
+  return BUILTIN_HEADING_STYLES.has(style);
+}
+
+function quotedClips(paragraphs: Word.Paragraph[]): string {
+  return paragraphs.map((paragraph) => `「${clipNote(paragraphText(paragraph), 24)}」`).join("、");
+}
+
+function outlineAppliedNote(paragraphs: Word.Paragraph[], wanted: number): string {
+  const verb =
+    wanted === OUTLINE_BODY_LEVEL
+      ? "ナビゲーションの見出しから外しました（変更履歴に書式変更として記録）。"
+      : `レベル ${wanted} の見出しにしました（変更履歴に書式変更として記録）。`;
+  if (paragraphs.length === 1) {
+    return `「${clipNote(paragraphText(paragraphs[0]), 24)}」を${verb}`;
+  }
+  const head = clipNote(paragraphText(paragraphs[0]), 24);
+  const tail = clipNote(paragraphText(paragraphs[paragraphs.length - 1]), 24);
+  return `${paragraphs.length} 段落（「${head}」〜「${tail}」）を${verb}`;
+}
+
+/**
+ * Navigation headings are outline levels, not heading styles. This writes only
+ * `outlineLevel`, so the paragraph style and font stay. Built-in Heading 1-9
+ * lock that level to the style, so those paragraphs are skipped.
+ */
+export async function setOutlineLevel(args: SetOutlineArgs): Promise<string> {
+  const wanted = args.action === "clear" ? OUTLINE_BODY_LEVEL : args.level;
+  if (wanted === undefined) {
+    throw new Error("set には level（1 から 9）が必要です。");
+  }
+  return Word.run(async (context) => {
+    startTracking(context);
+    const collection = context.document.body.paragraphs;
+    collection.load("items/text");
+    await context.sync();
+    const items = collection.items;
+
+    let targets: Word.Paragraph[];
+    if (args.paragraph !== undefined) {
+      targets = [locateParagraph(items, args.paragraph).paragraph];
+    } else {
+      const target = await resolveTarget(context, args, "paragraph");
+      const ranged = target.range.paragraphs;
+      ranged.load("items/text");
+      await context.sync();
+      const found = ranged.items.filter((paragraph) => paragraphText(paragraph).trim());
+      if (!found.length) {
+        throw new Error("対象の段落がありません。");
+      }
+      targets = [];
+      for (const paragraph of found) {
+        targets.push(await anchorInBody(context, items, paragraph));
+      }
+    }
+    if (args.through !== undefined) {
+      const fromIndex = items.indexOf(targets[0]);
+      const toIndex = locateParagraph(items, args.through).index;
+      targets = spanListTargets(items, fromIndex, toIndex);
+    }
+
+    for (const paragraph of targets) {
+      paragraph.load("styleBuiltIn,outlineLevel,style");
+    }
+    await context.sync();
+
+    const locked: Word.Paragraph[] = [];
+    const same: Word.Paragraph[] = [];
+    const writes: { paragraph: Word.Paragraph; styleBefore: string }[] = [];
+    for (const paragraph of targets) {
+      if (isBuiltinHeadingStyle(String(paragraph.styleBuiltIn))) {
+        locked.push(paragraph);
+        continue;
+      }
+      const current = readOutlineLevel(paragraph.outlineLevel);
+      if (current === wanted) {
+        same.push(paragraph);
+        continue;
+      }
+      writes.push({ paragraph, styleBefore: paragraph.style });
+      paragraph.outlineLevel = wanted;
+    }
+
+    if (writes.length) {
+      await context.sync();
+      for (const write of writes) {
+        write.paragraph.load("outlineLevel,style");
+      }
+      await context.sync();
+    }
+
+    const stuck: Word.Paragraph[] = [];
+    const missed: Word.Paragraph[] = [];
+    const restyled: { paragraph: Word.Paragraph; styleBefore: string }[] = [];
+    for (const write of writes) {
+      if (write.paragraph.style !== write.styleBefore) {
+        restyled.push(write);
+        continue;
+      }
+      if (readOutlineLevel(write.paragraph.outlineLevel) === wanted) {
+        stuck.push(write.paragraph);
+      } else {
+        missed.push(write.paragraph);
+      }
+    }
+    if (restyled.length) {
+      const first = restyled[0];
+      throw new Error(
+        `${quotedClips(restyled.map((write) => write.paragraph))}のスタイル名が` +
+          `「${first.styleBefore}」から「${first.paragraph.style}」に変わりました。取り消してください。`
+      );
+    }
+
+    const parts: string[] = [];
+    if (stuck.length) {
+      parts.push(outlineAppliedNote(stuck, wanted));
+    }
+    if (missed.length) {
+      parts.push(`${quotedClips(missed)}はナビゲーションに出ていません。`);
+    }
+    if (locked.length) {
+      parts.push(
+        `${quotedClips(locked)}は組み込みの見出しスタイルがレベルを固定しているので変えていません。`
+      );
+    }
+    if (!stuck.length && !missed.length && same.length) {
+      parts.push(
+        wanted === OUTLINE_BODY_LEVEL
+          ? `${quotedClips(same)}はすでにナビゲーションの見出しではありません。`
+          : `${quotedClips(same)}はすでにレベル ${wanted} です。`
+      );
+    }
+    if (missed.length && !stuck.length) {
+      throw new Error(parts.join(""));
+    }
+    if (!parts.length) {
+      throw new Error("対象の段落がありません。");
+    }
+    return parts.join("");
   });
 }
 
@@ -808,8 +2660,13 @@ export async function insertCitationText(hit: SearchHit): Promise<void> {
   await Word.run(async (context) => {
     startTracking(context);
     const selection = context.document.getSelection();
-    selection.insertParagraph(formatCitation(hit), Word.InsertLocation.after);
+    const paragraph = selection.insertParagraph(formatCitation(hit), Word.InsertLocation.after);
+    paragraph.load("isListItem");
     await context.sync();
+    if (paragraph.isListItem) {
+      paragraph.detachFromList();
+      await context.sync();
+    }
   });
 }
 

@@ -160,7 +160,34 @@ describe("runTurn", () => {
     expect(names).not.toContain("replace_selection");
     // The way to point at text without a selection.
     expect(names).toContain("replace_quote");
-    expect(names).toContain("insert_blocks");
+    expect(names).toContain("format_list");
+  });
+
+  it("explains Word list marks only when the attachment carried them", async () => {
+    chatStream.mockResolvedValue(completion({ content: "はい。" }));
+    await runTurn({
+      settings,
+      instruction: "項を見て",
+      attachment: { ...attach("", "[1] 〔1.〕甲は乙に委託する。"), listMarks: true },
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+    });
+    const marked = (chatStream.mock.calls[0][0] as ChatBody).messages[0]?.content || "";
+    expect(marked).toContain("Word の項番号");
+
+    chatStream.mockClear();
+    chatStream.mockResolvedValue(completion({ content: "はい。" }));
+    await runTurn({
+      settings,
+      instruction: "本文を見て",
+      attachment: attach("", "[1] 甲は乙に委託する。"),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+    });
+    const plain = (chatStream.mock.calls[0][0] as ChatBody).messages[0]?.content || "";
+    expect(plain).not.toContain("Word の項番号");
   });
 
   it("requires a quote from the comment tool when there is no selection to fall back on", async () => {
@@ -207,6 +234,25 @@ describe("runTurn", () => {
     // Qwen wants its own reasoning back alongside the tool replies.
     expect(assistantTurn?.reasoning_content).toBe("どこを直すか考える");
     expect(second.messages.filter((m) => m.role === "tool")).toHaveLength(2);
+  });
+
+  it("offers paragraph numbers from the next round once an insert handed some out", async () => {
+    executeToolCall.mockResolvedValue({ content: "3 段落を挿入しました。\n[2] 第1条", ok: true, numbered: true });
+    chatStream
+      .mockResolvedValueOnce(
+        completion({ toolCalls: [toolCall("c1", "insert_blocks")], finishReason: "tool_calls" })
+      )
+      .mockResolvedValueOnce(completion({ content: "入れました。" }));
+
+    // An empty document: the first round has no numbers to offer.
+    await run("ひな形を入れて");
+
+    const properties = (callIndex: number) =>
+      ((chatStream.mock.calls[callIndex][0] as ChatBody).tools as {
+        function: { name: string; parameters: { properties: Record<string, unknown> } };
+      }[]).find((tool) => tool.function.name === "format_list")?.function.parameters.properties;
+    expect(properties(0)?.paragraph).toBeUndefined();
+    expect(properties(1)?.paragraph).toBeDefined();
   });
 
   it("stops after the tool-round budget and tells the user, without a no-tools closing call", async () => {

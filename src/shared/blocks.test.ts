@@ -56,6 +56,20 @@ describe("mapBlockToParagraph", () => {
     expect(spec.firstLineIndentPt).toBe(12);
     expect(spec.leftIndentPt).toBe(0);
     expect(spec.bold).toBe(false);
+    expect(spec.lineSpacingPt).toBe(12);
+  });
+
+  it("scales line spacing with the paragraph font", () => {
+    const body = mapBlockToParagraph(
+      { type: "body", text: "原告は次のとおり請求する。" },
+      { ...opts, lineSpacingChars: 1.5 }
+    );
+    const title = mapBlockToParagraph(
+      { type: "title", text: "訴状" },
+      { ...opts, lineSpacingChars: 1.5 }
+    );
+    expect(body.lineSpacingPt).toBe(18);
+    expect(title.lineSpacingPt).toBe(24);
   });
 
   it("maps clause with a bold label and no indent", () => {
@@ -149,6 +163,26 @@ describe("summarizeInsertedBlocks", () => {
       "前の段落は「受託者が本契約について現に受領した報酬の総額を上…」です"
     );
     expect(summary).toContain("意図と違う場所なら");
+  });
+
+  it("lists the numbers handed out for the new paragraphs, so the turn can point at them", () => {
+    const summary = summarizeInsertedBlocks(
+      [
+        { type: "clause", text: "売主は買主に売り渡す。", label: "第1条" },
+        { type: "item", text: "品名　○○" },
+      ],
+      {
+        placement: "cursor",
+        after: "",
+        numbers: [
+          { number: 2, text: "第1条　売主は買主に売り渡す。" },
+          { number: 3, text: "品名　○○" },
+        ],
+      }
+    );
+    expect(summary).toContain("（変更履歴に記録）。");
+    expect(summary).toContain("paragraph / through");
+    expect(summary).toContain("\n[2] 第1条　売主は買主に売り渡す。\n[3] 品名　○○");
   });
 
   it("quotes the tail so the model can anchor the next call", () => {

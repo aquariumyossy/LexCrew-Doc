@@ -10,6 +10,9 @@ export type XmlEvent =
   | { kind: "close"; name: string }
   | { kind: "text"; text: string };
 
+/** Same events as `scanXml`, with the slice of the source each token covers. */
+export type XmlToken = XmlEvent & { start: number; end: number };
+
 const NAMED_ENTITIES: Record<string, string> = {
   amp: "&",
   lt: "<",
@@ -56,19 +59,24 @@ function endOfTag(xml: string, from: number): number {
   return -1;
 }
 
-export function* scanXml(xml: string): Generator<XmlEvent> {
+export function* scanXmlTokens(xml: string): Generator<XmlToken> {
   let at = 0;
   while (at < xml.length) {
     const open = xml.indexOf("<", at);
     if (open < 0) {
       const tail = xml.slice(at);
       if (tail) {
-        yield { kind: "text", text: decodeXmlText(tail) };
+        yield { kind: "text", text: decodeXmlText(tail), start: at, end: xml.length };
       }
       return;
     }
     if (open > at) {
-      yield { kind: "text", text: decodeXmlText(xml.slice(at, open)) };
+      yield {
+        kind: "text",
+        text: decodeXmlText(xml.slice(at, open)),
+        start: at,
+        end: open,
+      };
     }
 
     if (xml.startsWith("<!--", open)) {
@@ -79,7 +87,7 @@ export function* scanXml(xml: string): Generator<XmlEvent> {
     if (xml.startsWith("<![CDATA[", open)) {
       const close = xml.indexOf("]]>", open);
       const to = close < 0 ? xml.length : close;
-      yield { kind: "text", text: xml.slice(open + 9, to) };
+      yield { kind: "text", text: xml.slice(open + 9, to), start: open + 9, end: to };
       at = close < 0 ? xml.length : close + 3;
       continue;
     }
@@ -94,9 +102,10 @@ export function* scanXml(xml: string): Generator<XmlEvent> {
       return;
     }
     const inner = xml.slice(open + 1, close);
-    at = close + 1;
+    const end = close + 1;
+    at = end;
     if (inner.startsWith("/")) {
-      yield { kind: "close", name: inner.slice(1).trim() };
+      yield { kind: "close", name: inner.slice(1).trim(), start: open, end };
       continue;
     }
     const empty = inner.endsWith("/");
@@ -108,7 +117,21 @@ export function* scanXml(xml: string): Generator<XmlEvent> {
       name: name.trim(),
       attrs: space < 0 ? "" : body.slice(space + 1),
       empty,
+      start: open,
+      end,
     };
+  }
+}
+
+export function* scanXml(xml: string): Generator<XmlEvent> {
+  for (const token of scanXmlTokens(xml)) {
+    if (token.kind === "open") {
+      yield { kind: "open", name: token.name, attrs: token.attrs, empty: token.empty };
+    } else if (token.kind === "close") {
+      yield { kind: "close", name: token.name };
+    } else {
+      yield { kind: "text", text: token.text };
+    }
   }
 }
 

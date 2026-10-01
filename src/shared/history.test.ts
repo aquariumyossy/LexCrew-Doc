@@ -7,6 +7,7 @@ import {
   conversationTitle,
   documentFileName,
   groupConversationsByDocument,
+  partitionConversations,
 } from "./history";
 
 describe("conversationTitle", () => {
@@ -54,6 +55,33 @@ function summary(partial: Partial<ConversationSummary>): ConversationSummary {
     ...partial,
   };
 }
+
+describe("partitionConversations", () => {
+  it("keeps this document's rows in order and puts the rest aside", () => {
+    const rows = [
+      summary({ id: "b1", documentKey: "docB" }),
+      summary({ id: "a1", documentKey: "docA" }),
+      summary({ id: "a2", documentKey: "docA" }),
+      summary({ id: "none" }),
+    ];
+    expect(partitionConversations(rows, "docA")).toEqual({
+      here: [
+        summary({ id: "a1", documentKey: "docA" }),
+        summary({ id: "a2", documentKey: "docA" }),
+      ],
+      elsewhere: [summary({ id: "b1", documentKey: "docB" }), summary({ id: "none" })],
+    });
+    expect(rows.map((row) => row.id)).toEqual(["b1", "a1", "a2", "none"]);
+  });
+
+  it("puts every row aside when no document is open", () => {
+    const rows = [summary({ id: "a1", documentKey: "docA" })];
+    expect(partitionConversations(rows, "")).toEqual({
+      here: [],
+      elsewhere: [summary({ id: "a1", documentKey: "docA" })],
+    });
+  });
+});
 
 describe("groupConversationsByDocument", () => {
   it("keeps newest-first groups and folds later rows of the same document", () => {

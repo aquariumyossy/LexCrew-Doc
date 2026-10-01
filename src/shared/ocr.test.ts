@@ -1,5 +1,21 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { MAX_OCR_PAGE_CHARS, OCR_PROMPT, isLoopbackUrl, visionUnsupportedMessage } from "./ocr";
+
+/** The Rust sidecar cannot import this module, so the prompt is copied there. */
+function rustOcrPrompt(): string {
+  const source = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/ocr.rs"),
+    "utf8"
+  );
+  const start = source.indexOf("pub const OCR_PROMPT");
+  const body = source.slice(start, source.indexOf(");", start));
+  return [...body.matchAll(/"((?:\\.|[^"\\])*)"/g)]
+    .map((match) => match[1].replace(/\\n/g, "\n").replace(/\\"/g, '"'))
+    .join("");
+}
 
 describe("OCR_PROMPT", () => {
   it("asks for the text as written, not for a summary", () => {
@@ -7,6 +23,21 @@ describe("OCR_PROMPT", () => {
     expect(OCR_PROMPT).toContain("要約");
     // A blank page must come back blank, or an apology becomes the body.
     expect(OCR_PROMPT).toContain("空で返して");
+  });
+
+  it("writes chart edges under 〔図〕 and does not invent kinship", () => {
+    expect(OCR_PROMPT).toContain("〔図〕");
+    expect(OCR_PROMPT).toContain("山田太郎 → 山田花子");
+    expect(OCR_PROMPT).toContain("山田太郎 ┄ 山田花子");
+    expect(OCR_PROMPT).toContain("端点は箱の文字を短くせず");
+    expect(OCR_PROMPT).toContain("親子、婚姻、養子とは書きません");
+    expect(OCR_PROMPT).toContain("タブ区切り");
+    expect(OCR_PROMPT).toContain("表は図にしません");
+    expect(OCR_PROMPT).toContain("図が無いページでは「〔図〕」を書きません");
+  });
+
+  it("matches the Rust copy the sidecar sends", () => {
+    expect(rustOcrPrompt()).toBe(OCR_PROMPT);
   });
 });
 

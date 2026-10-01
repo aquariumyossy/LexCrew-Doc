@@ -6,7 +6,7 @@ use crate::log;
 use crate::ocr;
 use crate::search;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, Query};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -16,6 +16,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::time::SystemTime;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -64,6 +65,27 @@ pub struct SearchRequest {
     pub q: String,
 }
 
+#[derive(Clone)]
+struct AppState {
+    connection_file: PathBuf,
+}
+
+fn note_connection(line: &str) {
+    log::info(line, None);
+}
+
+fn active_connection(file: &std::path::Path, base_url: &str, api_key: &str, searxng_url: &str) -> crate::connection::Connection {
+    let read = crate::connection::read_connection(file, &mut note_connection);
+    crate::connection::resolve_connection(
+        &read,
+        &crate::connection::Connection {
+            llm_base_url: base_url.to_string(),
+            llm_api_key: api_key.to_string(),
+            searxng_url: searxng_url.to_string(),
+        },
+    )
+}
+
 fn json_error(status: StatusCode, error: &str, hint: Option<&str>) -> Response {
     let body = if let Some(hint) = hint {
         json!({ "error": error, "hint": hint })
@@ -74,16 +96,49 @@ fn json_error(status: StatusCode, error: &str, hint: Option<&str>) -> Response {
 }
 
 async fn get_health() -> Json<Value> {
-    Json(json!({ "ok": true, "service": "GURI" }))
+    Json(json!({ "ok": true, "service": "LexCrew Doc" }))
 }
 
-async fn post_health(Json(body): Json<HealthRequest>) -> Response {
+async fn get_connection(State(state): State<AppState>) -> Json<Value> {
+    let file = crate::connection::read_connection(&state.connection_file, &mut note_connection);
+    Json(crate::connection::connection_payload(&file))
+}
+
+async fn post_connection(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let incoming = crate::connection::connection_from_value(&body);
+    match crate::connection::adopt_connection(&state.connection_file, &incoming, &mut note_connection) {
+        Ok(file) => Json(crate::connection::connection_payload(&file)).into_response(),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &error, None),
+    }
+}
+
+async fn put_connection(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let incoming = crate::connection::connection_from_value(&body);
+    match crate::connection::save_connection(&state.connection_file, &incoming) {
+        Ok(()) => Json(json!({
+            "kind": "ready",
+            "llmBaseUrl": incoming.llm_base_url,
+            "llmApiKey": incoming.llm_api_key,
+            "searxngUrl": incoming.searxng_url,
+        }))
+        .into_response(),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &error, None),
+    }
+}
+
+async fn post_health(State(state): State<AppState>, Json(body): Json<HealthRequest>) -> Response {
     log::info_status("POST /api/health", "start");
-    let llm = llm::check_llm_health(&body.llm_base_url, &body.llm_api_key).await;
-    let searxng = if body.searxng_url.trim().is_empty() {
+    let connection = active_connection(
+        &state.connection_file,
+        &body.llm_base_url,
+        &body.llm_api_key,
+        &body.searxng_url,
+    );
+    let llm = llm::check_llm_health(&connection.llm_base_url, &connection.llm_api_key).await;
+    let searxng = if connection.searxng_url.trim().is_empty() {
         None
     } else {
-        let (ok, error) = search::check_searxng(&body.searxng_url).await;
+        let (ok, error) = search::check_searxng(&connection.searxng_url).await;
         let mut payload = json!({ "ok": ok });
         if let Some(error) = error {
             payload["error"] = json!(error);
@@ -167,7 +222,13 @@ async fn forward_mtplx_stream(upstream: reqwest::Response) -> Response {
     }
 }
 
-async fn post_chat(Json(body): Json<ChatRequest>) -> Response {
+async fn post_chat(State(state): State<AppState>, Json(body): Json<ChatRequest>) -> Response {
+    let connection = active_connection(
+        &state.connection_file,
+        &body.llm_base_url,
+        &body.llm_api_key,
+        "",
+    );
     let model = if body.model.trim().is_empty() {
         DEFAULT_MODEL
     } else {
@@ -178,8 +239,8 @@ async fn post_chat(Json(body): Json<ChatRequest>) -> Response {
         .clone()
         .unwrap_or_else(|| "medium".into());
     let options = ChatOptions {
-        base_url: &body.llm_base_url,
-        api_key: &body.llm_api_key,
+        base_url: &connection.llm_base_url,
+        api_key: &connection.llm_api_key,
         model,
         messages: &body.messages,
         tools: &body.tools,
@@ -215,8 +276,9 @@ async fn post_chat(Json(body): Json<ChatRequest>) -> Response {
     }
 }
 
-async fn post_search(Json(body): Json<SearchRequest>) -> Response {
-    match search::search(&body.q, &body.searxng_url).await {
+async fn post_search(State(state): State<AppState>, Json(body): Json<SearchRequest>) -> Response {
+    let connection = active_connection(&state.connection_file, "", "", &body.searxng_url);
+    match search::search(&body.q, &connection.searxng_url).await {
         Ok(results) => Json(json!({
             "provider": "searxng",
             "results": results,
@@ -316,8 +378,8 @@ async fn put_argos_scope(Path(id): Path<String>, Json(body): Json<ArgosScopeBody
     }
 }
 
-/// One page image to read. The LLM settings ride along because they live in the
-/// task pane's storage; the sidecar holds none of them.
+/// One page image to read. The three connection fields on the body are the
+/// fallback when `connection.json` is missing or unreadable.
 #[derive(Debug, Default, Deserialize)]
 pub struct OcrRequest {
     #[serde(default, rename = "llmBaseUrl")]
@@ -333,7 +395,7 @@ pub struct OcrRequest {
     pub timeout_ms: Option<u64>,
 }
 
-async fn post_ocr(Json(body): Json<OcrRequest>) -> Response {
+async fn post_ocr(State(state): State<AppState>, Json(body): Json<OcrRequest>) -> Response {
     let image = body.image.trim();
     if !image.starts_with("data:image/") {
         return json_error(
@@ -355,11 +417,17 @@ async fn post_ocr(Json(body): Json<OcrRequest>) -> Response {
         ]
     })];
     log::info_status("POST /api/ocr", "start");
+    let connection = active_connection(
+        &state.connection_file,
+        &body.llm_base_url,
+        &body.llm_api_key,
+        "",
+    );
     // Thinking is off: transcription is not a reasoning task, and a long
     // deliberation per page makes a 20-page scan crawl.
     let options = ChatOptions {
-        base_url: &body.llm_base_url,
-        api_key: &body.llm_api_key,
+        base_url: &connection.llm_base_url,
+        api_key: &connection.llm_api_key,
         model,
         messages: &messages,
         tools: &[],
@@ -500,9 +568,31 @@ async fn delete_conversation(Path(id): Path<String>) -> Response {
     }
 }
 
+fn default_connection_file() -> PathBuf {
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join("guri-test-connection-absent")
+            .join("connection.json")
+    }
+    #[cfg(not(test))]
+    {
+        crate::connection::connection_path()
+    }
+}
+
 pub fn create_router(static_dir: Option<PathBuf>) -> Router {
+    create_router_at(static_dir, default_connection_file())
+}
+
+fn create_router_at(static_dir: Option<PathBuf>, connection_file: PathBuf) -> Router {
+    if let Some(dir) = connection_file.parent() {
+        crate::connection::sweep_connection_temps(dir, SystemTime::now());
+    }
+    let state = AppState { connection_file };
     let router = Router::new()
         .route("/api/health", get(get_health).post(post_health))
+        .route("/api/connection", get(get_connection).post(post_connection).put(put_connection))
         .route("/api/chat", post(post_chat))
         // A page image is base64, which grows it by 4/3, so this one route
         // takes more than the limit that guards every other body.
@@ -537,12 +627,14 @@ pub fn create_router(static_dir: Option<PathBuf>) -> Router {
     } else {
         router
     };
-    router.layer(SetResponseHeaderLayer::overriding(
-        CACHE_CONTROL,
-        // Office refuses to use ribbon images it may not store, so revalidate
-        // instead of sending no-store.
-        HeaderValue::from_static("no-cache, must-revalidate"),
-    ))
+    router
+        .layer(SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            // Office refuses to use ribbon images it may not store, so revalidate
+            // instead of sending no-store.
+            HeaderValue::from_static("no-cache, must-revalidate"),
+        ))
+        .with_state(state)
 }
 
 #[cfg(test)]
@@ -626,7 +718,84 @@ mod tests {
         };
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
-        assert_eq!(body["service"], "GURI");
+        assert_eq!(body["service"], "LexCrew Doc");
+    }
+
+    #[tokio::test]
+    async fn health_prefers_a_ready_connection_file() {
+        let mtplx = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(wiremock::matchers::header("authorization", "Bearer file-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "id": "qwen3.8-flash-next" }]
+            })))
+            .expect(1)
+            .mount(&mtplx)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(wiremock::matchers::header("authorization", "Bearer body-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "id": "qwen3.8-flash-next" }]
+            })))
+            .expect(1)
+            .mount(&mtplx)
+            .await;
+        let searx = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("format", "json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{ "title": "民法", "url": "https://example.jp/m", "content": "抜粋" }]
+            })))
+            .expect(2)
+            .mount(&searx)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("guri-api-conn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("connection.json");
+        std::fs::write(
+            &file,
+            format!(
+                "{{\n  \"llmBaseUrl\": \"{}/v1\",\n  \"llmApiKey\": \"file-key\",\n  \"searxngUrl\": \"{}\"\n}}\n",
+                mtplx.uri(),
+                searx.uri()
+            ),
+        )
+        .unwrap();
+
+        let (status, body) = json_request(
+            create_router_at(None, file.clone()),
+            "POST",
+            "/api/health",
+            json!({
+                "llmBaseUrl": "http://127.0.0.1:9/v1",
+                "llmApiKey": "body-key",
+                "searxngUrl": "http://127.0.0.1:9",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["llm"]["ok"], true);
+        assert_eq!(body["searxng"]["ok"], true);
+
+        std::fs::write(&file, "{").unwrap();
+        let (status, body) = json_request(
+            create_router_at(None, file),
+            "POST",
+            "/api/health",
+            json!({
+                "llmBaseUrl": format!("{}/v1", mtplx.uri()),
+                "llmApiKey": "body-key",
+                "searxngUrl": searx.uri(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["llm"]["ok"], true);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

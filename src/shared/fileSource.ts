@@ -30,6 +30,8 @@ export type FileText = {
   changes: MarkupList<ChangeNote>;
   /** Set when a cap cut the text short. */
   truncated: boolean;
+  /** Comments inlined in `body` as 〔注…〕. */
+  inlineCommentCount?: number;
 };
 
 /**

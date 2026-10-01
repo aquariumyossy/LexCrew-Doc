@@ -1,4 +1,5 @@
 import { BrandVariants, Theme, createLightTheme } from "@fluentui/react-components";
+import { scaleThemeLength } from "./uiFont";
 
 /** 参照イラストの服と同じアズール。薄い段も彩度を落とさない。 */
 const guriBrand: BrandVariants = {
@@ -22,8 +23,20 @@ const guriBrand: BrandVariants = {
 
 const theme = createLightTheme(guriBrand);
 
+function withUiFontScale(base: Theme): Theme {
+  const next = { ...base };
+  for (const key of Object.keys(next) as (keyof Theme)[]) {
+    const name = String(key);
+    if (!name.startsWith("fontSize") && !name.startsWith("lineHeight")) continue;
+    const value = next[key];
+    if (typeof value !== "string") continue;
+    (next as Record<string, string | number>)[name] = scaleThemeLength(value);
+  }
+  return next;
+}
+
 /** Word 作業ウィンドウ用。キャンバスは白、ブランド色はユーザー吹き出しなどに残す。 */
-export const guriLightTheme: Theme = {
+export const guriLightTheme: Theme = withUiFontScale({
   ...theme,
   colorBrandBackground2: "#bae4f4",
   colorBrandBackground2Hover: "#d2eff9",
@@ -63,4 +76,4 @@ export const guriLightTheme: Theme = {
   colorNeutralCardBackgroundHover: "#ffffff",
   colorNeutralCardBackgroundPressed: "#f5f5f5",
   colorNeutralCardBackgroundSelected: "#f0f0f0",
-};
+});

@@ -33,43 +33,22 @@ const COMMENTS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 describe("extractDocx", () => {
   const read = extractDocx({ document: DOCUMENT, comments: COMMENTS });
 
-  it("keeps insertions in the body and leaves deletions out", () => {
-    expect(read.body).toBe(
-      ["第1条（目的）", "本契約は、甲乙間の取引を定める。", "第2条\t報酬は別途定める。"].join("\n")
-    );
-    expect(read.body).not.toContain("丙野との");
+  it("inlines tracked edits in the body when markup is present", () => {
+    expect(read.body).toContain("※ 〔-〕削除");
+    expect(read.body).toContain("本契約は、");
+    expect(read.body).toContain("〔-乙川: 丙野との〕");
+    expect(read.body).toContain("〔+乙川: 甲乙間の〕");
+    expect(read.body).toContain("〔注 丙野 2026-03-02: 主体が甲乙だけで足りるか確認してください。〕");
     expect(read.origin).toBe("text");
   });
 
-  it("reports both edits as notes placed in their paragraph", () => {
+  it("leaves only format changes in the list when edits are inlined", () => {
     expect(read.changes.error).toBe("");
-    expect(read.changes.items).toEqual([
-      {
-        kind: "insert",
-        author: "乙川",
-        date: "2026-03-01",
-        text: "甲乙間の",
-        where: "本契約は、甲乙間の取引を定める。",
-      },
-      {
-        kind: "delete",
-        author: "乙川",
-        date: "2026-03-01",
-        text: "丙野との",
-        where: "本契約は、甲乙間の取引を定める。",
-      },
-    ]);
+    expect(read.changes.items).toEqual([]);
   });
 
-  it("anchors a comment to the text its range covers", () => {
-    expect(read.comments.items).toHaveLength(1);
-    const note = read.comments.items[0];
-    expect(note.author).toBe("丙野");
-    expect(note.date).toBe("2026-03-02");
-    expect(note.content).toBe("主体が甲乙だけで足りるか確認してください。");
-    expect(note.anchor).toBe("本契約は、甲乙間の取引を定める。");
-    // Threading lives in a part we do not read, so a note claims no replies.
-    expect(note.replies).toEqual([]);
+  it("keeps comments without replies out of the list once they are inlined", () => {
+    expect(read.comments.items).toEqual([]);
   });
 
   it("says a document without comments has none rather than failing", () => {
@@ -77,6 +56,44 @@ describe("extractDocx", () => {
     expect(plain.comments.items).toEqual([]);
     expect(plain.comments.error).toBe("");
     expect(plain.comments.truncated).toBe(false);
+  });
+});
+
+const NUMBERING = `<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+</w:numbering>`;
+
+function numberedParagraph(text: string, withInsert = false): string {
+  const insert = withInsert
+    ? `<w:ins w:id="1" w:author="乙川" w:date="2026-03-01T10:00:00Z"><w:r><w:t>追記</w:t></w:r></w:ins>`
+    : "";
+  return `<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>${text}</w:t></w:r>${insert}</w:p>`;
+}
+
+describe("extractDocx list marks", () => {
+  it("puts the list label outside the paragraph text", () => {
+    const document = `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+      ${numberedParagraph("甲")}
+      <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr></w:p>
+      ${numberedParagraph("乙")}
+    </w:body></w:document>`;
+    const read = extractDocx({ document, numbering: NUMBERING });
+    expect(read.body).toBe("〔1.〕甲\n〔2.〕\n〔3.〕乙");
+  });
+
+  it("keeps the label on a paragraph that also has tracked edits", () => {
+    const document = `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${numberedParagraph("甲", true)}</w:body></w:document>`;
+    const read = extractDocx({ document, numbering: NUMBERING });
+    expect(read.body).toContain("〔1.〕甲");
+    expect(read.body).toContain("〔+乙川: 追記〕");
+  });
+
+  it("leaves the body unchanged when the file has no numbering part", () => {
+    const document = `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${numberedParagraph("甲")}</w:body></w:document>`;
+    expect(extractDocx({ document }).body).toBe("甲");
   });
 });
 

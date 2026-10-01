@@ -1,9 +1,14 @@
+import fs from "fs";
 import http from "http";
 import { AddressInfo } from "net";
+import os from "os";
+import path from "path";
 import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "./app";
 import { pickDefaultModel } from "./llm";
+
+const absentConnection = path.join(os.tmpdir(), `guri-sidecar-absent-${process.pid}`, "connection.json");
 
 type MockServer = {
   url: string;
@@ -55,10 +60,10 @@ describe("pickDefaultModel", () => {
 
 describe("sidecar", () => {
   it("GET /api/health reports the local process", async () => {
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app).get("/api/health");
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ ok: true, service: "GURI" });
+    expect(res.body).toMatchObject({ ok: true, service: "LexCrew Doc" });
   });
 
   it("checks MTPLX via GET /v1/models then SearXNG JSON search", async () => {
@@ -91,7 +96,7 @@ describe("sidecar", () => {
     });
     servers.push(searx);
 
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app)
       .post("/api/health")
       .send({
@@ -117,7 +122,7 @@ describe("sidecar", () => {
     });
     servers.push(mtplx);
 
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app).post("/api/health").send({
       llmBaseUrl: mtplx.url,
       llmApiKey: "test-key",
@@ -165,7 +170,7 @@ describe("sidecar", () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app)
       .post("/api/chat")
       .send({
@@ -229,7 +234,7 @@ describe("sidecar", () => {
     });
     servers.push(mtplx);
 
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app)
       .post("/api/chat")
       .send({
@@ -266,7 +271,7 @@ describe("sidecar", () => {
     });
     servers.push(mtplx);
 
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app)
       .post("/api/chat")
       .send({
@@ -303,7 +308,7 @@ describe("sidecar", () => {
     });
     servers.push(mtplx);
 
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app)
       .post("/api/chat")
       .send({
@@ -336,7 +341,7 @@ describe("sidecar", () => {
     });
     servers.push(searx);
 
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app).post("/api/search").send({
       searxngUrl: searx.url,
       q: "民法",
@@ -353,7 +358,7 @@ describe("sidecar", () => {
     });
     servers.push(searx);
 
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app).post("/api/search").send({
       searxngUrl: searx.url,
       q: "テスト",
@@ -425,7 +430,7 @@ describe("sidecar", () => {
     });
     servers.push(argos);
 
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const health = await request(app)
       .post("/api/health")
       .send({
@@ -479,7 +484,7 @@ describe("POST /api/ocr", () => {
     });
     servers.push(mtplx);
 
-    const app = createApp();
+    const app = createApp({ connectionFile: absentConnection });
     const res = await request(app)
       .post("/api/ocr")
       .send({
@@ -508,12 +513,12 @@ describe("POST /api/ocr", () => {
 
     // Over the 2MB global limit, under the OCR route's own.
     const big = `data:image/jpeg;base64,${"A".repeat(4 * 1024 * 1024)}`;
-    const res = await request(createApp())
+    const res = await request(createApp({ connectionFile: absentConnection }))
       .post("/api/ocr")
       .send({ llmBaseUrl: `${mtplx.url}/v1`, llmApiKey: "k", image: big });
     expect(res.status).toBe(200);
 
-    const chat = await request(createApp())
+    const chat = await request(createApp({ connectionFile: absentConnection }))
       .post("/api/chat")
       .send({
         llmBaseUrl: `${mtplx.url}/v1`,
@@ -532,7 +537,7 @@ describe("POST /api/ocr", () => {
     });
     servers.push(mtplx);
 
-    const res = await request(createApp())
+    const res = await request(createApp({ connectionFile: absentConnection }))
       .post("/api/ocr")
       .send({ llmBaseUrl: `${mtplx.url}/v1`, llmApiKey: "k", image: PAGE_IMAGE });
     expect(res.status).toBe(502);
@@ -540,7 +545,7 @@ describe("POST /api/ocr", () => {
   });
 
   it("refuses a request with nothing to read", async () => {
-    const res = await request(createApp())
+    const res = await request(createApp({ connectionFile: absentConnection }))
       .post("/api/ocr")
       .send({ llmBaseUrl: "http://x/v1", llmApiKey: "k", image: "こんにちは" });
     expect(res.status).toBe(400);
@@ -556,12 +561,89 @@ describe("POST /api/ocr", () => {
     });
     servers.push(mtplx);
 
-    await request(createApp())
+    await request(createApp({ connectionFile: absentConnection }))
       .post("/api/ocr")
       .send({ llmBaseUrl: `${mtplx.url}/v1`, llmApiKey: "k", image: PAGE_IMAGE });
 
     const dumped = info.mock.calls.map((c) => JSON.stringify(c)).join("\n");
     expect(dumped).not.toContain("SECRET_SCAN");
     expect(dumped).not.toContain(PAGE_IMAGE);
+  });
+});
+
+describe("connection file on the routes", () => {
+  it("prefers a ready file over the request body", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guri-conn-http-"));
+    const file = path.join(dir, "connection.json");
+    const seen: string[] = [];
+    const upstream = await listen((req, res) => {
+      seen.push(`${req.url || ""} ${req.headers.authorization || ""}`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if ((req.url || "").includes("/search")) {
+        res.end(JSON.stringify({ results: [{ title: "判例", url: "http://example.test", content: "" }] }));
+        return;
+      }
+      if ((req.url || "").includes("/chat")) {
+        res.end(JSON.stringify({ choices: [{ message: { content: "ok" } }] }));
+        return;
+      }
+      res.end(JSON.stringify({ data: [{ id: "m" }] }));
+    });
+    servers.push(upstream);
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ llmBaseUrl: `${upstream.url}/v1`, llmApiKey: "file-key", searxngUrl: upstream.url })
+    );
+    const app = createApp({ connectionFile: file });
+    const body = {
+      llmBaseUrl: "http://127.0.0.1:9/v1",
+      llmApiKey: "body-key",
+      searxngUrl: "http://127.0.0.1:9",
+    };
+
+    const health = await request(app).post("/api/health").send(body);
+    expect(health.status).toBe(200);
+    expect(health.body.llm.ok).toBe(true);
+    expect(seen.join("\n")).toContain("file-key");
+    expect(seen.join("\n")).not.toContain("body-key");
+
+    seen.length = 0;
+    const chat = await request(app).post("/api/chat").send({ ...body, model: "m", messages: [{ role: "user", content: "hi" }] });
+    expect(chat.status).toBe(200);
+    expect(seen.join("\n")).toContain("file-key");
+
+    const search = await request(app).post("/api/search").send({ q: "判例", searxngUrl: "http://127.0.0.1:9" });
+    expect(search.status).toBe(200);
+    expect(search.body.results[0].title).toBe("判例");
+
+    const ocr = await request(app).post("/api/ocr").send({ ...body, model: "m", image: "data:image/png;base64,aa", timeoutMs: 5000 });
+    expect(ocr.status).toBe(200);
+
+    fs.writeFileSync(file, "{");
+    seen.length = 0;
+    const broken = await request(app).post("/api/health").send({
+      llmBaseUrl: `${upstream.url}/v1`,
+      llmApiKey: "body-key",
+      searxngUrl: "",
+    });
+    expect(broken.body.llm.ok).toBe(true);
+    expect(seen.join("\n")).toContain("body-key");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("does not create an empty file and does not log a key from a broken file", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guri-conn-empty-"));
+    const file = path.join(dir, "connection.json");
+    const app = createApp({ connectionFile: file });
+    const empty = await request(app).post("/api/connection").send({ llmBaseUrl: "", llmApiKey: "", searxngUrl: "" });
+    expect(empty.body.kind).toBe("absent");
+    expect(fs.existsSync(file)).toBe(false);
+
+    fs.writeFileSync(file, '{"llmApiKey":"super-secret-key"');
+    const broken = await request(app).get("/api/connection");
+    expect(broken.body.kind).toBe("broken");
+    expect(JSON.stringify(info.mock.calls)).not.toContain("super-secret-key");
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

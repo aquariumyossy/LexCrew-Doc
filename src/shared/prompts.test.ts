@@ -22,6 +22,7 @@ const base = {
   fontName: "游明朝",
   bodyPt: 12,
   titlePt: 16,
+  lineSpacingChars: 1,
 };
 
 describe("systemPrompt", () => {
@@ -48,6 +49,22 @@ describe("systemPrompt", () => {
     expect(text).toContain("SearXNG または Argos");
   });
 
+  it("keeps reply readability rules off the document body", () => {
+    const text = systemPrompt({ ...base, search: false, argos: false });
+    const reportAt = text.indexOf("1〜2 文で日本語で報告します");
+    const scopeAt = text.indexOf("insert_blocks や置換で文書に入れる文言には適用しません");
+    expect(reportAt).toBeGreaterThan(-1);
+    expect(scopeAt).toBeGreaterThan(reportAt);
+    expect(text).toContain("法律上の結論は断定しません");
+    expect(text).toContain("指摘が複数あるときだけ");
+    expect(text).toContain("ツール名は書きません");
+    expect(text).toContain("チャットと insert_comment の本文には書きません");
+    expect(text).toContain("書いていなければ言いません");
+    expect(text).toContain("行間は 1字");
+    expect(text).toContain("set_outline_level");
+    expect(text).toContain("段落スタイルは変えません");
+  });
+
   it("forbids simplified and traditional Chinese in replies and tool arguments", () => {
     const text = systemPrompt({ ...base, search: false, argos: false });
     expect(text).toContain("簡体字");
@@ -62,6 +79,32 @@ describe("systemPrompt", () => {
     expect(without).toContain("quote");
     const with_ = systemPrompt({ ...base, search: false, argos: false, selection: true });
     expect(with_).not.toContain("選択が無い");
+  });
+
+  it("explains the paragraph numbers only on a turn that carried them", () => {
+    const numbered = systemPrompt({ ...base, search: false, argos: false, numbered: true });
+    expect(numbered).toContain("行頭の [12] はその段落の番号です");
+    expect(numbered).toContain("paragraph に渡します");
+    // Gaps are normal, and guessing at the missing number lands elsewhere.
+    expect(numbered).toContain("空の段落を飛ばすので連続しません");
+    expect(numbered).toContain("insert_blank_before");
+    const plain = systemPrompt({ ...base, search: false, argos: false, numbered: false });
+    expect(plain).not.toContain("paragraph に渡します");
+    expect(plain).not.toContain("insert_blank_before");
+  });
+
+  it("says a quote must be copied as it stands, not paraphrased", () => {
+    const text = systemPrompt({ ...base, search: false, argos: false, numbered: true });
+    expect(text).toContain("字句どおりに写します");
+    expect(text).toContain("要約・言い換え");
+    expect(text).toContain("候補の番号で指し直します");
+  });
+
+  it("forbids writing about clauses that are not in the body", () => {
+    const text = systemPrompt({ ...base, search: false, argos: false });
+    expect(text).toContain("見当たらない条項や文言について、あるものとして書きません");
+    expect(text).toContain("見当たらないことを利用者に伝えます");
+    expect(text).toContain("件数や有無も推測で書きません");
   });
 
   it("explains that the attachment is rebuilt every turn", () => {
@@ -81,7 +124,30 @@ describe("systemPrompt", () => {
   it("explains that a deletion is a proposal and where to place it", () => {
     const text = systemPrompt({ ...base, search: false, argos: false, markup: true });
     expect(text).toContain("「削除」");
-    expect(text).toContain("場所");
+    expect(text).toContain("[段落 N]");
+  });
+
+  it("says the body is the current reviewed text when reviewedBody is on", () => {
+    const text = systemPrompt({
+      ...base,
+      search: false,
+      argos: false,
+      reviewedBody: true,
+    });
+    expect(text).toContain("承認したあとの文面");
+    expect(text).not.toContain("消えて見えることも残って見えることもある");
+  });
+
+  it("explains inline markup when it is on", () => {
+    const text = systemPrompt({
+      ...base,
+      search: false,
+      argos: false,
+      markup: true,
+      inlineMarkup: true,
+    });
+    expect(text).toContain("〔+〕");
+    expect(text).toContain("引用・置換の対象に含めません");
   });
 
   it("says replying and accepting are not possible, so it does not promise them", () => {
@@ -102,12 +168,31 @@ describe("systemPrompt", () => {
     expect(text).toContain("いま開いている Word の文書ではありません");
     // Quoting a file into a Word edit would silently rewrite the wrong clause.
     expect(text).toContain("資料の文言を開いている文書の検索に使いません");
+    expect(text).toContain("資料の行頭の〔第１条〕〔（１）〕〔ア〕〔1.〕は Word の自動番号");
+    expect(text).toContain("開いている文書の [12] でもありません");
     expect(text).toContain("OCR 読み取り");
+    expect(text).toContain("〔図〕");
+    expect(text).toContain("続柄は補っていません");
   });
 
   it("says nothing about files on a turn that carries none", () => {
     const text = systemPrompt({ ...base, search: false, argos: false });
     expect(text).not.toContain("--- 添付ファイル ---");
+  });
+
+  it("explains Word list marks only on a turn that carried them", () => {
+    const withMarks = systemPrompt({ ...base, search: false, argos: false, listMarks: true });
+    expect(withMarks).toContain("〔1.〕");
+    expect(withMarks).toContain("〔第１〕");
+    expect(withMarks).toContain("〔第１条〕");
+    expect(withMarks).toContain("〔•〕");
+    expect(withMarks).toContain("箇条書き");
+    expect(withMarks).toContain("行頭の [12] は場所");
+    expect(withMarks).toContain("本文には書きません");
+    expect(withMarks).toContain("insert_blocks の clause");
+    expect(withMarks).toContain("format_list の daiJo");
+    const without = systemPrompt({ ...base, search: false, argos: false, numbered: true });
+    expect(without).not.toContain("Word の自動番号");
   });
 });
 
@@ -291,7 +376,7 @@ function comment(partial: Partial<CommentNote> = {}): CommentNote {
     author: "田中太郎",
     date: "2026-09-10",
     resolved: false,
-    anchor: "代金は、金100万円とする",
+    anchor: "[段落 2]",
     content: "分割払いにしたい。",
     replies: [],
     ...partial,
@@ -304,7 +389,7 @@ function change(partial: Partial<ChangeNote> = {}): ChangeNote {
     author: "田中太郎",
     date: "2026-09-10",
     text: "無催告で",
-    where: "第12条（解除）売主は、無催告で本契約を解除できる。",
+    where: "[段落 12]",
     ...partial,
   };
 }
@@ -330,7 +415,7 @@ describe("markup sections", () => {
       ]),
     });
     expect(text).toContain("--- コメント ---");
-    expect(text).toContain("[1] 田中太郎 2026-09-10 対象「代金は、金100万円とする」");
+    expect(text).toContain("[1] 田中太郎 2026-09-10 [段落 2]");
     expect(text).toContain("分割払いにしたい。");
     expect(text).toContain("↳ 佐藤花子 2026-09-11 検討します。");
   });
@@ -342,7 +427,7 @@ describe("markup sections", () => {
   it("says what kind of change it is and where it sits", () => {
     const text = render({ changes: changes([change()]) });
     expect(text).toContain("--- 変更履歴 ---");
-    expect(text).toContain("[1] 削除 田中太郎 2026-09-10「無催告で」 場所「第12条（解除）");
+    expect(text).toContain("[1] 削除 田中太郎 2026-09-10「無催告で」 [段落 12]");
   });
 
   it("labels every kind in Japanese", () => {
@@ -357,6 +442,17 @@ describe("markup sections", () => {
     const text = render({ comments: comments([]), changes: changes([]) });
     expect(text).toContain("コメントはありません。");
     expect(text).toContain("変更履歴はありません。");
+  });
+
+  it("points to inline comments when the appendix list is empty", () => {
+    const text = render({
+      inlineMarkup: true,
+      inlineCommentCount: 4,
+      comments: comments([]),
+    });
+    expect(text).toContain("--- コメント ---");
+    expect(text).toContain("本文中に 4 件インライン（〔注…〕）");
+    expect(text).not.toContain("コメントはありません");
   });
 
   it("says a failed read is not proof that there are none", () => {

@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { CHARS_PER_TOKEN, MAX_FILE_CHARS, TOOL_RESULT_BUDGET_RATIO } from "../../shared/constants";
 import { StoredMessage } from "../../shared/history";
+import { STALE_DOCUMENT_READ } from "../../shared/tools";
 import { ChatMessage } from "../../sidecar/types";
 import {
   capToolResults,
   dropOldest,
   estimateTokens,
+  indexedReadCharLimit,
   messagesTokens,
   toChatMessages,
 } from "./context";
@@ -67,11 +70,66 @@ describe("toChatMessages", () => {
     expect(chat[0].content).toBe("整えて");
   });
 
+  it("drops a document read on the next turn and keeps a delete report", () => {
+    const chat = toChatMessages([
+      stored({
+        role: "assistant",
+        toolCalls: [
+          {
+            id: "c1",
+            type: "function",
+            function: { name: "read_paragraphs", arguments: '{"from":1,"view":"full"}' },
+          },
+          {
+            id: "c2",
+            type: "function",
+            function: { name: "find_in_document", arguments: '{"q":"第6条"}' },
+          },
+          {
+            id: "c3",
+            type: "function",
+            function: { name: "delete_paragraphs", arguments: '{"paragraphs":[4]}' },
+          },
+          {
+            id: "c4",
+            type: "function",
+            function: { name: "read_indexed_file", arguments: '{"path":"C:\\\\契約.docx"}' },
+          },
+        ],
+      }),
+      stored({ role: "tool", content: "[1] 第1条 甲は乙に委託する。", toolCallId: "c1" }),
+      stored({ role: "tool", content: "[8] 第6条を準用する", toolCallId: "c2" }),
+      stored({ role: "tool", content: "段落 4 を削除しました。", toolCallId: "c3" }),
+      stored({ role: "tool", content: "みなし合格とする。", toolCallId: "c4" }),
+    ]);
+    expect(chat[1].content).toBe(STALE_DOCUMENT_READ);
+    expect(chat[2].content).toBe(STALE_DOCUMENT_READ);
+    expect(chat[1].content).not.toContain("第1条");
+    expect(chat[3].content).toBe("段落 4 を削除しました。");
+    expect(chat[4].content).toBe("みなし合格とする。");
+  });
+
   it("leaves assistant and tool messages as they are", () => {
     const chat = toChatMessages([
       stored({ role: "tool", content: "第1条の後ろに入れました\n\n--- 文書全体 ---\n表示用" }),
     ]);
     expect(chat[0].content).toContain("--- 文書全体 ---");
+  });
+});
+
+describe("indexedReadCharLimit", () => {
+  it("stays inside the tool-result share, and never past the file cap", () => {
+    const limit = 131_072;
+    const chars = indexedReadCharLimit(limit, []);
+    expect(chars).toBeLessThanOrEqual(MAX_FILE_CHARS);
+    const tokens = Math.ceil(chars / CHARS_PER_TOKEN) + 4;
+    expect(tokens).toBeLessThanOrEqual(Math.floor(limit * TOOL_RESULT_BUDGET_RATIO));
+  });
+
+  it("shrinks by what earlier tool results already use", () => {
+    const open = indexedReadCharLimit(131_072, []);
+    const used = indexedReadCharLimit(131_072, ["あ".repeat(8000)]);
+    expect(used).toBeLessThan(open);
   });
 });
 

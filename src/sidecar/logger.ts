@@ -1,6 +1,3 @@
-import fs from "fs";
-import path from "path";
-
 const FORBIDDEN = new Set([
   "body",
   "prompt",
@@ -43,23 +40,6 @@ function scrub(extra?: Record<string, unknown>): Record<string, unknown> | undef
   return out;
 }
 
-let logFilePath: string | undefined;
-
-export function setLogFile(filePath: string): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  logFilePath = filePath;
-}
-
-function writeFile(level: string, message: string, extra?: Record<string, unknown>): void {
-  if (!logFilePath) {
-    return;
-  }
-  const line = extra
-    ? `${new Date().toISOString()} [GURI] ${level} ${message} ${JSON.stringify(extra)}\n`
-    : `${new Date().toISOString()} [GURI] ${level} ${message}\n`;
-  fs.appendFile(logFilePath, line, () => undefined);
-}
-
 /** Status-only logging. Never pass document body or prompts. */
 export function logInfo(message: string, extra?: Record<string, unknown>): void {
   const safe = scrub(extra);
@@ -68,7 +48,6 @@ export function logInfo(message: string, extra?: Record<string, unknown>): void 
   } else {
     console.info("[GURI]", message);
   }
-  writeFile("info", message, safe);
 }
 
 export function logError(message: string, extra?: Record<string, unknown>): void {
@@ -78,5 +57,4 @@ export function logError(message: string, extra?: Record<string, unknown>): void
   } else {
     console.error("[GURI]", message);
   }
-  writeFile("error", message, safe);
 }

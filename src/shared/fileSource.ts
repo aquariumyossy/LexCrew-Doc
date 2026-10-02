@@ -4,7 +4,6 @@ import {
   MarkupList,
   changeChars,
   commentChars,
-  emptyMarkup,
   markupCharBudget,
 } from "./attachment";
 import {
@@ -71,16 +70,6 @@ export function isReady(source: FileSource): source is ReadyFileSource {
 /** True while a file is still being read, which is when sending must wait. */
 export function isPendingRead(source: FileSource): boolean {
   return source.status === "extracting" || source.status === "ocr";
-}
-
-export function emptyFileText(origin: FileOrigin): FileText {
-  return {
-    origin,
-    body: "",
-    comments: emptyMarkup<CommentNote>(),
-    changes: emptyMarkup<ChangeNote>(),
-    truncated: false,
-  };
 }
 
 export function commit(source: ReadyFileSource): CommittedFile {

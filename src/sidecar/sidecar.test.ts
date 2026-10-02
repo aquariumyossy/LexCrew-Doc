@@ -470,6 +470,55 @@ describe("sidecar", () => {
   });
 });
 
+describe("POST /api/argos/file", () => {
+  it("returns the bytes of a path the search returned, and refuses any other path", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guri-indexed-"));
+    const filePath = path.join(dir, "委託.txt");
+    fs.writeFileSync(filePath, "みなし合格とする。", "utf8");
+    const { clearIndexedPaths } = await import("./indexedPaths");
+    clearIndexedPaths();
+    const argos = await listen((req, res) => {
+      if (req.method === "POST" && req.url === "/search") {
+        readJsonBody(req, () => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              hits: [{ title: "委託.txt", path: filePath, snippet: "みなし" }],
+            })
+          );
+        });
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    try {
+      const app = createApp({ connectionFile: absentConnection });
+      const before = await request(app).post("/api/argos/file").send({ path: filePath });
+      expect(before.status).toBe(403);
+
+      const search = await request(app)
+        .post("/api/argos/search")
+        .send({ argosBaseUrl: argos.url, q: "みなし合格" });
+      expect(search.status).toBe(200);
+      expect(search.body.results[0].url).toBe(filePath);
+
+      const read = await request(app).post("/api/argos/file").send({ path: filePath });
+      expect(read.status).toBe(200);
+      expect(Buffer.from(read.body.data, "base64").toString("utf8")).toBe("みなし合格とする。");
+
+      const other = await request(app)
+        .post("/api/argos/file")
+        .send({ path: path.join(dir, "..", "秘密.txt") });
+      expect(other.status).toBe(403);
+    } finally {
+      await argos.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      clearIndexedPaths();
+    }
+  });
+});
+
 const PAGE_IMAGE = "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
 
 describe("POST /api/ocr", () => {

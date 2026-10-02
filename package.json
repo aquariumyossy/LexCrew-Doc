@@ -1,6 +1,6 @@
 {
   "name": "guri",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "LexCrew Doc。Word デスクトップ作業ウィンドウから MTPLX と SearXNG を使う法律文書アドイン",
   "license": "Elastic-2.0",

@@ -17,7 +17,7 @@ import {
 import { ChatMessage } from "../../sidecar/types";
 import { chatStream } from "../api";
 import { Settings } from "../settings";
-import { fitContext, messagesTokens, toChatMessages } from "./context";
+import { fitContext, indexedReadCharLimit, messagesTokens, toChatMessages } from "./context";
 import { beginToolTurn, executeToolCall } from "./execute";
 
 /* global AbortSignal */
@@ -177,8 +177,12 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
 
     for (const call of completion.toolCalls) {
       signal.throwIfAborted();
+      const toolContents = messages
+        .filter((message) => message.role === "tool")
+        .map((message) => message.content || "");
       const outcome = await executeToolCall(call, settings, signal, {
         argosPathPrefixes: options.argosPathPrefixes,
+        indexedReadChars: indexedReadCharLimit(limit, toolContents),
       });
       await options.onMessage({ role: "tool", content: outcome.content, toolCallId: call.id });
       messages.push({ role: "tool", content: outcome.content, tool_call_id: call.id });

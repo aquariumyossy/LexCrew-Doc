@@ -143,13 +143,6 @@ export function listLevelNumberFormat(builtin: BuiltinListStyleSpec, level: numb
   return builtin.numberFormat.replace("%N", `%${level + 1}`);
 }
 
-/** Comma-separated style names for tool errors and descriptions. */
-export function listStyleNamesForPrompt(): string {
-  return LIST_STYLE_SPECS.filter((spec) => spec.id !== "continue")
-    .map((spec) => spec.id)
-    .join(" / ");
-}
-
 /** Styles that can turn a bullet into a numbered list. */
 export function listStyleNamesForApply(): string {
   return LIST_STYLE_SPECS.filter((spec) => spec.kind !== "continue")

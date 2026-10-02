@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -146,9 +146,4 @@ pub fn capture_stop() -> Vec<String> {
         .lock()
         .map(|mut logs| logs.drain(..).collect())
         .unwrap_or_default()
-}
-
-#[allow(dead_code)]
-pub fn log_path() -> Option<&'static Path> {
-    LOG_FILE.get().map(|p| p.as_path())
 }

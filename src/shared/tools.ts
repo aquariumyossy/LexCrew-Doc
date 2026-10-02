@@ -16,6 +16,26 @@ export const TOOL_FORMAT_TEXT = "format_text";
 export const TOOL_FORMAT_PARAGRAPH = "format_paragraph";
 export const TOOL_FORMAT_LIST = "format_list";
 export const TOOL_SET_OUTLINE = "set_outline_level";
+export const TOOL_READ_PARAGRAPHS = "read_paragraphs";
+export const TOOL_FIND_IN_DOCUMENT = "find_in_document";
+export const TOOL_DELETE_PARAGRAPHS = "delete_paragraphs";
+export const TOOL_READ_INDEXED_FILE = "read_indexed_file";
+
+/** Word's search string cannot exceed this, and cannot span paragraphs. */
+export const MAX_FIND_CHARS = 255;
+/** One delete call. A longer list is a runaway, not a review. */
+export const MAX_DELETE_PARAGRAPHS = 8;
+
+/**
+ * Shown on the next turn instead of a document read. The body is stale by then.
+ * The chat pane still shows what was read.
+ */
+export const STALE_DOCUMENT_READ =
+  "読み取った本文は次のターンには渡していません。いまの文書は添付を見てください。";
+
+export function isDocumentSnapshotTool(name: string): boolean {
+  return name === TOOL_READ_PARAGRAPHS || name === TOOL_FIND_IN_DOCUMENT;
+}
 
 /** Default rounds of tool calls before the task pane stops and tells the user. */
 export const MAX_TOOL_ROUNDS = 8;
@@ -145,6 +165,31 @@ export type SetOutlineArgs = {
   level?: number;
 };
 
+export type ParagraphReadView = "full" | "marks";
+
+export type ReadParagraphsArgs = {
+  from?: number;
+  through?: number;
+  view?: ParagraphReadView;
+};
+
+export type FindInDocumentArgs = {
+  q: string;
+  /** Only hits whose paragraph number is greater than this. */
+  after?: number;
+};
+
+export type DeleteParagraphsArgs = {
+  paragraphs: number[];
+  /** Paragraph number immediately before the copy to delete, when the text is not unique. */
+  follows?: number;
+};
+
+export type ReadIndexedFileArgs = {
+  path: string;
+  offset?: number;
+};
+
 export type ToolInvocation =
   | { name: typeof TOOL_SEARCH; args: SearchArgs }
   | { name: typeof TOOL_SEARCH_INDEX; args: SearchIndexArgs }
@@ -158,7 +203,11 @@ export type ToolInvocation =
   | { name: typeof TOOL_FORMAT_TEXT; args: FormatTextArgs }
   | { name: typeof TOOL_FORMAT_PARAGRAPH; args: FormatParagraphArgs }
   | { name: typeof TOOL_FORMAT_LIST; args: FormatListArgs }
-  | { name: typeof TOOL_SET_OUTLINE; args: SetOutlineArgs };
+  | { name: typeof TOOL_SET_OUTLINE; args: SetOutlineArgs }
+  | { name: typeof TOOL_READ_PARAGRAPHS; args: ReadParagraphsArgs }
+  | { name: typeof TOOL_FIND_IN_DOCUMENT; args: FindInDocumentArgs }
+  | { name: typeof TOOL_DELETE_PARAGRAPHS; args: DeleteParagraphsArgs }
+  | { name: typeof TOOL_READ_INDEXED_FILE; args: ReadIndexedFileArgs };
 
 export type ParsedTool = { ok: true; call: ToolInvocation } | { ok: false; error: string };
 
@@ -596,6 +645,118 @@ export type ToolSetOptions = {
  * fail, and a place to work is asked for in the terms this turn can supply —
  * a paragraph number when the body was numbered, a quote when it was not.
  */
+function readIndexedFileTool(): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_READ_INDEXED_FILE,
+      description:
+        "search_index が返したファイルの全文を読む。url を path にそのまま渡す。検索の抜粋では足りないとき、たとえば契約書の条を確かめるときに使う。" +
+        "検索結果に無いパスは読めない。長いファイルは offset で続きを読む。" +
+        "文字層の無い PDF は読めないので、チャットに添付してもらう。",
+      parameters: {
+        type: "object",
+        properties: {
+          path: stringParam("search_index の結果の url。ファイルパス。"),
+          offset: {
+            type: "number",
+            description: "続きを読むときの文字位置。最初は省く。",
+          },
+        },
+        required: ["path"],
+      },
+    },
+  };
+}
+
+function readParagraphsTool(): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_READ_PARAGRAPHS,
+      description:
+        "開いている文書のいまの段落を読む。添付はツールを動かす前の状態なので、書き込んだあと、項番号、見出し、重複を確かめるときに使う。" +
+        "view が full のときは本文・項番号・スタイル・その段落のコメントを返す。from が必要で、through を省くと from の 1 段落だけ。" +
+        "view が marks のときは項番号の一覧だけを、文書の先頭から返す。from を省ける。番号なしの段落から番号を外す必要はない。" +
+        "〔（１）〕は Word の項番号、[12] は場所である。返った [12] を、このあとの paragraph に使う。" +
+        "続きがあるときは、結果に書いた from からもう一度読む。",
+      parameters: {
+        type: "object",
+        properties: {
+          from: {
+            type: "number",
+            description: "読み始める段落番号。添付または直前の読み取り結果の [12]。marks で省くと先頭から。",
+          },
+          through: {
+            type: "number",
+            description: "ここまでの段落番号（この番号を含む）。full で省くと from だけ。marks で省くと末尾まで。",
+          },
+          view: {
+            type: "string",
+            enum: ["full", "marks"],
+            description: "full は本文つき。marks は項番号の一覧。省くと full。",
+          },
+        },
+        required: [],
+      },
+    },
+  };
+}
+
+function findInDocumentTool(): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_FIND_IN_DOCUMENT,
+      description:
+        "開いている文書から、ある語を位置付きで全部出す。書き込みはしない。" +
+        "「第6条を準用する」のような相互参照と、その条が本文にあるかの確認に使う。" +
+        "自動番号（〔第１条〕）も対象にする。本文に書いていない番号は search では見つからない。" +
+        "結果の [12] を、このあとの paragraph に使う。" +
+        "件数が多いときは残りと最後の段落番号を返す。続きは after にその番号を渡す。",
+      parameters: {
+        type: "object",
+        properties: {
+          q: stringParam("文書から探す語。1 段落に収まる長さ。"),
+          after: {
+            type: "number",
+            description: "この段落番号より後ろだけを見る。続きを取るときに、前回の最後の番号を渡す。",
+          },
+        },
+        required: ["q"],
+      },
+    },
+  };
+}
+
+function deleteParagraphsTool(): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_DELETE_PARAGRAPHS,
+      description:
+        "段落そのものを削除する。修正履歴に残る。空の text での置換では消えないので、段落を消すときはこれを使う。" +
+        "同じ文言が 2 箇所以上あるときは消さず、それぞれの直前の段落を返す。消したい方の直前の番号を follows に渡してやり直す。" +
+        `一度に消せるのは ${MAX_DELETE_PARAGRAPHS} 段落まで。消した番号はもう使えない。`,
+      parameters: {
+        type: "object",
+        required: ["paragraphs"],
+        properties: {
+          paragraphs: {
+            type: "array",
+            items: { type: "number" },
+            description: "消す段落の番号。添付または read_paragraphs の [12]。",
+          },
+          follows: {
+            type: "number",
+            description: "同じ文言が複数あるときだけ。消したい方の直前の段落番号。",
+          },
+        },
+      },
+    },
+  };
+}
+
 export function buildTools(options: ToolSetOptions = {}): ToolDefinition[] {
   const selection = Boolean(options.selection);
   const numbered = Boolean(options.numbered);
@@ -607,10 +768,13 @@ export function buildTools(options: ToolSetOptions = {}): ToolDefinition[] {
   }
   if (options.argos) {
     tools.push(searchIndexTool());
+    tools.push(readIndexedFileTool());
   }
   if (options.search || options.argos) {
     tools.push(insertCitationTool());
   }
+  tools.push(readParagraphsTool());
+  tools.push(findInDocumentTool());
   if (selection) {
     tools.push(getSelectionTool());
     tools.push(replaceSelectionTool());
@@ -619,6 +783,7 @@ export function buildTools(options: ToolSetOptions = {}): ToolDefinition[] {
   tools.push(insertBlocksTool(numbered || inserted));
   if (numbered || inserted) {
     tools.push(insertBlankBeforeTool());
+    tools.push(deleteParagraphsTool());
   }
   tools.push(insertCommentTool(target));
   tools.push(formatTextTool(target));
@@ -738,15 +903,18 @@ function paragraphListOf(row: Record<string, unknown>): number[] | { error: stri
   return numbers;
 }
 
-function paragraphOf(row: Record<string, unknown>): number | undefined | { error: string } {
-  const raw = row.paragraph;
+function paragraphOf(
+  row: Record<string, unknown>,
+  key = "paragraph"
+): number | undefined | { error: string } {
+  const raw = row[key];
   if (raw === undefined || raw === null || raw === "") {
     return undefined;
   }
-  const value = num(row, "paragraph");
+  const value = num(row, key);
   if (value === undefined || !Number.isInteger(value) || value < 1) {
     return {
-      error: "paragraph は添付された本文の行頭にある [番号] の数字（1 以上の整数）にしてください。",
+      error: `${key} は添付または読み取り結果の [番号] の数字（1 以上の整数）にしてください。`,
     };
   }
   return value;
@@ -824,6 +992,123 @@ function insertAtOf(row: Record<string, unknown>): InsertAtArg | { error: string
     return row.at;
   }
   return { error: 'at は "cursor"、"continue"、"end" のどれかにしてください。' };
+}
+
+function parseReadParagraphs(row: Record<string, unknown>): ParsedTool {
+  const from = paragraphOf(row, "from");
+  if (isArgError(from)) {
+    return { ok: false, error: from.error };
+  }
+  const through = paragraphOf(row, "through");
+  if (isArgError(through)) {
+    return { ok: false, error: through.error };
+  }
+  const rawView = row.view;
+  let view: ParagraphReadView | undefined;
+  if (rawView !== undefined && rawView !== null && rawView !== "") {
+    if (rawView !== "full" && rawView !== "marks") {
+      return { ok: false, error: 'view は "full" か "marks" にしてください。' };
+    }
+    view = rawView;
+  }
+  if (through !== undefined && from !== undefined && through < from) {
+    return { ok: false, error: "through は from と同じか、それより後ろの番号にしてください。" };
+  }
+  if ((view === undefined || view === "full") && from === undefined) {
+    return {
+      ok: false,
+      error: "full で読むときは from に段落番号を渡してください。番号の一覧は view を marks にしてください。",
+    };
+  }
+  return {
+    ok: true,
+    call: {
+      name: TOOL_READ_PARAGRAPHS,
+      args: {
+        ...(from === undefined ? {} : { from }),
+        ...(through === undefined ? {} : { through }),
+        ...(view === undefined ? {} : { view }),
+      },
+    },
+  };
+}
+
+function parseFindInDocument(row: Record<string, unknown>): ParsedTool {
+  const q = text(row, "q").trim();
+  if (!q) {
+    return { ok: false, error: "q が空です。探す語を入れてください。" };
+  }
+  if (q.length > MAX_FIND_CHARS) {
+    return {
+      ok: false,
+      error: `q が ${MAX_FIND_CHARS} 字を超えています。Word の検索の上限です。短くしてください。`,
+    };
+  }
+  if (/[\r\n]/.test(q)) {
+    return { ok: false, error: "q に改行は入れられません。1 行の語にしてください。" };
+  }
+  const after = paragraphOf(row, "after");
+  if (isArgError(after)) {
+    return { ok: false, error: after.error };
+  }
+  return {
+    ok: true,
+    call: {
+      name: TOOL_FIND_IN_DOCUMENT,
+      args: { q, ...(after === undefined ? {} : { after }) },
+    },
+  };
+}
+
+function parseReadIndexedFile(row: Record<string, unknown>): ParsedTool {
+  const path = text(row, "path").trim();
+  if (!path) {
+    return { ok: false, error: "path が空です。search_index の url をそのまま渡してください。" };
+  }
+  const raw = row.offset;
+  if (raw === undefined || raw === null || raw === "") {
+    return { ok: true, call: { name: TOOL_READ_INDEXED_FILE, args: { path } } };
+  }
+  const offset = num(row, "offset");
+  if (offset === undefined || !Number.isInteger(offset) || offset < 0) {
+    return { ok: false, error: "offset は 0 以上の整数にしてください。" };
+  }
+  return { ok: true, call: { name: TOOL_READ_INDEXED_FILE, args: { path, offset } } };
+}
+
+function parseDeleteParagraphs(row: Record<string, unknown>): ParsedTool {
+  const raw = row.paragraphs;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { ok: false, error: "paragraphs に、消す段落の番号を 1 つ以上入れてください。" };
+  }
+  if (raw.length > MAX_DELETE_PARAGRAPHS) {
+    return {
+      ok: false,
+      error: `一度に消せるのは ${MAX_DELETE_PARAGRAPHS} 段落までです。`,
+    };
+  }
+  const numbers: number[] = [];
+  for (const item of raw) {
+    const number = paragraphNumber(item);
+    if (number === undefined) {
+      return {
+        ok: false,
+        error: "paragraphs は [番号] の数字（1 以上の整数）の配列にしてください。",
+      };
+    }
+    numbers.push(number);
+  }
+  const follows = paragraphOf(row, "follows");
+  if (isArgError(follows)) {
+    return { ok: false, error: follows.error };
+  }
+  return {
+    ok: true,
+    call: {
+      name: TOOL_DELETE_PARAGRAPHS,
+      args: { paragraphs: numbers, ...(follows === undefined ? {} : { follows }) },
+    },
+  };
 }
 
 export function parseToolArguments(name: string, rawArguments: string): ParsedTool {
@@ -1161,6 +1446,14 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
       };
       return { ok: true, call: { name: TOOL_SET_OUTLINE, args } };
     }
+    case TOOL_READ_PARAGRAPHS:
+      return parseReadParagraphs(row);
+    case TOOL_FIND_IN_DOCUMENT:
+      return parseFindInDocument(row);
+    case TOOL_DELETE_PARAGRAPHS:
+      return parseDeleteParagraphs(row);
+    case TOOL_READ_INDEXED_FILE:
+      return parseReadIndexedFile(row);
     default:
       return { ok: false, error: `${name} というツールはありません。` };
   }
@@ -1332,6 +1625,32 @@ export function describeToolCall(name: string, rawArguments: string): string {
         return `${action}（段落 ${call.args.paragraph}〜${call.args.through}）`;
       }
       return where ? `${where}${action}` : action;
+    }
+    case TOOL_READ_PARAGRAPHS: {
+      const view = call.args.view === "marks" ? "番号一覧" : "本文";
+      if (call.args.from !== undefined && call.args.through !== undefined) {
+        return `段落 ${call.args.from}〜${call.args.through} を読む（${view}）`;
+      }
+      if (call.args.from !== undefined) {
+        return `段落 ${call.args.from} を読む（${view}）`;
+      }
+      return `文書を読む（${view}）`;
+    }
+    case TOOL_FIND_IN_DOCUMENT:
+      return call.args.after !== undefined
+        ? `文書内「${shorten(call.args.q, 16)}」（段落 ${call.args.after} の後ろ）`
+        : `文書内「${shorten(call.args.q, 16)}」`;
+    case TOOL_READ_INDEXED_FILE:
+      return call.args.offset
+        ? `資料を読む（${call.args.offset} 字目から）`
+        : `資料を読む「${shorten(call.args.path, 24)}」`;
+    case TOOL_DELETE_PARAGRAPHS: {
+      const numbers = call.args.paragraphs;
+      const follows = call.args.follows !== undefined ? `（段落 ${call.args.follows} の次）` : "";
+      if (numbers.length === 1) {
+        return `段落 ${numbers[0]} を削除${follows}`;
+      }
+      return `${numbers.length} 段落を削除${follows}`;
     }
     default:
       return name;

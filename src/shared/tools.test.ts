@@ -4,9 +4,13 @@ import {
   TOOL_FORMAT_TEXT,
   TOOL_FORMAT_LIST,
   TOOL_SET_OUTLINE,
+  TOOL_DELETE_PARAGRAPHS,
+  TOOL_FIND_IN_DOCUMENT,
   TOOL_INSERT_BLANK_BEFORE,
   TOOL_INSERT_BLOCKS,
   TOOL_INSERT_COMMENT,
+  TOOL_READ_INDEXED_FILE,
+  TOOL_READ_PARAGRAPHS,
   TOOL_REPLACE_QUOTE,
   TOOL_SEARCH,
   TOOL_SEARCH_INDEX,
@@ -117,7 +121,11 @@ describe("buildTools", () => {
     const names = (options: { numbered?: boolean; insertedNumbers?: boolean }) =>
       buildTools({ selection: false, ...options }).map((tool) => tool.function.name);
     expect(names({})).not.toContain(TOOL_INSERT_BLANK_BEFORE);
+    expect(names({})).not.toContain(TOOL_DELETE_PARAGRAPHS);
+    expect(names({})).toContain(TOOL_READ_PARAGRAPHS);
+    expect(names({})).toContain(TOOL_FIND_IN_DOCUMENT);
     expect(names({ numbered: true })).toContain(TOOL_INSERT_BLANK_BEFORE);
+    expect(names({ numbered: true })).toContain(TOOL_DELETE_PARAGRAPHS);
     expect(names({ insertedNumbers: true })).toContain(TOOL_INSERT_BLANK_BEFORE);
     const description = buildTools({ numbered: true }).find(
       (tool) => tool.function.name === TOOL_INSERT_BLANK_BEFORE
@@ -142,11 +150,13 @@ describe("buildTools", () => {
     expect(names).toContain("search");
     expect(names).toContain("insert_citation");
     expect(names).not.toContain("search_index");
+    expect(names).not.toContain("read_indexed_file");
   });
 
   it("includes search_index and citation when Argos is configured", () => {
     const names = buildTools({ argos: true }).map((tool) => tool.function.name);
     expect(names).toContain("search_index");
+    expect(names).toContain("read_indexed_file");
     expect(names).toContain("insert_citation");
     expect(names).not.toContain("search");
   });
@@ -163,6 +173,27 @@ describe("parseToolArguments", () => {
     const result = parseToolArguments("delete_everything", "{}");
     expect(result.ok).toBe(false);
     expect(result.ok === false && result.error).toContain("delete_everything");
+  });
+
+  it("rejects a full read that does not say where to start", () => {
+    const result = parseToolArguments(TOOL_READ_PARAGRAPHS, '{"view":"full"}');
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects a find that is too long for Word", () => {
+    const result = parseToolArguments(TOOL_FIND_IN_DOCUMENT, JSON.stringify({ q: "あ".repeat(256) }));
+    expect(result.ok).toBe(false);
+  });
+
+  it("reads an indexed file only from a path and a non-negative offset", () => {
+    expect(parseToolArguments(TOOL_READ_INDEXED_FILE, '{"path":"  "}').ok).toBe(false);
+    expect(parseToolArguments(TOOL_READ_INDEXED_FILE, '{"path":"C:\\\\a.txt","offset":-1}').ok).toBe(
+      false
+    );
+    expect(parseToolArguments(TOOL_READ_INDEXED_FILE, '{"path":"C:\\\\a.txt","offset":0}')).toEqual({
+      ok: true,
+      call: { name: TOOL_READ_INDEXED_FILE, args: { path: "C:\\a.txt", offset: 0 } },
+    });
   });
 
   it("parses search arguments", () => {
@@ -556,6 +587,18 @@ describe("describeToolCall", () => {
     expect(
       describeToolCall(TOOL_SET_OUTLINE, '{"action":"clear","paragraph":12,"through":14}')
     ).toBe("見出しを外す（段落 12〜14）");
+    expect(describeToolCall(TOOL_READ_PARAGRAPHS, '{"from":12,"view":"marks"}')).toBe(
+      "段落 12 を読む（番号一覧）"
+    );
+    expect(describeToolCall(TOOL_FIND_IN_DOCUMENT, '{"q":"第6条を準用する"}')).toBe(
+      "文書内「第6条を準用する」"
+    );
+    expect(describeToolCall(TOOL_DELETE_PARAGRAPHS, '{"paragraphs":[14]}')).toBe(
+      "段落 14 を削除"
+    );
+    expect(
+      describeToolCall(TOOL_READ_INDEXED_FILE, '{"path":"C:\\\\案件\\\\委託基本契約書.docx"}')
+    ).toBe("資料を読む「C:\\案件\\委託基本契約書.docx」");
   });
 
   it("says so when the arguments cannot be read", () => {

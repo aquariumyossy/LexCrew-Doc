@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SETTINGS } from "../settings";
 
 const insertDraftParagraphs = vi.hoisted(() => vi.fn());
+const readBuffer = vi.hoisted(() => vi.fn());
 const insertBlankBefore = vi.hoisted(() => vi.fn());
 const replaceSelection = vi.hoisted(() => vi.fn());
 const insertComment = vi.hoisted(() => vi.fn());
@@ -24,10 +25,11 @@ vi.mock("../word", () => ({
   setOutlineLevel,
 }));
 
-vi.mock("../api", () => ({ search: vi.fn(), searchArgosIndex: vi.fn() }));
+vi.mock("../api", () => ({ search: vi.fn(), searchArgosIndex: vi.fn(), readArgosFile: vi.fn() }));
+vi.mock("../files/read", () => ({ readBuffer }));
 
 import { beginToolTurn, executeToolCall } from "./execute";
-import { searchArgosIndex } from "../api";
+import { readArgosFile, searchArgosIndex } from "../api";
 
 function insertCall(args: unknown, id = "c1") {
   return {
@@ -127,6 +129,49 @@ describe("search_index", () => {
     );
     expect(result.ok).toBe(true);
     expect(JSON.parse(result.content)[0].url).toBe("C:\\案件A\\契約.md");
+  });
+});
+
+describe("read_indexed_file", () => {
+  const signal = new AbortController().signal;
+  const call = {
+    id: "c1",
+    type: "function" as const,
+    function: { name: "read_indexed_file", arguments: '{"path":"C:\\\\案件A\\\\契約.txt"}' },
+  };
+  const settings = { ...DEFAULT_SETTINGS, argosBaseUrl: "http://127.0.0.1:17890" };
+
+  beforeEach(() => {
+    readBuffer.mockReset();
+    vi.mocked(readArgosFile).mockReset();
+  });
+
+  it("returns the extracted text within the character budget", async () => {
+    vi.mocked(readArgosFile).mockResolvedValue({
+      name: "契約.txt",
+      bytes: new ArrayBuffer(0),
+    });
+    readBuffer.mockResolvedValue({
+      status: "text",
+      text: { body: "みなし合格とする。", truncated: false },
+    });
+    const result = await executeToolCall(call, settings, signal, { indexedReadChars: 1000 });
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe("みなし合格とする。");
+    expect(readBuffer).toHaveBeenCalledWith("契約.txt", expect.any(ArrayBuffer));
+  });
+
+  it("asks for an attachment when the file has no text layer", async () => {
+    vi.mocked(readArgosFile).mockResolvedValue({ name: "scan.pdf", bytes: new ArrayBuffer(0) });
+    readBuffer.mockResolvedValue({ status: "scan", pages: 2 });
+    const result = await executeToolCall(call, settings, signal, { indexedReadChars: 1000 });
+    expect(result.content).toContain("チャットに添付");
+  });
+
+  it("refuses when the tool-result share is already full", async () => {
+    const result = await executeToolCall(call, settings, signal, { indexedReadChars: 0 });
+    expect(result.ok).toBe(false);
+    expect(readArgosFile).not.toHaveBeenCalled();
   });
 });
 

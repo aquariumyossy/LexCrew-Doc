@@ -354,11 +354,14 @@ async fn post_argos_search(Json(body): Json<ArgosSearchBody>) -> Response {
     )
     .await
     {
-        Ok(results) => Json(json!({
-            "provider": "argos",
-            "results": results,
-        }))
-        .into_response(),
+        Ok(results) => {
+            crate::indexed::note_hits(results.iter().map(|hit| hit.url.as_str()));
+            Json(json!({
+                "provider": "argos",
+                "results": results,
+            }))
+            .into_response()
+        }
         Err(error) => {
             let status = if error.cancelled {
                 StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
@@ -366,6 +369,32 @@ async fn post_argos_search(Json(body): Json<ArgosSearchBody>) -> Response {
                 StatusCode::BAD_GATEWAY
             };
             json_error(status, &error.message, error.hint.as_deref())
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IndexedFileBody {
+    #[serde(default)]
+    path: String,
+}
+
+async fn post_argos_file(Json(body): Json<IndexedFileBody>) -> Response {
+    match crate::indexed::read_file(&body.path) {
+        Ok((name, data)) => Json(json!({ "name": name, "data": data })).into_response(),
+        Err(crate::indexed::ReadError::Forbidden) => json_error(
+            StatusCode::FORBIDDEN,
+            "検索結果に無いパスは読めません。search_index の url をそのまま渡してください。",
+            None,
+        ),
+        Err(crate::indexed::ReadError::BadRequest(reason)) => {
+            json_error(StatusCode::BAD_REQUEST, &reason, None)
+        }
+        Err(crate::indexed::ReadError::NotFound) => {
+            json_error(StatusCode::NOT_FOUND, "ファイルが見つかりません。", None)
+        }
+        Err(crate::indexed::ReadError::Failed) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "失敗しました。", None)
         }
     }
 }
@@ -606,6 +635,7 @@ fn create_router_at(static_dir: Option<PathBuf>, connection_file: PathBuf) -> Ro
             get(get_argos_scopes).post(post_argos_scopes),
         )
         .route("/api/argos/search", post(post_argos_search))
+        .route("/api/argos/file", post(post_argos_file))
         .route(
             "/api/conversations",
             get(get_conversations).post(post_conversations),
@@ -1275,5 +1305,68 @@ mod tests {
         assert_eq!(body["results"][0]["title"], "契約.md");
         assert_eq!(body["results"][0]["url"], "C:\\案件A\\契約.md");
         assert_eq!(body["results"][0]["content"], "民法第555条");
+    }
+
+    #[tokio::test]
+    async fn argos_file_returns_bytes_only_for_a_search_hit() {
+        crate::indexed::clear();
+        let dir = std::env::temp_dir().join(format!("guri-indexed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("委託.txt");
+        std::fs::write(&file_path, "ok").unwrap();
+        let file_string = file_path.to_string_lossy().to_string();
+
+        let (denied, denied_body) = json_request(
+            create_router(None),
+            "POST",
+            "/api/argos/file",
+            json!({ "path": file_string }),
+        )
+        .await;
+        assert_eq!(denied, StatusCode::FORBIDDEN);
+        assert!(denied_body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("検索結果に無い"));
+
+        let argos = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "hits": [{ "title": "委託.txt", "path": file_string, "snippet": "ok" }]
+            })))
+            .mount(&argos)
+            .await;
+        let (search_status, _) = json_request(
+            create_router(None),
+            "POST",
+            "/api/argos/search",
+            json!({ "argosBaseUrl": argos.uri(), "q": "みなし" }),
+        )
+        .await;
+        assert_eq!(search_status, StatusCode::OK);
+
+        let (status, body) = json_request(
+            create_router(None),
+            "POST",
+            "/api/argos/file",
+            json!({ "path": file_string }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["name"], "委託.txt");
+        assert_eq!(body["data"], "b2s=");
+
+        let other = dir.join("..").join("秘密.txt");
+        let (other_status, _) = json_request(
+            create_router(None),
+            "POST",
+            "/api/argos/file",
+            json!({ "path": other.to_string_lossy().to_string() }),
+        )
+        .await;
+        assert_eq!(other_status, StatusCode::FORBIDDEN);
+        crate::indexed::clear();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

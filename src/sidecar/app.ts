@@ -1,3 +1,4 @@
+import fs from "fs";
 import path from "path";
 import express, { NextFunction, Request, Response } from "express";
 import { DEFAULT_MODEL, DEFAULT_TIMEOUT_MS, OCR_BODY_LIMIT_BYTES } from "../shared/constants";
@@ -5,7 +6,9 @@ import { parseCommittedFiles } from "../shared/fileSource";
 import { NewMessage } from "../shared/history";
 import { visionUnsupportedMessage } from "../shared/ocr";
 import { getHistory } from "./history";
+import { rejectReason } from "../shared/fileExtract";
 import { checkArgos, listArgosScopes, searchArgos } from "./argos";
+import { canReadIndexedPath, noteIndexedHits } from "./indexedPaths";
 import { checkLlmHealth, chatCompletions, pipeChatStream, readImageText } from "./llm";
 import { logError, logInfo } from "./logger";
 import { checkSearxng, getSearchProvider } from "./search";
@@ -279,6 +282,7 @@ export function createApp(options: { connectionFile?: string } = {}): express.Ex
           body.pathPrefixes || [],
           signal
         );
+        noteIndexedHits(results.map((hit) => hit.url));
         res.json({ provider: "argos", results });
       } catch (error) {
         if (signal.aborted) {
@@ -291,6 +295,36 @@ export function createApp(options: { connectionFile?: string } = {}): express.Ex
       }
     }
   );
+
+  app.post("/api/argos/file", async (req: Request<unknown, unknown, { path?: string }>, res) => {
+    const filePath = (req.body?.path || "").trim();
+    if (!canReadIndexedPath(filePath)) {
+      sendError(
+        res,
+        403,
+        "検索結果に無いパスは読めません。search_index の url をそのまま渡してください。"
+      );
+      return;
+    }
+    try {
+      const stat = await fs.promises.stat(filePath);
+      const name = path.basename(filePath);
+      const reason = rejectReason({ name, size: stat.size });
+      if (reason) {
+        sendError(res, 400, reason);
+        return;
+      }
+      const bytes = await fs.promises.readFile(filePath);
+      res.json({ name, data: bytes.toString("base64") });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        sendError(res, 404, "ファイルが見つかりません。");
+        return;
+      }
+      sendError(res, 500, textError(error));
+    }
+  });
 
   // Conversations live only in the local database. Bodies are never logged.
   app.get("/api/conversations", (req, res) => {

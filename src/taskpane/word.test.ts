@@ -12,7 +12,10 @@ import {
   insertDraftParagraphs,
   readAttachment,
   setOutlineLevel,
+  deleteParagraphs,
+  findInDocument,
   readDocumentText,
+  readParagraphs,
   replaceQuote,
 } from "./word";
 
@@ -102,6 +105,7 @@ type FakeParagraph = {
   restyleOnOutline: boolean;
   ignoreOutline: boolean;
   font: { bold: boolean; name: string; nameFarEast: string; size: number };
+  delete: () => void;
 };
 
 function installWord(options: WordOptions): {
@@ -192,6 +196,7 @@ function installWord(options: WordOptions): {
     const reviewed =
       options.reviewedParagraphs?.[index] ??
       text.replace(/\r$/, "");
+    let reviewedText = reviewed;
     const tracked = options.paragraphChanges?.[index] || [];
     const state = {
       text,
@@ -304,7 +309,7 @@ function installWord(options: WordOptions): {
       insertComment: (value: string) => comments.push(value),
       search: makeRange(text).search,
       getReviewedText: () => ({
-        value: reviewed,
+        value: reviewedText,
       }),
       getTrackedChanges: () => ({
         load: () => undefined,
@@ -415,6 +420,9 @@ function installWord(options: WordOptions): {
         return created;
       },
       select: () => undefined,
+      delete: () => {
+        reviewedText = "";
+      },
       alignment: "",
       firstLineIndent: 0,
       leftIndent: 0,
@@ -1970,6 +1978,173 @@ describe("insertBlankBefore", () => {
     await readDocumentText(1_000);
     await expect(insertBlankBefore([2, 3])).rejects.toThrow(/添付にありません/);
     expect(texts(word)).toEqual(["前文", "", "第1条（目的）"]);
+  });
+});
+
+describe("readParagraphs", () => {
+  it("returns the live list mark, style, and comment for a range", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文です。", "第1条（目的）甲は乙に委託する。"],
+      listStrings: [null, "（１）"],
+      markupComments: [
+        {
+          author: "山田",
+          date: new Date("2026-04-01"),
+          anchor: "第1条（目的）",
+          content: "目的を確認",
+          resolved: false,
+        },
+      ],
+    });
+    word.paragraphs[0].style = "見出し 1";
+    word.paragraphs[0].styleBuiltIn = "Heading1";
+    word.paragraphs[0].outlineLevel = 1;
+    await readDocumentText(10_000);
+
+    const read = await readParagraphs({ from: 1, through: 2, view: "full" });
+
+    expect(read.numbered).toBe(false);
+    expect(read.text).toContain("[1] 番号なし スタイル:見出し 1 見出し:1");
+    expect(read.text).toContain("前文です。");
+    expect(read.text).toContain("[2] 〔（１）〕 スタイル:標準");
+    expect(read.text).toContain("コメント: 山田 目的を確認");
+    expect(read.text).toContain("コメント: なし");
+  });
+
+  it("does not call an unreadable list number 番号なし", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["本文"],
+      listStrings: [""],
+    });
+    const read = await readParagraphs({ view: "marks" });
+    expect(read.text).toContain("〔番号あり〕");
+    expect(read.text).not.toContain("番号なし");
+  });
+
+  it("keeps attached numbers and assigns the tail past them", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["売買契約書", "第1条（目的）", "第2条（代金）"],
+    });
+    const attached = await readDocumentText(12);
+    expect(attached.text).toBe("[1] 売買契約書");
+
+    const read = await readParagraphs({ view: "marks" });
+
+    expect(read.text).toContain("[1] 番号なし");
+    expect(read.text).toContain("[2] 番号なし");
+    expect(read.text).toContain("[3] 番号なし");
+    expect(read.numbered).toBe(true);
+  });
+
+  it("numbers a document that was not attached, from the body position", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "", "第1条"],
+    });
+    await readDocumentText(0);
+    const read = await readParagraphs({ view: "marks" });
+    expect(read.numbered).toBe(true);
+    expect(read.text).toBe("[1] 番号なし\n[3] 番号なし");
+  });
+});
+
+describe("findInDocument", () => {
+  it("returns the paragraph number and the text around the hit", async () => {
+    const lead = "あ".repeat(40);
+    const tail = "い".repeat(40);
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: [`${lead}第6条を準用する${tail}`],
+    });
+    await readDocumentText(10_000);
+
+    const found = await findInDocument({ q: "第6条を準用する" });
+
+    expect(found.text).toContain("1 件");
+    expect(found.text).toMatch(/\[1\] …あ+第6条を準用する/);
+  });
+
+  it("finds an article number that exists only as a list label", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["目的について定める。"],
+      listStrings: ["第１条"],
+    });
+    await readDocumentText(10_000);
+
+    const found = await findInDocument({ q: "第１条" });
+
+    expect(found.text).toContain("1 件");
+    expect(found.text).toContain("[1]");
+    expect(found.text).toContain("〔第１条〕");
+  });
+});
+
+describe("deleteParagraphs", () => {
+  function reviewed(paragraph: object): string {
+    return (paragraph as { getReviewedText: () => { value: string } }).getReviewedText().value;
+  }
+
+  it("refuses two copies of the same sentence and deletes neither", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "甲は売る", "甲は売る"],
+    });
+    await readDocumentText(10_000);
+
+    await expect(deleteParagraphs({ paragraphs: [2] })).rejects.toThrow(/同じ文言が 2 箇所/);
+    expect(reviewed(word.paragraphs[1])).toContain("甲は売る");
+    expect(reviewed(word.paragraphs[2])).toContain("甲は売る");
+    expect(word.getTracking()).toBe("");
+  });
+
+  it("deletes the copy after follows, and the other number still reads", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "甲は売る", "甲は売る"],
+    });
+    await readDocumentText(10_000);
+
+    const note = await deleteParagraphs({ paragraphs: [3], follows: 2 });
+
+    expect(note).toContain("段落 3");
+    expect(note).toContain("変更履歴に記録");
+    expect(word.getTracking()).toBe("trackAll");
+    expect(reviewed(word.paragraphs[2])).toBe("");
+    expect(reviewed(word.paragraphs[1])).toContain("甲は売る");
+
+    const found = await findInDocument({ q: "甲は売る" });
+    expect(found.text).toContain("1 件");
+    expect(found.text).not.toContain("[3]");
+
+    const kept = await readParagraphs({ from: 2, view: "full" });
+    expect(kept.text).toContain("甲は売る");
+  });
+
+  it("reports a paragraph that is already a tracked deletion", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["甲は売る", "甲は買う"],
+    });
+    await readDocumentText(10_000);
+    word.paragraphs[0].delete();
+
+    const note = await deleteParagraphs({ paragraphs: [1] });
+
+    expect(note).toContain("削除済み");
+    expect(word.getTracking()).toBe("");
   });
 });
 

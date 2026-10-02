@@ -78,7 +78,7 @@ export class SearxngProvider implements SearchProvider {
   }
 }
 
-/** Provider seam. MVP implements SearXNG only; Argos is not wired. */
+/** Provider seam for public web search. SearXNG only. Argos has its own module. */
 export function getSearchProvider(): SearchProvider {
   return new SearxngProvider();
 }

@@ -348,6 +348,31 @@ export async function searchArgosIndex(
   return data.results || [];
 }
 
+export async function readArgosFile(
+  body: { path: string },
+  signal?: AbortSignal
+): Promise<{ name: string; bytes: ArrayBuffer }> {
+  const res = await fetch("/api/argos/file", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: body.path }),
+    signal,
+  });
+  const data = await parseJson<{ name?: string; data?: string; error?: string; hint?: string }>(res);
+  if (!res.ok) {
+    const error = new Error(data.error || `資料を読めませんでした（${res.status}）。`);
+    (error as Error & { hint?: string }).hint = data.hint;
+    throw error;
+  }
+  const encoded = data.data || "";
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return { name: data.name || "", bytes: bytes.buffer };
+}
+
 export async function setConversationArgosScope(
   id: string,
   pathPrefixes: string[]

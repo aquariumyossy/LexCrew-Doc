@@ -10,7 +10,7 @@ import {
 } from "../../shared/extract/plain";
 import { extractSheet } from "../../shared/extract/sheet";
 import { xmlAttr, scanXml } from "../../shared/extract/xml";
-import { FileReadError, fileKind } from "../../shared/fileExtract";
+import { FileReadError, fileKind, rejectReason } from "../../shared/fileExtract";
 import { FileText, capFileText } from "../../shared/fileSource";
 import { openPdf, readPdfPages } from "./pdf";
 
@@ -127,13 +127,14 @@ async function readPdf(bytes: ArrayBuffer): Promise<FileRead> {
  * on the way out: only the extracted text is kept, so a 20MB scan does not sit
  * beside the document for the rest of the conversation.
  */
-export async function readFile(file: File): Promise<FileRead> {
-  const kind = fileKind(file.name);
+export async function readBuffer(name: string, bytes: ArrayBuffer): Promise<FileRead> {
+  const kind = fileKind(name);
   if (kind === "image") {
-    // A picture has no text layer to try, so it goes straight to a vision read.
     return { status: "scan", pages: 1 };
   }
-  const bytes = await reading("ファイル", () => file.arrayBuffer());
+  if (!kind) {
+    throw new FileReadError(rejectReason({ name, size: bytes.byteLength }) || "この形式は読めません。");
+  }
   if (kind === "pdf") {
     return reading("PDF", () => readPdf(bytes));
   }
@@ -148,4 +149,12 @@ export async function readFile(file: File): Promise<FileRead> {
   const decoded = decodeUtf8(bytes);
   const body = kind === "html" ? htmlToText(decoded) : decoded;
   return { status: "text", text: capFileText(plainFileText(body), MAX_FILE_CHARS) };
+}
+
+export async function readFile(file: File): Promise<FileRead> {
+  if (fileKind(file.name) === "image") {
+    return { status: "scan", pages: 1 };
+  }
+  const bytes = await reading("ファイル", () => file.arrayBuffer());
+  return readBuffer(file.name, bytes);
 }

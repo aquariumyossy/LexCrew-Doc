@@ -1,6 +1,8 @@
 import { mapBlocks, summarizeInsertedBlocks } from "../../shared/blocks";
 import { foreignCharToolError } from "../../shared/japaneseHan";
 import {
+  TOOL_DELETE_PARAGRAPHS,
+  TOOL_FIND_IN_DOCUMENT,
   TOOL_FORMAT_LIST,
   TOOL_FORMAT_PARAGRAPH,
   TOOL_FORMAT_TEXT,
@@ -9,6 +11,8 @@ import {
   TOOL_INSERT_BLOCKS,
   TOOL_INSERT_CITATION,
   TOOL_INSERT_COMMENT,
+  TOOL_READ_INDEXED_FILE,
+  TOOL_READ_PARAGRAPHS,
   TOOL_REPLACE_QUOTE,
   TOOL_REPLACE_SELECTION,
   TOOL_SEARCH,
@@ -17,13 +21,17 @@ import {
   ToolCall,
   parseToolArguments,
 } from "../../shared/tools";
-import { search, searchArgosIndex } from "../api";
+import { readArgosFile, search, searchArgosIndex } from "../api";
+import { sliceIndexedText } from "../../shared/indexedRead";
 import { Settings } from "../settings";
 import {
+  deleteParagraphs,
+  findInDocument,
   formatList,
   formatParagraph,
   formatText,
   getSelectionInfo,
+  readParagraphs,
   insertCitationComment,
   insertCitationText,
   insertBlankBefore,
@@ -60,6 +68,8 @@ export type ToolOutcome = {
 
 export type ExecuteOptions = {
   argosPathPrefixes?: string[];
+  /** Characters this read may return without exceeding the tool-result share. */
+  indexedReadChars?: number;
 };
 
 function failed(message: string): ToolOutcome {
@@ -120,6 +130,45 @@ async function runIndexSearch(
     content: hit.content.slice(0, HIT_SNIPPET_CHARS),
   }));
   return { content: JSON.stringify(trimmed), ok: true };
+}
+
+function fileNameOf(filePath: string): string {
+  const parts = filePath.split(/[/\\]/);
+  return parts[parts.length - 1] || filePath;
+}
+
+async function runIndexedRead(
+  path: string,
+  offset: number,
+  settings: Settings,
+  limit: number,
+  signal: AbortSignal
+): Promise<ToolOutcome> {
+  if (!settings.argosBaseUrl.trim()) {
+    return failed(
+      "Argos の URL が設定されていません。設定で http://127.0.0.1:17890 を入れてください。"
+    );
+  }
+  if (limit <= 0) {
+    return failed("ツール結果の枠が足りません。この読み取りは次のターンでやり直してください。");
+  }
+  const file = await readArgosFile({ path }, signal);
+  const { readBuffer } = await import("../files/read");
+  let read;
+  try {
+    read = await readBuffer(file.name || fileNameOf(path), file.bytes);
+  } catch (error) {
+    return failed(error instanceof Error ? error.message : "資料を読めませんでした。");
+  }
+  if (read.status === "scan") {
+    return {
+      content: "文字層がありません。このファイルをチャットに添付すると OCR で読めます。",
+      ok: true,
+    };
+  }
+  const note = read.text.truncated ? "抽出は6万字で打ち切っています。\n" : "";
+  const sliced = sliceIndexedText(read.text.body, offset, limit - note.length);
+  return { content: `${note}${sliced}`, ok: true };
 }
 
 /**
@@ -253,6 +302,30 @@ export async function executeToolCall(
         const note = await setOutlineLevel(invocation.args);
         return { content: note, ok: true };
       }
+
+      case TOOL_READ_PARAGRAPHS: {
+        const read = await readParagraphs(invocation.args);
+        return { content: read.text, ok: true, numbered: read.numbered };
+      }
+
+      case TOOL_FIND_IN_DOCUMENT: {
+        const read = await findInDocument(invocation.args);
+        return { content: read.text, ok: true, numbered: read.numbered };
+      }
+
+      case TOOL_DELETE_PARAGRAPHS: {
+        const note = await deleteParagraphs(invocation.args);
+        return { content: note, ok: true };
+      }
+
+      case TOOL_READ_INDEXED_FILE:
+        return await runIndexedRead(
+          invocation.args.path,
+          invocation.args.offset ?? 0,
+          settings,
+          extras.indexedReadChars ?? 0,
+          signal
+        );
 
       default:
         return failed(`${call.function.name} は実行できません。`);

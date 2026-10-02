@@ -255,6 +255,28 @@ describe("runTurn", () => {
     expect(properties(1)?.paragraph).toBeDefined();
   });
 
+  it("offers paragraph numbers from the next round once a read handed some out", async () => {
+    executeToolCall.mockResolvedValue({
+      content: "[1] 番号なし\n前文",
+      ok: true,
+      numbered: true,
+    });
+    chatStream
+      .mockResolvedValueOnce(
+        completion({ toolCalls: [toolCall("c1", "read_paragraphs")], finishReason: "tool_calls" })
+      )
+      .mockResolvedValueOnce(completion({ content: "読みました。" }));
+
+    await run("ひな形を見て");
+
+    const properties = (callIndex: number) =>
+      ((chatStream.mock.calls[callIndex][0] as ChatBody).tools as {
+        function: { name: string; parameters: { properties: Record<string, unknown> } };
+      }[]).find((tool) => tool.function.name === "format_list")?.function.parameters.properties;
+    expect(properties(0)?.paragraph).toBeUndefined();
+    expect(properties(1)?.paragraph).toBeDefined();
+  });
+
   it("stops after the tool-round budget and tells the user, without a no-tools closing call", async () => {
     chatStream.mockResolvedValue(
       completion({ toolCalls: [toolCall("c1", "insert_comment")], finishReason: "tool_calls" })
@@ -382,13 +404,14 @@ describe("runTurn", () => {
     const first = chatStream.mock.calls[0][0] as ChatBody;
     const names = toolNames();
     expect(names).toContain("search_index");
+    expect(names).toContain("read_indexed_file");
     expect(names).not.toContain("search");
     expect(first.messages[0].content).toContain("C:\\案件A");
     expect(executeToolCall).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),
       expect.anything(),
-      { argosPathPrefixes: ["C:\\案件A"] }
+      expect.objectContaining({ argosPathPrefixes: ["C:\\案件A"], indexedReadChars: 52422 })
     );
   });
 

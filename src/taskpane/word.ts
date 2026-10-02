@@ -54,11 +54,15 @@ import {
   type ListStyle,
 } from "../shared/listStyles";
 import {
+  DeleteParagraphsArgs,
+  FindInDocumentArgs,
   FormatListArgs,
   FormatParagraphArgs,
   FormatTextArgs,
   InsertAtArg,
   InsertCommentArgs,
+  MAX_FIND_CHARS,
+  ReadParagraphsArgs,
   ReplaceQuoteArgs,
   SetOutlineArgs,
 } from "../shared/tools";
@@ -294,19 +298,6 @@ let lastInlineChanges: ChangeNote[] = [];
 let lastInlineChangesTruncated = false;
 let lastInlineAppendixComments: CommentNote[] = [];
 let lastInlineCommentCount = 0;
-
-export function lastAttachmentReviewedFallback(): boolean {
-  return attachmentReviewedFallback;
-}
-
-export function lastAttachmentUsesInlineMarkup(): boolean {
-  return attachmentUsesInlineMarkup;
-}
-
-/** The address the model uses instead of a quote. */
-function paragraphLabel(number: number): string {
-  return `[${number}] `;
-}
 
 const PARAGRAPH_LABEL = /^\s*\[(\d+)\]\s*/;
 const PARAGRAPH_LABEL_ONLY = /^\s*\[(\d+)\]\s*$/;
@@ -2681,6 +2672,544 @@ export function getDocumentKey(settingName: string): string {
   settings.set(settingName, created);
   settings.saveAsync();
   return created;
+}
+
+const FULL_READ_PARAGRAPHS = 40;
+const FULL_READ_CHARS = 8_000;
+const MARKS_READ_CHARS = 12_000;
+const FIND_READ_CHARS = 8_000;
+
+type LiveParagraph = {
+  paragraph: Word.Paragraph;
+  index: number;
+  raw: string;
+  reviewed: string;
+  mark: ListMark;
+  styleName: string;
+  styleBuiltIn: string;
+  outline: number | null;
+};
+
+type NumberedLive = { number: number; live: LiveParagraph };
+
+export type ParagraphRead = { text: string; numbered: boolean };
+
+function isPresent(live: LiveParagraph): boolean {
+  return Boolean(live.reviewed.trim());
+}
+
+function nextAddress(): number {
+  let max = 0;
+  for (const number of attachedParagraphs.keys()) {
+    if (number > max) {
+      max = number;
+    }
+  }
+  return max + 1;
+}
+
+/**
+ * Pair each remembered paragraph with the live one `locateParagraph` would find,
+ * then give every other present paragraph a new number past the high water.
+ * Existing numbers stay. The same text uses each remembered number once.
+ */
+function claimNumbers(lives: LiveParagraph[]): { rows: NumberedLive[]; handedOut: boolean } {
+  const hadNone = attachedParagraphs.size === 0;
+  const claimed = new Map<LiveParagraph, number>();
+  const numbers = [...attachedParagraphs.keys()].sort((a, b) => a - b);
+  for (const number of numbers) {
+    const row = attachedParagraphs.get(number);
+    if (!row) {
+      continue;
+    }
+    const target = compact(row.text);
+    if (!target || lives.length === 0) {
+      continue;
+    }
+    const from = Math.min(Math.max(number - 1, 0), lives.length - 1);
+    let found: LiveParagraph | undefined;
+    for (let step = 0; step < lives.length && !found; step += 1) {
+      const indexes = step === 0 ? [from] : [from + step, from - step];
+      for (const index of indexes) {
+        if (index < 0 || index >= lives.length) {
+          continue;
+        }
+        const live = lives[index];
+        if (claimed.has(live) || !isPresent(live)) {
+          continue;
+        }
+        if (compact(live.raw) === target || compact(live.reviewed) === target) {
+          found = live;
+          break;
+        }
+      }
+    }
+    if (found) {
+      claimed.set(found, number);
+    }
+  }
+
+  const rows: NumberedLive[] = [];
+  let handedOut = false;
+  let fresh = nextAddress();
+  for (const live of lives) {
+    if (!isPresent(live)) {
+      continue;
+    }
+    const existing = claimed.get(live);
+    if (existing !== undefined) {
+      rows.push({ number: existing, live });
+      continue;
+    }
+    const number = hadNone ? live.index + 1 : fresh;
+    if (!hadNone) {
+      fresh += 1;
+    }
+    attachedParagraphs.set(number, {
+      text: live.raw,
+      shown: live.reviewed,
+      listString: live.mark.listString,
+      isListItem: live.mark.isListItem,
+    });
+    handedOut = true;
+    rows.push({ number, live });
+  }
+  if (hadNone && rows.length) {
+    attachedParagraphCount = lives.length;
+  }
+  return { rows, handedOut: handedOut || (hadNone && rows.length > 0) };
+}
+
+/** Drop remembered paragraphs that no longer match live text, so their numbers cannot fall through to an index. */
+function retireUnclaimed(rows: NumberedLive[]): void {
+  const kept = new Set(rows.map((row) => row.number));
+  let dropped = false;
+  for (const number of [...attachedParagraphs.keys()]) {
+    if (!kept.has(number)) {
+      attachedParagraphs.delete(number);
+      dropped = true;
+    }
+  }
+  if (dropped) {
+    attachedParagraphCount = Math.max(attachedParagraphCount, 0) + 1;
+  }
+}
+
+async function loadLiveParagraphs(context: Word.RequestContext): Promise<LiveParagraph[]> {
+  const collection = context.document.body.paragraphs;
+  collection.load("items/text,items/isListItem");
+  await context.sync();
+  await loadListStrings(context, collection.items);
+
+  let styled = true;
+  try {
+    for (const paragraph of collection.items) {
+      paragraph.load("style,styleBuiltIn,outlineLevel");
+    }
+    await context.sync();
+  } catch {
+    styled = false;
+  }
+
+  const useReviewed = canReadReviewed();
+  const reviewed: Array<{ value: string }> = [];
+  if (useReviewed) {
+    for (const paragraph of collection.items) {
+      reviewed.push(paragraph.getReviewedText(Word.ChangeTrackingVersion.current) as { value: string });
+    }
+    try {
+      await context.sync();
+    } catch {
+      reviewed.length = 0;
+    }
+  }
+
+  return collection.items.map((paragraph, index) => {
+    const raw = paragraphText(paragraph);
+    const reviewedText = reviewed[index]
+      ? paragraphText({ text: reviewed[index].value || "" })
+      : raw;
+    let styleName = "";
+    let styleBuiltIn = "";
+    let outline: number | null = null;
+    if (styled) {
+      try {
+        styleName = String(paragraph.style || "");
+        styleBuiltIn = String(paragraph.styleBuiltIn || "");
+        outline = readOutlineLevel(paragraph.outlineLevel as number | string);
+      } catch {
+        styleName = "";
+      }
+    }
+    return {
+      paragraph,
+      index,
+      raw,
+      reviewed: reviewedText,
+      mark: listMarkOf(paragraph),
+      styleName,
+      styleBuiltIn,
+      outline,
+    };
+  });
+}
+
+function markLabel(mark: ListMark): string {
+  if (!mark.isListItem) {
+    return "番号なし";
+  }
+  return wrapListMark(mark) || "番号あり";
+}
+
+function outlineNote(live: LiveParagraph): string {
+  if (live.outline !== null && live.outline >= 1 && live.outline <= 9) {
+    return `見出し:${live.outline}`;
+  }
+  return "";
+}
+
+function aroundMatch(text: string, needle: string): string {
+  const want = compact(needle);
+  const chars = [...text];
+  let dense = "";
+  const map: number[] = [];
+  for (let index = 0; index < chars.length; index += 1) {
+    if (/[\s\u3000]/.test(chars[index])) {
+      continue;
+    }
+    map.push(index);
+    dense += chars[index];
+  }
+  const pos = dense.indexOf(want);
+  if (pos < 0) {
+    return clipNote(text, 60);
+  }
+  const startChar = map[Math.max(0, pos - 12)] ?? 0;
+  const endIndex = Math.min(map.length - 1, pos + want.length - 1 + 12);
+  const endChar = (map[endIndex] ?? text.length - 1) + 1;
+  const prefix = startChar > 0 ? "…" : "";
+  const suffix = endChar < text.length ? "…" : "";
+  return `${prefix}${text.slice(startChar, endChar)}${suffix}`;
+}
+
+type CommentHit = { author: string; anchor: string; content: string };
+
+async function loadCommentHits(context: Word.RequestContext): Promise<{ hits: CommentHit[]; error: string }> {
+  try {
+    const list = context.document.body.getComments();
+    list.load("items/authorName,items/content");
+    await context.sync();
+    const anchors = list.items.map((comment) => {
+      const range = comment.getRange();
+      range.load("text");
+      return range;
+    });
+    try {
+      await context.sync();
+    } catch {
+      return {
+        hits: list.items.map((comment) => ({
+          author: comment.authorName || "",
+          anchor: "",
+          content: comment.content || "",
+        })),
+        error: "",
+      };
+    }
+    return {
+      hits: list.items.map((comment, index) => ({
+        author: comment.authorName || "",
+        anchor: anchors[index].text || "",
+        content: comment.content || "",
+      })),
+      error: "",
+    };
+  } catch (error) {
+    return { hits: [], error: readFailed(error) };
+  }
+}
+
+function commentsOn(live: LiveParagraph, hits: CommentHit[]): string {
+  const dense = compact(live.reviewed);
+  if (!dense) {
+    return "なし";
+  }
+  const matched = hits.filter((hit) => {
+    const anchor = compact(hit.anchor);
+    return Boolean(anchor) && (dense.includes(anchor) || anchor === dense);
+  });
+  if (!matched.length) {
+    return "なし";
+  }
+  return matched.map((hit) => `${hit.author} ${hit.content}`.trim()).join(" / ");
+}
+
+function fullBlock(row: NumberedLive, comments: string): string {
+  const style = `スタイル:${row.live.styleName || "標準"}`;
+  const heading = outlineNote(row.live);
+  const head = [`[${row.number}] ${markLabel(row.live.mark)}`, style, heading].filter(Boolean).join(" ");
+  return `${head}\n${row.live.reviewed}\nコメント: ${comments}`;
+}
+
+function marksLine(row: NumberedLive): string {
+  const extras = [
+    isBuiltinHeadingStyle(row.live.styleBuiltIn) ? `スタイル:${row.live.styleName || row.live.styleBuiltIn}` : "",
+    outlineNote(row.live),
+  ].filter(Boolean);
+  const head = `[${row.number}] ${markLabel(row.live.mark)}`;
+  return extras.length ? `${head} ${extras.join(" ")}` : head;
+}
+
+function assertFindQuery(q: string): void {
+  if (q.length > MAX_FIND_CHARS) {
+    throw new Error(`検索語が ${MAX_FIND_CHARS} 字を超えています。Word の検索の上限です。短くしてください。`);
+  }
+  if (/[\r\n]/.test(q)) {
+    throw new Error("検索語に改行は入れられません。1 行の語にしてください。");
+  }
+}
+
+/**
+ * The document as it is now, addressed with the same paragraph numbers as the attachment.
+ * Paragraphs the attachment never reached get new numbers and stay addressable this turn.
+ */
+export async function readParagraphs(args: ReadParagraphsArgs): Promise<ParagraphRead> {
+  if (!isWordHost()) {
+    throw new Error("Word で開いてください。");
+  }
+  const view = args.view ?? "full";
+  return Word.run(async (context) => {
+    const lives = await loadLiveParagraphs(context);
+    const { rows, handedOut } = claimNumbers(lives);
+    retireUnclaimed(rows);
+    const comments = view === "full" ? await loadCommentHits(context) : { hits: [], error: "" };
+
+    let selected = rows;
+    if (view === "full") {
+      if (args.from === undefined) {
+        throw new Error("full で読むときは from に段落番号を渡してください。");
+      }
+      const end = args.through ?? args.from;
+      selected = rows.filter((row) => row.number >= args.from! && row.number <= end);
+    } else if (args.from !== undefined) {
+      const end = args.through ?? Number.POSITIVE_INFINITY;
+      selected = rows.filter((row) => row.number >= args.from! && row.number <= end);
+    }
+    if (!rows.length) {
+      return { text: "本文に段落がありません。", numbered: false };
+    }
+    if (!selected.length) {
+      throw new Error(
+        `段落 ${args.from} から読める段落がありません。read_paragraphs の view を marks にして番号を見てください。`
+      );
+    }
+
+    const charCap = view === "marks" ? MARKS_READ_CHARS : FULL_READ_CHARS;
+    const paraCap = view === "marks" ? Number.POSITIVE_INFINITY : FULL_READ_PARAGRAPHS;
+    const blocks: string[] = [];
+    let used = 0;
+    for (const row of selected) {
+      if (blocks.length >= paraCap) {
+        break;
+      }
+      const block =
+        view === "marks" ? marksLine(row) : fullBlock(row, commentsOn(row.live, comments.hits));
+      if (blocks.length > 0 && used + block.length + 1 > charCap) {
+        break;
+      }
+      blocks.push(block);
+      used += block.length + 1;
+    }
+    const next = selected[blocks.length];
+    const tail = next ? `\n…（続きは from を ${next.number} にしてください）` : "";
+    const failed = comments.error ? `コメントは読めませんでした（${comments.error}）。無いとは限りません。\n` : "";
+    const body = view === "marks" ? blocks.join("\n") : blocks.join("\n\n");
+    return { text: `${failed}${body}${tail}`, numbered: handedOut };
+  });
+}
+
+/**
+ * Every current occurrence of a word, with the paragraph number a later edit can use.
+ * List labels are not in paragraph.text, so they are matched on their own.
+ */
+export async function findInDocument(args: FindInDocumentArgs): Promise<ParagraphRead> {
+  if (!isWordHost()) {
+    throw new Error("Word で開いてください。");
+  }
+  const needle = args.q.trim();
+  assertFindQuery(needle);
+  return Word.run(async (context) => {
+    const lives = await loadLiveParagraphs(context);
+    const { rows, handedOut } = claimNumbers(lives);
+    retireUnclaimed(rows);
+    const wanted = compact(needle);
+    const hits: Array<{ number: number; snippet: string }> = [];
+    const seen = new Set<number>();
+
+    const ranges = await findQuote(context, (options) => context.document.body.search(needle, options));
+    const used = new Set<NumberedLive>();
+    for (const range of ranges) {
+      const collection = range.paragraphs;
+      collection.load("items/text");
+      await context.sync();
+      const host = collection.items[0];
+      if (!host) {
+        continue;
+      }
+      const dense = compact(paragraphText(host));
+      const row = rows.find((candidate) => !used.has(candidate) && compact(candidate.live.raw) === dense);
+      if (!row || seen.has(row.number)) {
+        continue;
+      }
+      if (args.after !== undefined && row.number <= args.after) {
+        used.add(row);
+        continue;
+      }
+      if (!compact(row.live.reviewed).includes(wanted)) {
+        used.add(row);
+        continue;
+      }
+      used.add(row);
+      seen.add(row.number);
+      hits.push({ number: row.number, snippet: aroundMatch(row.live.reviewed, needle) });
+    }
+
+    for (const row of rows) {
+      if (seen.has(row.number)) {
+        continue;
+      }
+      if (args.after !== undefined && row.number <= args.after) {
+        continue;
+      }
+      const label = row.live.mark.listString;
+      if (!label.trim() || !compact(label).includes(wanted)) {
+        continue;
+      }
+      seen.add(row.number);
+      const preview = clipNote(row.live.reviewed, 24);
+      hits.push({ number: row.number, snippet: `${wrapListMark(row.live.mark)}${preview}` });
+    }
+
+    hits.sort((a, b) => a.number - b.number);
+    if (!hits.length) {
+      return { text: `「${clipNote(needle, 40)}」は本文にありません。`, numbered: handedOut };
+    }
+
+    const lines: string[] = [];
+    let usedChars = 0;
+    for (const hit of hits) {
+      const line = `[${hit.number}] ${hit.snippet}`;
+      if (lines.length > 0 && usedChars + line.length + 1 > FIND_READ_CHARS) {
+        break;
+      }
+      lines.push(line);
+      usedChars += line.length + 1;
+    }
+    const rest = hits.length - lines.length;
+    const last = lines.length ? hits[lines.length - 1].number : hits[0].number;
+    const more = rest > 0 ? `\nほか ${rest} 件。続きは after を ${last} にしてください。` : "";
+    const head = `「${clipNote(needle, 40)}」は ${hits.length} 件`;
+    return { text: `${head}\n${lines.join("\n")}${more}`, numbered: handedOut };
+  });
+}
+
+function alreadyDeleted(number: number, lives: LiveParagraph[]): boolean {
+  const remembered = attachedParagraphs.get(number);
+  if (!remembered || !compact(remembered.text)) {
+    return false;
+  }
+  const target = compact(remembered.text);
+  return lives.some((live) => !isPresent(live) && (compact(live.raw) === target || compact(live.reviewed) === target));
+}
+
+/**
+ * Delete whole paragraphs under tracked changes. Identical text is refused
+ * until `follows` names the paragraph just before the copy to remove.
+ */
+export async function deleteParagraphs(args: DeleteParagraphsArgs): Promise<string> {
+  if (!isWordHost()) {
+    throw new Error("Word で開いてください。");
+  }
+  if (args.paragraphs.length > 8) {
+    throw new Error("一度に消せるのは 8 段落までです。");
+  }
+  return Word.run(async (context) => {
+    const lives = await loadLiveParagraphs(context);
+    const { rows } = claimNumbers(lives);
+    const byNumber = new Map(rows.map((row) => [row.number, row]));
+    const gone: number[] = [];
+    const targets: NumberedLive[] = [];
+
+    for (const number of args.paragraphs) {
+      const row = byNumber.get(number);
+      if (!row) {
+        if (alreadyDeleted(number, lives)) {
+          gone.push(number);
+          continue;
+        }
+        throw new Error(`段落 ${number} が見つかりません。read_paragraphs で読み直してください。`);
+      }
+      const key = compact(row.live.reviewed);
+      const twins = rows.filter((candidate) => compact(candidate.live.reviewed) === key);
+      if (twins.length > 1) {
+        if (args.follows === undefined) {
+          const lines = twins.map((twin) => {
+            const at = rows.indexOf(twin);
+            const prev = at > 0 ? rows[at - 1] : undefined;
+            const where = prev
+              ? `段落 ${prev.number}「${clipNote(prev.live.reviewed, 16)}」の次`
+              : "文書の先頭";
+            return `${where}（段落 ${twin.number}）`;
+          });
+          throw new Error(
+            `同じ文言が ${twins.length} 箇所あります。消していません。\n${lines.join("\n")}\n` +
+              "follows に、消したい方の直前の段落番号を渡してください。"
+          );
+        }
+        const prev = byNumber.get(args.follows);
+        if (!prev) {
+          throw new Error(`段落 ${args.follows} が見つかりません。`);
+        }
+        const after = rows.find(
+          (candidate) => candidate.live.index > prev.live.index && compact(candidate.live.reviewed) === key
+        );
+        if (!after) {
+          throw new Error(`段落 ${args.follows} の後ろに、その文言はありません。`);
+        }
+        targets.push(after);
+        continue;
+      }
+      targets.push(row);
+    }
+
+    if (gone.length && targets.length) {
+      throw new Error(
+        `段落 ${gone.join("、")} は削除済みです。ほかの段落は消していません。分けて指定してください。`
+      );
+    }
+    if (gone.length) {
+      retireUnclaimed(rows);
+      return `段落 ${gone.join("、")} は削除済みです。`;
+    }
+
+    const unique = [...new Map(targets.map((target) => [target.number, target])).values()];
+    unique.sort((a, b) => b.live.index - a.live.index);
+    startTracking(context);
+    for (const target of unique) {
+      target.live.paragraph.delete();
+      attachedParagraphs.delete(target.number);
+    }
+    await context.sync();
+    attachedParagraphCount = lives.length + 1;
+    retireUnclaimed(rows.filter((row) => attachedParagraphs.has(row.number)));
+    const labels = [...unique]
+      .sort((a, b) => a.number - b.number)
+      .map((target) => `段落 ${target.number}「${clipNote(target.live.reviewed, 24)}」`);
+    return (
+      `${labels.join("、")}を削除しました（変更履歴に記録）。` +
+      "この番号はもう使えません。続きは read_paragraphs で読み直してください。"
+    );
+  });
 }
 
 /** Word のファイル URL。未保存なら空。 */

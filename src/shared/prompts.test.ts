@@ -26,6 +26,12 @@ const base = {
 };
 
 describe("systemPrompt", () => {
+  it("says the attachment is the document from before tools run", () => {
+    const text = systemPrompt({ ...base, search: false, argos: false });
+    expect(text).toContain("ツールを動かす前の文書");
+    expect(text).toContain("read_paragraphs");
+  });
+
   it("describes both search tools when both providers are on", () => {
     const text = systemPrompt({ ...base, search: true, argos: true });
     expect(text).toContain("search_index");

@@ -5,6 +5,7 @@ mod connection;
 mod constants;
 mod history;
 mod https;
+mod indexed;
 mod json;
 mod llm;
 mod log;

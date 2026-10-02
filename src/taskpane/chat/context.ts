@@ -1,6 +1,7 @@
-import { CHARS_PER_TOKEN, TOOL_RESULT_BUDGET_RATIO } from "../../shared/constants";
+import { CHARS_PER_TOKEN, MAX_FILE_CHARS, TOOL_RESULT_BUDGET_RATIO } from "../../shared/constants";
 import { StoredMessage } from "../../shared/history";
 import { stripAttachment } from "../../shared/prompts";
+import { isDocumentSnapshotTool, STALE_DOCUMENT_READ } from "../../shared/tools";
 import { ChatMessage } from "../../sidecar/types";
 
 /** Rough count used for the header readout and for trimming. */
@@ -29,9 +30,26 @@ export function messagesTokens(messages: ChatMessage[]): number {
  * turn, so an old copy would only describe a document that has since changed —
  * and would crowd out the room the new one needs.
  */
+function toolNameById(stored: StoredMessage[]): Map<string, string> {
+  const names = new Map<string, string>();
+  for (const message of stored) {
+    for (const call of message.toolCalls) {
+      names.set(call.id, call.function.name);
+    }
+  }
+  return names;
+}
+
 export function toChatMessages(stored: StoredMessage[]): ChatMessage[] {
+  const names = toolNameById(stored);
   return stored.map((message) => {
-    const content = message.role === "user" ? stripAttachment(message.content) : message.content;
+    let content = message.role === "user" ? stripAttachment(message.content) : message.content;
+    if (
+      message.role === "tool" &&
+      isDocumentSnapshotTool(names.get(message.toolCallId) || "")
+    ) {
+      content = STALE_DOCUMENT_READ;
+    }
     const chat: ChatMessage = { role: message.role, content };
     if (message.toolCalls.length) {
       chat.tool_calls = message.toolCalls;
@@ -49,6 +67,23 @@ function truncate(text: string, maxTokens: number): string {
     return text;
   }
   return `${text.slice(0, maxChars)}\n…（長いので省略しました）`;
+}
+
+/**
+ * How much of an indexed file the next tool result can carry.
+ * `capToolResults` shrinks a result, newest included, once the tool share is over.
+ */
+export function indexedReadCharLimit(contextLimit: number, toolContents: string[]): number {
+  const budget = Math.floor(contextLimit * TOOL_RESULT_BUDGET_RATIO);
+  const used = toolContents.reduce(
+    (total, content) => total + messageTokens({ role: "tool", content }),
+    0
+  );
+  const room = budget - used - 4;
+  if (room <= 0) {
+    return 0;
+  }
+  return Math.min(MAX_FILE_CHARS, Math.floor(room * CHARS_PER_TOKEN));
 }
 
 /**

@@ -677,7 +677,7 @@ function readIndexedFileTool(): ToolDefinition {
       description:
         "search_index が返したファイルの全文を読む。url を path にそのまま渡す。検索の抜粋では足りないとき、たとえば契約書の条を確かめるときに使う。" +
         "検索結果に無いパスは読めない。長いファイルは offset で続きを読む。" +
-        "文字層の無い PDF は読めないので、チャットに添付してもらう。",
+        "各ページの文字が少ない PDF は読めないので、チャットに添付してもらう。",
       parameters: {
         type: "object",
         properties: {

@@ -1,6 +1,6 @@
 [package]
 name = "guri"
-version = "1.2.0"
+version = "1.2.1"
 description = "GURI Word add-in sidecar"
 authors = ["弁護士　吉田秀平"]
 license = "Elastic-2.0"

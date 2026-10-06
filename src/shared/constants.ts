@@ -56,6 +56,12 @@ export const CONVERSATION_BUDGET_RATIO = 0.2;
 export const MAX_ATTACHED_FILES = 10;
 /** Pages of a scanned PDF worth reading. Matches Argos. */
 export const MAX_OCR_PAGES = 20;
+/**
+ * Characters on one page, after spaces and line breaks are removed, at or
+ * below which that page is a picture of text. A caption of a few lines stays
+ * under it. One longer page means the words are already in the file.
+ */
+export const PDF_SPARSE_PAGE_CHARS = 200;
 export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 export const MAX_PDF_BYTES = 20 * 1024 * 1024;
 /** base64 grows by 4/3, so the OCR route needs more room than the image cap. */

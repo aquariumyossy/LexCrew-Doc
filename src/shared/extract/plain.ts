@@ -1,4 +1,5 @@
 import { emptyMarkup } from "../attachment";
+import { PDF_SPARSE_PAGE_CHARS } from "../constants";
 import { FileReadError } from "../fileExtract";
 import { FileOrigin, FileText } from "../fileSource";
 import { scanXml } from "./xml";
@@ -97,14 +98,19 @@ export function htmlToText(html: string): string {
     .trim();
 }
 
+/** Spaces and line breaks are gaps in the caption. */
+function pdfPageGlyphs(page: string): number {
+  return page.replace(/\s/g, "").length;
+}
+
 /**
- * A PDF with nothing on its text layer is a scan. One readable character is
- * enough to trust the layer: a hybrid file's stray glyphs are the author's
- * choice, and rasterising a file that already carries text costs a vision call
- * per page for no gain.
+ * A caption on a scanned page is not the document. Court downloads often leave
+ * a few lines of text and the rest of the page as an image. One page over the
+ * threshold means the author put the words in the file, so that layer is what
+ * we read.
  */
-export function pdfHasTextLayer(pages: string[]): boolean {
-  return pages.some((page) => page.trim().length > 0);
+export function pdfNeedsOcr(pages: string[]): boolean {
+  return pages.every((page) => pdfPageGlyphs(page) <= PDF_SPARSE_PAGE_CHARS);
 }
 
 export function pdfPagesToText(pages: string[], origin: FileOrigin = "text"): FileText {

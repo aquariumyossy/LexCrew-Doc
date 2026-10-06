@@ -164,7 +164,7 @@ async function runIndexedRead(
   }
   if (read.status === "scan") {
     return {
-      content: "文字層がありません。このファイルをチャットに添付すると OCR で読めます。",
+      content: "各ページの文字が少なすぎます。このファイルをチャットに添付すると OCR で読めます。",
       ok: true,
     };
   }

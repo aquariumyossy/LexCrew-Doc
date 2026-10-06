@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FileReadError } from "../fileExtract";
-import { decodeUtf8, htmlToText, pdfHasTextLayer, pdfPagesToText } from "./plain";
+import { decodeUtf8, htmlToText, pdfNeedsOcr, pdfPagesToText } from "./plain";
 
 describe("decodeUtf8", () => {
   it("drops a byte order mark", () => {
@@ -32,10 +32,17 @@ describe("htmlToText", () => {
 });
 
 describe("pdf pages", () => {
-  it("treats one readable character as a text layer", () => {
-    expect(pdfHasTextLayer(["", "  ", "1"])).toBe(true);
-    expect(pdfHasTextLayer(["", "  \n "])).toBe(false);
-    expect(pdfHasTextLayer([])).toBe(false);
+  it("sends a short caption to OCR, and ignores spaces and line breaks", () => {
+    expect(pdfNeedsOcr(["", "  ", "1"])).toBe(true);
+    expect(pdfNeedsOcr(["", "  \n "])).toBe(true);
+    expect(pdfNeedsOcr([])).toBe(true);
+    expect(pdfNeedsOcr(["あ".repeat(200)])).toBe(true);
+    expect(pdfNeedsOcr(["あ".repeat(50) + " \n\t　" + "い".repeat(150)])).toBe(true);
+  });
+
+  it("keeps the text layer when any page is longer than the caption", () => {
+    expect(pdfNeedsOcr(["あ".repeat(201)])).toBe(false);
+    expect(pdfNeedsOcr(["あ".repeat(200), "い".repeat(201)])).toBe(false);
   });
 
   it("joins pages and records where the text came from", () => {

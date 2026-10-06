@@ -4,7 +4,7 @@ import { extractDocx } from "../../shared/extract/docx";
 import {
   decodeUtf8,
   htmlToText,
-  pdfHasTextLayer,
+  pdfNeedsOcr,
   pdfPagesToText,
   plainFileText,
 } from "../../shared/extract/plain";
@@ -113,7 +113,7 @@ async function readPdf(bytes: ArrayBuffer): Promise<FileRead> {
   const handle = await openPdf(bytes);
   try {
     const pages = await readPdfPages(handle.doc, MAX_FILE_CHARS);
-    if (!pdfHasTextLayer(pages)) {
+    if (pdfNeedsOcr(pages)) {
       return { status: "scan", pages: handle.doc.numPages };
     }
     return { status: "text", text: pdfPagesToText(pages) };

@@ -23,10 +23,20 @@ import {
   InsertedParagraph,
   ParagraphSpec,
   Severity,
+  paintParagraph,
   specPlainText,
 } from "../shared/blocks";
 import { MAX_CHANGES_READ, MAX_COMMENTS_READ, MAX_COMMENT_CHARS } from "../shared/constants";
-import { ParagraphFormatOptions, patchParagraphFormat } from "../shared/lineGrid";
+import { ParagraphFormatOptions, patchParagraphFormat, readParagraphLineSpacing } from "../shared/lineGrid";
+import {
+  SAMPLE_RADIUS,
+  FaceReading,
+  ResolvedInsert,
+  SampledParagraph,
+  SettingsFormat,
+  UserFormat,
+  resolveInsertFormats,
+} from "../shared/typography";
 import {
   commentsXmlFromPackage,
   documentXmlFromPackage,
@@ -36,6 +46,7 @@ import {
   stripInlineMarkup,
 } from "../shared/markupText";
 import { formatParagraphRef, isParagraphRef } from "../shared/paragraphRef";
+import { alignReviewed, opHitsDeletion, planRedline, type RedlineOp, type ReviewedAlignment } from "../shared/redline";
 import {
   formatAttachedLine,
   formatSelectionLine,
@@ -104,6 +115,34 @@ function formatComment(comment: string, severity: Severity): string {
 function formatCitation(hit: SearchHit): string {
   const snippet = hit.content.trim() ? `\n${hit.content.trim()}` : "";
   return `【出典】${hit.title}\n${hit.url}${snippet}`;
+}
+
+/** True when any of the first paragraphs has text. Selection-only turns use this. */
+export async function documentHasVisibleText(limit = 40): Promise<boolean> {
+  if (!isWordHost()) {
+    return false;
+  }
+  try {
+    return await Word.run(async (context) => {
+      let current = context.document.body.paragraphs.getFirstOrNullObject();
+      await context.sync();
+      for (let i = 0; i < limit; i += 1) {
+        if (current.isNullObject) {
+          return false;
+        }
+        current.load("text");
+        await context.sync();
+        if ((current.text || "").trim()) {
+          return true;
+        }
+        current = current.getNextOrNullObject();
+        await context.sync();
+      }
+      return false;
+    });
+  } catch {
+    return false;
+  }
 }
 
 export function isWordHost(): boolean {
@@ -1003,8 +1042,15 @@ function quoteNeedle(raw: string, paragraph?: number): string {
   return needle;
 }
 
-function replacementText(text: string, paragraph?: number): string {
-  return quoteNeedle(text, paragraph);
+/**
+ * The replacement keeps the model's spaces. Quote search folds whitespace so a
+ * missing ideographic space still matches; doing that here would record those
+ * spaces as revisions the model did not make.
+ */
+function replacementBody(text: string, paragraph?: number): string {
+  const listString =
+    paragraph === undefined ? undefined : attachedParagraphs.get(paragraph)?.listString;
+  return stripListMarks(stripParagraphLabel(text), listString).replace(/〔[+-\u6ce8][^〕]*〕/g, "");
 }
 
 const MAX_CANDIDATES = 3;
@@ -1325,8 +1371,8 @@ export async function insertComment(args: InsertCommentArgs): Promise<string> {
   });
 }
 
-export async function replaceSelection(text: string): Promise<void> {
-  await Word.run(async (context) => {
+export async function replaceSelection(text: string): Promise<string> {
+  return Word.run(async (context) => {
     startTracking(context);
     const selection = context.document.getSelection();
     selection.load("text");
@@ -1334,8 +1380,8 @@ export async function replaceSelection(text: string): Promise<void> {
     if (!(selection.text || "").trim()) {
       throw new Error("選択範囲が空です。置き換える範囲を選んでから指示してください。");
     }
-    selection.insertText(text, Word.InsertLocation.replace);
-    await context.sync();
+    const outcome = await applyRedline(context, selection, text);
+    return redlineNote("", outcome);
   });
 }
 
@@ -1343,10 +1389,156 @@ export async function replaceQuote(args: ReplaceQuoteArgs): Promise<string> {
   return Word.run(async (context) => {
     startTracking(context);
     const target = await resolveTarget(context, args);
-    target.range.insertText(replacementText(args.text, args.paragraph), Word.InsertLocation.replace);
-    await context.sync();
-    return target.note;
+    const outcome = await applyRedline(context, target.range, replacementBody(args.text, args.paragraph));
+    return redlineNote(target.note, outcome);
   });
+}
+
+type RedlineOutcome = "same" | "narrow" | "whole" | "span";
+
+function redlineNote(note: string, outcome: RedlineOutcome): string {
+  if (outcome === "same") {
+    return `${note}文言は同じだったので、変更履歴は残していません。`;
+  }
+  if (outcome === "narrow") {
+    return `${note}変更履歴には違った部分だけを残しました。`;
+  }
+  if (outcome === "span") {
+    return `${note}段落をまたぐので、範囲全体を変更履歴にしました。`;
+  }
+  return note;
+}
+
+/**
+ * `?` with wildcards is one range per character, in order, and the paragraph
+ * mark is the last `\r`. A surrogate pair comes back as one range. Markup All
+ * keeps tracked deletions in that list, so a later op can see when it would
+ * cover one. Measured on desktop Word, 2000 characters took under a second.
+ */
+async function applyRedline(
+  context: Word.RequestContext,
+  range: Word.Range,
+  after: string
+): Promise<RedlineOutcome> {
+  if (/[\r\n]/.test(after)) {
+    throw new Error("置換後の文が段落をまたいでいます。段落の分割は insert_blocks を使ってください。");
+  }
+  const paragraphs = range.paragraphs;
+  if (paragraphs) {
+    paragraphs.load("items");
+    await context.sync();
+  }
+  if (paragraphs && paragraphs.items.length > 1) {
+    range.insertText(after, Word.InsertLocation.replace);
+    await context.sync();
+    return "span";
+  }
+
+  let filter: Word.RevisionsFilter | null = null;
+  let previousMarkup: Word.RevisionsFilter["markup"] | null = null;
+  let previousView: Word.RevisionsFilter["view"] | null = null;
+  try {
+    filter = context.document.activeWindow.view.revisionsFilter;
+    filter.load("markup,view");
+    await context.sync();
+    previousMarkup = filter.markup;
+    previousView = filter.view;
+    filter.markup = "All";
+    filter.view = "Final";
+    await context.sync();
+  } catch {
+    filter = null;
+  }
+  try {
+    const hits = range.search("?", { matchWildcards: true, matchCase: true });
+    hits.load("items/text");
+    const reviewed = range.getReviewedText(Word.ChangeTrackingVersion.current);
+    await context.sync();
+    const cells: Word.Range[] = [];
+    const tokens: string[] = [];
+    for (const cell of hits.items) {
+      const raw = cell.text || "";
+      if (raw === "\r" || raw === "\u0007") {
+        continue;
+      }
+      cells.push(cell);
+      tokens.push(raw === "\u000b" ? " " : raw);
+    }
+    // getReviewedText returns a ClientResult filled by the sync above.
+    // eslint-disable-next-line office-addins/load-object-before-read
+    const shown = paragraphText({ text: reviewed.value || "" });
+    const aligned = reviewedCells(tokens, cells, shown);
+    const ops = planRedline(aligned.tokens, Array.from(after));
+    if (!ops.length) {
+      return "same";
+    }
+    const alignment = aligned.alignment;
+    if (alignment && ops.some((op) => opHitsDeletion(op, alignment, tokens.length))) {
+      throw new Error(
+        "この変更は、範囲にある既存の変更履歴に重なります。" +
+          "校閲でこの範囲の履歴を確定してからやり直してください。"
+      );
+    }
+    const whole =
+      ops.length === 1 && ops[0].start === 0 && ops[0].end === aligned.tokens.length && ops[0].text.length > 0;
+    for (let i = ops.length - 1; i >= 0; i -= 1) {
+      writeOp(aligned.cells, range, ops[i]);
+      await context.sync();
+    }
+    return whole || !tokens.length ? "whole" : "narrow";
+  } finally {
+    if (filter && previousMarkup !== null && previousView !== null) {
+      filter.markup = previousMarkup;
+      filter.view = previousView;
+      try {
+        await context.sync();
+      } catch {
+        // The view restore is best-effort. The edit itself already synced.
+      }
+    }
+  }
+}
+
+function reviewedCells(
+  tokens: string[],
+  cells: Word.Range[],
+  shown: string
+): { tokens: string[]; cells: Word.Range[]; alignment: ReviewedAlignment | null } {
+  if (tokens.join("") === shown) {
+    return { tokens, cells, alignment: null };
+  }
+  const alignment = alignReviewed(tokens, shown);
+  if (!alignment) {
+    throw new Error(
+      "この範囲の表示と、変更を承認したあとの文面が一致しないため、差分だけを履歴に残せません。" +
+        "校閲でこの範囲の履歴を確定してからやり直してください。"
+    );
+  }
+  return {
+    tokens: Array.from(shown),
+    cells: alignment.rawIndex.map((index) => cells[index < 0 ? 0 : index]),
+    alignment,
+  };
+}
+
+function writeOp(cells: Word.Range[], range: Word.Range, op: RedlineOp): void {
+  if (op.start === op.end) {
+    const point =
+      cells.length === 0
+        ? range.getRange(Word.RangeLocation.start)
+        : op.start >= cells.length
+          ? cells[cells.length - 1].getRange(Word.RangeLocation.end)
+          : cells[op.start].getRange(Word.RangeLocation.start);
+    point.insertText(op.text, op.start >= cells.length ? Word.InsertLocation.after : Word.InsertLocation.before);
+    return;
+  }
+  const span =
+    op.end - op.start === 1 ? cells[op.start] : cells[op.start].expandTo(cells[op.end - 1]);
+  if (!op.text) {
+    span.delete();
+    return;
+  }
+  span.insertText(op.text, Word.InsertLocation.replace);
 }
 
 function alignmentOf(spec: ParagraphSpec): Word.Alignment {
@@ -1359,15 +1551,175 @@ function alignmentOf(spec: ParagraphSpec): Word.Alignment {
   return Word.Alignment.left;
 }
 
+function paintSpecs(specs: ParagraphSpec[], resolved: ResolvedInsert): ParagraphSpec[] {
+  return specs.map((spec) => paintParagraph(spec, spec.type === "title" ? resolved.title : resolved.body));
+}
+
+function faceReading(paragraph: Word.Paragraph): FaceReading {
+  const size = paragraph.font.size;
+  return {
+    text: paragraph.text || "",
+    name: paragraph.font.name || "",
+    nameFarEast: paragraph.font.nameFarEast || "",
+    sizePt: typeof size === "number" && size > 0 ? size : 0,
+    centered: paragraph.alignment === Word.Alignment.centered,
+    heading: isBuiltinHeadingStyle(String(paragraph.styleBuiltIn || "")),
+    inTable: (paragraph.tableNestingLevel || 0) > 0,
+  };
+}
+
+async function stepParagraphs(
+  context: Word.RequestContext,
+  start: Word.Paragraph,
+  direction: "previous" | "next"
+): Promise<Word.Paragraph[]> {
+  const found: Word.Paragraph[] = [];
+  let current = start;
+  for (let i = 0; i < SAMPLE_RADIUS; i += 1) {
+    const next =
+      direction === "previous" ? current.getPreviousOrNullObject() : current.getNextOrNullObject();
+    await context.sync();
+    if (next.isNullObject) {
+      break;
+    }
+    found.push(next);
+    current = next;
+  }
+  return found;
+}
+
+async function loadFaces(
+  context: Word.RequestContext,
+  paragraphs: Word.Paragraph[]
+): Promise<FaceReading[]> {
+  for (const paragraph of paragraphs) {
+    paragraph.load("text,styleBuiltIn,alignment,tableNestingLevel");
+    paragraph.font.load("name,nameFarEast,size");
+  }
+  await context.sync();
+  return paragraphs.map((paragraph) => faceReading(paragraph));
+}
+
+async function spacingOf(
+  context: Word.RequestContext,
+  paragraph: Word.Paragraph
+): Promise<SampledParagraph["spacing"]> {
+  const ooxml = paragraph.getOoxml();
+  await context.sync();
+  const reading = readParagraphLineSpacing(ooxml.value || "");
+  if (reading.snapOff && (reading.line !== null || reading.lineRule !== null)) {
+    return { kind: "copy", line: reading.line, lineRule: reading.lineRule };
+  }
+  return { kind: "keep" };
+}
+
+async function resolveAtAnchor(
+  context: Word.RequestContext,
+  anchor: Word.Paragraph,
+  format: InsertFormatContext
+): Promise<ResolvedInsert> {
+  if (!format.hasBody) {
+    return resolveInsertFormats(format.user, [], 0, format.settings, false);
+  }
+  const backward = await stepParagraphs(context, anchor, "previous");
+  const towardStart = [...backward].reverse();
+  let paragraphs = [...towardStart, anchor];
+  let faces = await loadFaces(context, paragraphs);
+  const anchorIndex = towardStart.length;
+  if (nearestBodyIndex(faces, anchorIndex) === null) {
+    const forward = await stepParagraphs(context, anchor, "next");
+    if (forward.length) {
+      paragraphs = [...paragraphs, ...forward];
+      faces = await loadFaces(context, paragraphs);
+    }
+  }
+  const samples: SampledParagraph[] = faces.map((face) => ({ ...face, spacing: { kind: "keep" } }));
+  const chosen = new Map<number, SampledParagraph["spacing"]>();
+  const indexes = new Set<number>();
+  if (!format.user.lineSpacingChars) {
+    const bodyAt = nearestBodyIndex(faces, anchorIndex);
+    const titleAt = nearestTitleIndex(faces, anchorIndex, bodyAt === null ? null : faces[bodyAt].sizePt);
+    if (bodyAt !== null) {
+      indexes.add(bodyAt);
+    }
+    if (titleAt !== null) {
+      indexes.add(titleAt);
+    }
+  }
+  for (const index of indexes) {
+    chosen.set(index, await spacingOf(context, paragraphs[index]));
+  }
+  const withSpacing = samples.map((sample, index) =>
+    chosen.has(index) ? { ...sample, spacing: chosen.get(index)! } : sample
+  );
+  return resolveInsertFormats(format.user, withSpacing, anchorIndex, format.settings, true);
+}
+
+function nearestBodyIndex(faces: FaceReading[], anchorIndex: number): number | null {
+  return nearestFace(faces, anchorIndex, (face) => {
+    return (
+      Boolean(face.text.trim()) &&
+      face.sizePt > 0 &&
+      Boolean(face.name.trim() || face.nameFarEast.trim()) &&
+      !face.heading &&
+      !face.centered &&
+      !face.inTable
+    );
+  });
+}
+
+function nearestTitleIndex(faces: FaceReading[], anchorIndex: number, bodySize: number | null): number | null {
+  return nearestFace(faces, anchorIndex, (face) => {
+    if (!face.text.trim() || face.inTable || face.sizePt <= 0 || !(face.name.trim() || face.nameFarEast.trim())) {
+      return false;
+    }
+    if (face.centered) {
+      return true;
+    }
+    return bodySize !== null && face.sizePt > bodySize;
+  });
+}
+
+function nearestFace(
+  faces: FaceReading[],
+  anchorIndex: number,
+  accept: (face: FaceReading) => boolean
+): number | null {
+  let best: { index: number; distance: number } | null = null;
+  for (let index = 0; index < faces.length; index += 1) {
+    if (!accept(faces[index])) {
+      continue;
+    }
+    const distance = Math.abs(index - anchorIndex);
+    const before = index <= anchorIndex;
+    if (!best || distance < best.distance || (distance === best.distance && before && best.index > anchorIndex)) {
+      best = { index, distance };
+    }
+  }
+  return best ? best.index : null;
+}
+
 function styleParagraph(paragraph: Word.Paragraph, spec: ParagraphSpec): void {
   paragraph.alignment = alignmentOf(spec);
-  paragraph.font.name = spec.fontName;
-  paragraph.font.nameFarEast = spec.fontName;
-  paragraph.font.size = spec.fontSize;
+  if (spec.applyFont !== false) {
+    paragraph.font.name = spec.fontName;
+    paragraph.font.nameFarEast = spec.fontNameFarEast || spec.fontName;
+  }
+  if (spec.applySize !== false) {
+    paragraph.font.size = spec.fontSize;
+  }
   paragraph.font.bold = spec.bold;
-  paragraph.firstLineIndent = spec.firstLineIndentPt;
-  paragraph.leftIndent = spec.leftIndentPt;
-  paragraph.lineSpacing = spec.lineSpacingPt;
+  if (spec.applyIndent !== false) {
+    paragraph.firstLineIndent = spec.firstLineIndentPt;
+    paragraph.leftIndent = spec.leftIndentPt;
+  }
+  if ((spec.spacingKind ?? "exact") === "exact" && spec.lineSpacingPt > 0) {
+    paragraph.lineSpacing = spec.lineSpacingPt;
+  }
+}
+
+function wantsExactSpacing(spec: ParagraphSpec): boolean {
+  return (spec.spacingKind ?? "exact") === "exact" && spec.lineSpacingPt > 0;
 }
 
 /**
@@ -1412,11 +1764,18 @@ async function resolveInsertStart(
  * from it. Returns what the text landed after, which is how the model finds out
  * that `continue` had no anchor or that its quote pointed at the wrong clause.
  */
+export type InsertFormatContext = {
+  hasBody: boolean;
+  user: UserFormat;
+  settings: SettingsFormat;
+};
+
 export async function insertDraftParagraphs(
   specs: ParagraphSpec[],
   at: InsertAtArg = "cursor",
   quote = "",
-  paragraph?: number
+  paragraph?: number,
+  format?: InsertFormatContext
 ): Promise<InsertLanding> {
   const asked: InsertPlacement =
     paragraph !== undefined ? "paragraph" : quote.trim() ? "quote" : at;
@@ -1431,10 +1790,13 @@ export async function insertDraftParagraphs(
     resolved.paragraph.load("text");
     await context.sync();
     landing = { placement: resolved.placement, after: resolved.paragraph.text || "" };
+    const painted = format
+      ? paintSpecs(specs, await resolveAtAnchor(context, resolved.paragraph, format))
+      : specs;
     let current: Word.Paragraph = resolved.paragraph;
     const created: { paragraph: Word.Paragraph; spec: ParagraphSpec }[] = [];
 
-    for (const spec of specs) {
+    for (const spec of painted) {
       const text = specPlainText(spec) || "";
       const paragraph = current.insertParagraph(text, Word.InsertLocation.after);
       styleParagraph(paragraph, spec);
@@ -1444,12 +1806,19 @@ export async function insertDraftParagraphs(
 
     await context.sync();
 
-    if (created.some((entry) => entry.spec.lineSpacingPt > 0)) {
+    const exact = created.filter((entry) => wantsExactSpacing(entry.spec));
+    if (exact.length) {
       await rewriteParagraphOoxml(
         context,
-        created.map((entry) => entry.paragraph),
+        exact.map((entry) => entry.paragraph),
         { unsetLineGrid: true }
       );
+    }
+    const copies = created.filter(
+      (entry) => entry.spec.spacingKind === "copy" && entry.spec.spacingCopy
+    );
+    if (copies.length) {
+      await rewriteCopiedLineSpacing(context, copies);
     }
 
     for (const { paragraph, spec } of created) {
@@ -1867,6 +2236,50 @@ function paragraphOoxmlOptions(args: FormatParagraphArgs): ParagraphFormatOption
  * Office.js cannot clear those flags, so the paragraph OOXML is patched instead.
  * Tracking is off for the rewrite so the clause is not recorded as delete+insert.
  */
+async function rewriteCopiedLineSpacing(
+  context: Word.RequestContext,
+  created: { paragraph: Word.Paragraph; spec: ParagraphSpec }[]
+): Promise<void> {
+  const reads = created.map((entry) => ({
+    entry,
+    ooxml: entry.paragraph.getOoxml(),
+  }));
+  await context.sync();
+  const writes: { paragraph: Word.Paragraph; ooxml: string }[] = [];
+  for (const read of reads) {
+    const copy = read.entry.spec.spacingCopy;
+    if (!copy) {
+      continue;
+    }
+    const patched = patchParagraphFormat(read.ooxml.value || "", {
+      unsetLineGrid: true,
+      lineCopy: copy,
+    });
+    if (patched.changed) {
+      writes.push({ paragraph: read.entry.paragraph, ooxml: patched.ooxml });
+    }
+  }
+  if (!writes.length) {
+    return;
+  }
+  context.document.changeTrackingMode = Word.ChangeTrackingMode.off;
+  try {
+    for (const write of writes) {
+      write.paragraph.insertOoxml(write.ooxml, Word.InsertLocation.replace);
+    }
+    await context.sync();
+  } catch {
+    // The point size still stands. The sample's line rule could not be copied.
+  } finally {
+    startTracking(context);
+  }
+  try {
+    await context.sync();
+  } catch {
+    // The next edit turns tracking back on.
+  }
+}
+
 async function rewriteParagraphOoxml(
   context: Word.RequestContext,
   paragraphs: Word.Paragraph[],

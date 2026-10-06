@@ -17,11 +17,12 @@ import {
   readDocumentText,
   readParagraphs,
   replaceQuote,
+  replaceSelection,
 } from "./word";
 
 /* global globalThis */
 
-type Replacement = { target: string; text: string };
+type Replacement = { target: string; text: string; where?: string };
 
 function countOccurrences(haystack: string, needle: string): number {
   if (!needle) {
@@ -76,6 +77,8 @@ type WordOptions = {
   pageIndex?: number;
   /** Per-paragraph tracked changes for resolveTarget deletion checks. */
   paragraphChanges?: FakeChange[][];
+  /** When set, the selection covers these paragraphs, in order. */
+  selectionParagraphs?: string[];
 };
 
 /**
@@ -105,6 +108,7 @@ type FakeParagraph = {
   restyleOnOutline: boolean;
   ignoreOutline: boolean;
   font: { bold: boolean; name: string; nameFarEast: string; size: number };
+  lineSpacing?: number;
   delete: () => void;
 };
 
@@ -118,27 +122,81 @@ function installWord(options: WordOptions): {
   const replacements: Replacement[] = [];
   const comments: string[] = [];
 
-  const stripSpace = (value: string) => value.replace(/[\s\u3000]/g, "");
-  const makeRange = (text: string) => ({
-    text,
+  const revisionsFilter = {
+    markup: "All",
+    view: "Final",
     load: () => undefined,
-    insertText: (value: string) => replacements.push({ target: text, text: value }),
-    insertComment: (value: string) => comments.push(value),
-    // Word's own ignoreSpace is what runs in production; here it only has to
-    // prove the second pass happens and the first one is preferred.
-    pages:
-      options.pageIndex === undefined
-        ? undefined
-        : { load: () => undefined, items: [{ index: options.pageIndex }] },
-    search: (needle: string, options?: { ignoreSpace?: boolean }) => {
-      const haystack = options?.ignoreSpace ? stripSpace(text) : text;
-      const target = options?.ignoreSpace ? stripSpace(needle) : needle;
-      return {
+  };
+  const stripSpace = (value: string) => value.replace(/[\s\u3000]/g, "");
+  const makeRange = (text: string) => {
+    const chars = Array.from(text);
+    const offsets: number[] = [0];
+    for (const ch of chars) {
+      offsets.push(offsets[offsets.length - 1] + ch.length);
+    }
+    const slice = (start: number, end: number): ReturnType<typeof makeRange> => {
+      const value = text.slice(offsets[start], offsets[end]);
+      const range = {
+        text: value,
+        startIndex: start,
+        endIndex: end,
         load: () => undefined,
-        items: Array.from({ length: countOccurrences(haystack, target) }, () => makeRange(needle)),
+        insertText: (inserted: string, where?: string) => {
+          const anchor =
+            value ||
+            (where === "Before" ? chars[start] || "" : where === "After" ? chars[end - 1] || "" : "");
+          replacements.push(
+            where && where !== "Replace"
+              ? { target: anchor, text: inserted, where }
+              : { target: value, text: inserted }
+          );
+        },
+        delete: () => {
+          replacements.push({ target: value, text: "", where: "Delete" });
+        },
+        insertComment: (commentText: string) => comments.push(commentText),
+        getRange: (loc?: string) => {
+          if (loc === "Start") {
+            return slice(start, start);
+          }
+          if (loc === "End") {
+            return slice(end, end);
+          }
+          return slice(start, end);
+        },
+        expandTo: (other: { startIndex?: number; endIndex?: number }) => {
+          if (typeof other.startIndex === "number" && typeof other.endIndex === "number") {
+            return slice(Math.min(start, other.startIndex), Math.max(end, other.endIndex));
+          }
+          return slice(start, end);
+        },
+        getReviewedText: () => ({ value: value.replace(/\r$/, "") }),
+        pages:
+          options.pageIndex === undefined
+            ? undefined
+            : { load: () => undefined, items: [{ index: options.pageIndex }] },
+        // Word's own ignoreSpace is what runs in production; here it only has to
+        // prove the second pass happens and the first one is preferred.
+        search: (needle: string, searchOptions?: { ignoreSpace?: boolean; matchWildcards?: boolean }) => {
+          if (searchOptions?.matchWildcards && needle === "?") {
+            const items = [];
+            for (let i = start; i < end; i += 1) {
+              items.push(slice(i, i + 1));
+            }
+            return { load: () => undefined, items };
+          }
+          const haystack = searchOptions?.ignoreSpace ? stripSpace(value) : value;
+          const target = searchOptions?.ignoreSpace ? stripSpace(needle) : needle;
+          return {
+            load: () => undefined,
+            items: Array.from({ length: countOccurrences(haystack, target) }, () => makeRange(needle)),
+          };
+        },
       };
-    },
-  });
+      return range;
+    };
+    return slice(0, chars.length);
+  };
 
   const getComments = () => {
     if (options.commentsFail) {
@@ -288,11 +346,14 @@ function installWord(options: WordOptions): {
       attachToList: (id: number, level: number) => void;
       separateList: () => void;
       insertParagraph: (value: string, _where: string) => unknown;
+      getPreviousOrNullObject: () => unknown;
+      getNextOrNullObject: () => unknown;
+      tableNestingLevel: number;
       select: () => undefined;
       alignment: string;
       firstLineIndent: number;
       leftIndent: number;
-      font: { bold: boolean; name: string; nameFarEast: string; size: number };
+      font: { bold: boolean; name: string; nameFarEast: string; size: number; load: () => void };
     } = {
       get text() {
         return state.text;
@@ -320,8 +381,16 @@ function installWord(options: WordOptions): {
           text: change.text,
         })),
       }),
-      getRange: () => ({
-        ...makeRange(state.text),
+      getRange: () => {
+        const raw = makeRange(state.text);
+        const accepted = makeRange(`${reviewedText}\r`);
+        return {
+          ...raw,
+          getReviewedText: () => ({ value: reviewedText }),
+          search: (
+            needle: string,
+            searchOptions?: { ignoreSpace?: boolean; matchWildcards?: boolean }
+          ) => (revisionsFilter.markup === "None" ? accepted : raw).search(needle, searchOptions),
         // Which paragraph this range covers, for compareLocationWith.
         owner: state,
         compareLocationWith: (other: { owner?: unknown }) => ({
@@ -344,7 +413,8 @@ function installWord(options: WordOptions): {
           getFirst: () => paragraph,
           getLast: () => paragraph,
         },
-      }),
+      };
+      },
       paragraphs: { load: () => undefined, items: [] },
       get listItemOrNullObject() {
         return {
@@ -397,6 +467,21 @@ function installWord(options: WordOptions): {
         state.listId = nextListId++;
         state.listString = "1.";
       },
+      getPreviousOrNullObject: () => {
+        const index = bodyParagraphs.indexOf(paragraph);
+        if (index <= 0) {
+          return { isNullObject: true };
+        }
+        return bodyParagraphs[index - 1];
+      },
+      getNextOrNullObject: () => {
+        const index = bodyParagraphs.indexOf(paragraph);
+        if (index < 0 || index + 1 >= bodyParagraphs.length) {
+          return { isNullObject: true };
+        }
+        return bodyParagraphs[index + 1];
+      },
+      tableNestingLevel: 0,
       insertParagraph: (value: string, where: string) => {
         const created = makeParagraph(`${value}\r`, null);
         created.styleBuiltIn = paragraph.styleBuiltIn;
@@ -430,7 +515,8 @@ function installWord(options: WordOptions): {
       spaceAfter: 0,
       lineUnitBefore: 0,
       lineUnitAfter: 0,
-      font: { bold: false, name: "", nameFarEast: "", size: 12 },
+      font: { bold: false, name: "", nameFarEast: "", size: 12, load: () => undefined },
+      lineSpacing: undefined,
       get outlineLevel() {
         return state.outlineLevel;
       },
@@ -509,19 +595,23 @@ function installWord(options: WordOptions): {
     return bodyParagraphs;
   };
 
-  const selectionParagraphs = options.selection.trim()
-    ? [
-        makeParagraph(
-          options.selection,
-          options.listStrings && options.paragraphs
-            ? (options.listStrings[options.paragraphs.indexOf(options.selection)] ?? null)
-            : null
-        ),
-      ]
-    : [];
+  const selectionParts = options.selectionParagraphs;
+  const selectionText = selectionParts ? selectionParts.join("\r") : options.selection;
+  const selectionParagraphs = selectionParts
+    ? selectionParts.map((text) => makeParagraph(text.endsWith("\r") ? text : `${text}\r`))
+    : options.selection.trim()
+      ? [
+          makeParagraph(
+            options.selection,
+            options.listStrings && options.paragraphs
+              ? (options.listStrings[options.paragraphs.indexOf(options.selection)] ?? null)
+              : null
+          ),
+        ]
+      : [];
 
   const selection = {
-    ...makeRange(options.selection),
+    ...makeRange(selectionText),
     getComments,
     getTrackedChanges,
     paragraphs: {
@@ -613,6 +703,11 @@ function installWord(options: WordOptions): {
   const context = {
     document: {
       changeTrackingMode: "",
+      activeWindow: {
+        view: {
+          revisionsFilter,
+        },
+      },
       getSelection: () => selection,
       body,
       getBookmarkRangeOrNullObject: () =>
@@ -639,6 +734,7 @@ function installWord(options: WordOptions): {
     ChangeTrackingMode: { trackAll: "trackAll", off: "off" },
     ChangeTrackingVersion: { current: "Current", original: "Original" },
     InsertLocation: { replace: "Replace", after: "After", before: "Before" },
+    RangeLocation: { start: "Start", end: "End", content: "Content" },
     BuiltInStyleName: { normal: "Normal" },
     SelectionMode: { end: "End" },
     Alignment: { centered: "Centered", left: "Left", right: "Right", justified: "Justified" },
@@ -694,7 +790,7 @@ describe("quote targeting", () => {
     const word = installWord({ selection: "", body: "第1条 定義する。第2条 報酬を支払う。" });
     await replaceQuote({ quote: "報酬を支払う", text: "報酬を翌月末までに支払う" });
     expect(word.replacements).toEqual([
-      { target: "報酬を支払う", text: "報酬を翌月末までに支払う" },
+      { target: "支", text: "翌月末までに", where: "Before" },
     ]);
   });
 
@@ -721,7 +817,7 @@ describe("quote targeting", () => {
   it("falls back to a space-insensitive search for a clause label", async () => {
     const word = installWord({ selection: "", body: "第12条　（協議）　甲乙は協議する。" });
     await replaceQuote({ quote: "第12条（協議）", text: "第13条（協議）" });
-    expect(word.replacements).toEqual([{ target: "第12条（協議）", text: "第13条（協議）" }]);
+    expect(word.replacements).toEqual([{ target: "2", text: "3" }]);
   });
 
   it("prefers an exact match over the space-insensitive one", async () => {
@@ -812,7 +908,124 @@ describe("paragraph targeting", () => {
     const word = installWord({ selection: "", body: "", paragraphs: [...body] });
     await readDocumentText(1_000);
     await replaceQuote({ paragraph: 3, quote: "100万円", text: "150万円" });
-    expect(word.replacements).toEqual([{ target: "100万円", text: "150万円" }]);
+    expect(word.replacements).toEqual([{ target: "0", text: "5" }]);
+  });
+
+  it("records only the changed words when a paragraph number replaces the whole line", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["甲と乙は、期間経過後2年間は、第三者に開示してはならない。"],
+    });
+    await readDocumentText(1_000);
+    const note = await replaceQuote({
+      paragraph: 1,
+      quote: "",
+      text: "甲と乙は、期間経過後においても、第三者に開示してはならない。",
+    });
+    expect(word.replacements).toEqual([{ target: "2年間は", text: "においても" }]);
+    expect(note).toContain("違った部分だけ");
+    expect(word.replacements.every((item) => !item.target.includes("\r"))).toBe(true);
+  });
+
+  it("does not record an ideographic space the model copied", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["第11条　甲は乙に支払う。"],
+    });
+    await readDocumentText(1_000);
+    await replaceQuote({
+      paragraph: 1,
+      quote: "",
+      text: "第11条　甲は丙に支払う。",
+    });
+    expect(word.replacements).toEqual([{ target: "乙", text: "丙" }]);
+  });
+
+  it("writes nothing when the replacement is the same text", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["甲と乙は協議する。"],
+    });
+    await readDocumentText(1_000);
+    const note = await replaceQuote({ paragraph: 1, quote: "", text: "甲と乙は協議する。" });
+    expect(word.replacements).toEqual([]);
+    expect(note).toContain("同じだった");
+  });
+
+  it("writes a change on either side of a tracked deletion", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["甲は乙削除に支払う。"],
+      reviewedParagraphs: ["甲は乙に支払う。"],
+    });
+    await readDocumentText(1_000);
+    const away = await replaceQuote({ paragraph: 1, quote: "", text: "丙は乙に支払う。" });
+    expect(word.replacements).toEqual([{ target: "甲", text: "丙" }]);
+    expect(away).toContain("違った部分だけ");
+
+    word.replacements.length = 0;
+    const otherSide = await replaceQuote({ paragraph: 1, quote: "", text: "甲は乙に渡す。" });
+    expect(word.replacements).toEqual([{ target: "支払う", text: "渡す" }]);
+    expect(otherSide).toContain("違った部分だけ");
+  });
+
+  it("writes nothing when the change covers a tracked deletion", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["甲は乙削除に支払う。"],
+      reviewedParagraphs: ["甲は乙に支払う。"],
+    });
+    await readDocumentText(1_000);
+    await expect(replaceQuote({ paragraph: 1, quote: "", text: "甲は丙へ支払う。" })).rejects.toThrow(
+      /既存の変更履歴に重なります/
+    );
+    expect(word.replacements).toEqual([]);
+  });
+
+  it("writes nothing when the accepted text is not the raw text minus deletions", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["支払額は100万円とする。"],
+      reviewedParagraphs: ["支払額は<100万円>とする。"],
+    });
+    await readDocumentText(1_000);
+    await expect(
+      replaceQuote({ paragraph: 1, quote: "", text: "支払額は<150万円>とする。" })
+    ).rejects.toThrow(/校閲でこの範囲の履歴を確定してから/);
+    expect(word.replacements).toEqual([]);
+  });
+
+  it("writes nothing when the replacement matches the text with the deletion accepted", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["甲は乙削除に支払う。"],
+      reviewedParagraphs: ["甲は乙に支払う。"],
+    });
+    await readDocumentText(1_000);
+    const note = await replaceQuote({ paragraph: 1, quote: "", text: "甲は乙に支払う。" });
+    expect(word.replacements).toEqual([]);
+    expect(note).toContain("同じだった");
+  });
+
+  it("replaces the whole selection when it spans paragraphs", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["甲は委託する。", "乙は受託する。"],
+      selectionParagraphs: ["甲は委託する。", "乙は受託する。"],
+    });
+    const note = await replaceSelection("甲は委任し、乙は受任する。");
+    expect(word.replacements).toEqual([
+      { target: "甲は委託する。\r乙は受託する。", text: "甲は委任し、乙は受任する。" },
+    ]);
+    expect(note).toContain("段落をまたぐ");
   });
 
   it("comments on the whole paragraph when the narrowing quote misses, and says so", async () => {
@@ -863,7 +1076,7 @@ describe("paragraph targeting", () => {
     const word = installWord({ selection: "", body: "", paragraphs: [...body] });
     await readDocumentText(1_000);
     await replaceQuote({ paragraph: 3, quote: "[3] 100万円", text: "150万円" });
-    expect(word.replacements).toEqual([{ target: "100万円", text: "150万円" }]);
+    expect(word.replacements).toEqual([{ target: "0", text: "5" }]);
   });
 });
 
@@ -1273,7 +1486,8 @@ describe("list marks on the attachment", () => {
       text: "丙は丁に委託する。",
     });
     expect(word.replacements).toEqual([
-      { target: "甲は乙に委託する。", text: "丙は丁に委託する。" },
+      { target: "乙", text: "丁" },
+      { target: "甲", text: "丙" },
     ]);
   });
 
@@ -1287,7 +1501,8 @@ describe("list marks on the attachment", () => {
     await readDocumentText(1_000);
     await replaceQuote({ paragraph: 1, quote: "1. 甲は乙に委託する。", text: "丙は丁に委託する。" });
     expect(word.replacements).toEqual([
-      { target: "甲は乙に委託する。", text: "丙は丁に委託する。" },
+      { target: "乙", text: "丁" },
+      { target: "甲", text: "丙" },
     ]);
   });
 
@@ -1318,7 +1533,8 @@ describe("list marks on the attachment", () => {
       text: "1. 丙は丁に委託する。",
     });
     expect(word.replacements).toEqual([
-      { target: "甲は乙に委託する。", text: "丙は丁に委託する。" },
+      { target: "乙", text: "丁" },
+      { target: "甲", text: "丙" },
     ]);
   });
 
@@ -2145,6 +2361,61 @@ describe("deleteParagraphs", () => {
 
     expect(note).toContain("削除済み");
     expect(word.getTracking()).toBe("");
+  });
+});
+
+describe("insert format priority", () => {
+  const settings = { fontName: "游明朝", bodyPt: 12, titlePt: 16, lineSpacingChars: 1 as const };
+
+  it("keeps the nearby font when the user asks only for a size", async () => {
+    const word = installWord({ selection: "", body: "", paragraphs: ["前文です。"] });
+    word.paragraphs[0].font.name = "游ゴシック";
+    word.paragraphs[0].font.nameFarEast = "游ゴシック";
+    word.paragraphs[0].font.size = 10.5;
+    await insertDraftParagraphs(
+      mapBlocks([{ type: "body", text: "続きです。" }]),
+      "end",
+      "",
+      undefined,
+      { hasBody: true, user: { bodyPt: 14 }, settings }
+    );
+    const created = word.paragraphs[word.paragraphs.length - 1];
+    expect(created.font.name).toBe("游ゴシック");
+    expect(created.font.nameFarEast).toBe("游ゴシック");
+    expect(created.font.size).toBe(14);
+    expect(created.lineSpacing).toBeUndefined();
+    expect(created.firstLineIndent).toBe(0);
+  });
+
+  it("leaves the face unset when the document has text but no readable font", async () => {
+    const word = installWord({ selection: "", body: "", paragraphs: ["前文です。"] });
+    await insertDraftParagraphs(
+      mapBlocks([{ type: "body", text: "続きです。" }]),
+      "end",
+      "",
+      undefined,
+      { hasBody: true, user: {}, settings }
+    );
+    const created = word.paragraphs[word.paragraphs.length - 1];
+    expect(created.font.name).toBe("");
+    expect(created.font.size).toBe(12);
+    expect(created.lineSpacing).toBeUndefined();
+  });
+
+  it("uses settings on an empty document, including a requested size", async () => {
+    const word = installWord({ selection: "", body: "", paragraphs: [""] });
+    await insertDraftParagraphs(
+      mapBlocks([{ type: "body", text: "最初の段落です。" }]),
+      "cursor",
+      "",
+      undefined,
+      { hasBody: false, user: { bodyPt: 14 }, settings }
+    );
+    const created = word.paragraphs[word.paragraphs.length - 1];
+    expect(created.font.name).toBe("游明朝");
+    expect(created.font.size).toBe(14);
+    expect(created.lineSpacing).toBe(14);
+    expect(created.firstLineIndent).toBe(14);
   });
 });
 

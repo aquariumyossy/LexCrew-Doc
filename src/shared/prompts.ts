@@ -12,6 +12,8 @@ export type PromptOptions = {
   titlePt: number;
   /** Line box in ems of each paragraph's font. 1字 equals that font size. */
   lineSpacingChars: number;
+  /** The open document already has body text to match. */
+  hasBody?: boolean;
   /** SearXNG が未設定ならウェブ検索の案内を出さない。 */
   search: boolean;
   /** Argos が未設定なら索引検索の案内を出さない。 */
@@ -40,6 +42,21 @@ export type PromptOptions = {
  * One system prompt for the whole chat. Operations are described by the `tools`
  * array, not here, so this only carries the house rules.
  */
+function formatPriorityLine(options: PromptOptions): string {
+  const settings = `設定の既定は本文 ${options.bodyPt}pt、タイトル ${options.titlePt}pt、フォントは ${options.fontName}、行間は ${options.lineSpacingChars}字です。1字はその段落の文字サイズと同じ行の高さです。`;
+  const order =
+    "新しく入れる段落のフォント、文字の大きさ、行間は、利用者がチャットで指定した項目、開いている文書の本文、設定の既定、の順です。" +
+    "指定した項目だけを insert_blocks の fontName、bodyPt、titlePt、lineSpacingChars に入れます。入れなかった項目は指定ではありません。";
+  if (options.hasBody) {
+    return (
+      order +
+      "この文書には本文があります。指定が無い項目は本文に合わせ、設定の数値では書きません。利用者が設定どおりと言ったときだけ、設定の数値を引数に写します。" +
+      settings
+    );
+  }
+  return order + "この文書に本文はありません。指定が無い項目は設定に合わせます。" + settings;
+}
+
 export function systemPrompt(options: PromptOptions): string {
   const lines = [
     "あなたは Word で日本語の法律文書を書く人を手伝うアシスタントです。訴状・準備書面・契約書などの種別は、指示と本文から読み取ってください。",
@@ -56,7 +73,7 @@ export function systemPrompt(options: PromptOptions): string {
     "書き言葉はすべて日本語にします。簡体字・繁体字・旧字体や日本語にない漢字、ハングル・キリル文字などの他の文字体系は、本文・コメント・チャットの報告・ツールの引数にも使いません。「기타」のような他言語の単語を日本語の文の中に混ぜません。",
     "英語を使うのは、CITES・ISO のような略語、固有名詞、出典の URL に限ります。日本語の語の代わりに英単語を置きません（「離脱権をEnsureする」「detailed な条項」のような書き方をしません）。ツールに渡す前に、自分の文が日本語だけで書けているか読み返します。",
     "文書への変更はすべて Word の修正履歴に残るので、利用者があとから取り消せます。",
-    `既定の書式は本文 ${options.bodyPt}pt、タイトル ${options.titlePt}pt、フォントは ${options.fontName}、行間は ${options.lineSpacingChars}字です。1字はその段落の文字サイズと同じ行の高さです。指定がなければこれに合わせます。`,
+    formatPriorityLine(options),
     "表・罫線・ページ余白は操作できません。頼まれたらできない旨を伝えます。",
     `指示と一緒に、いまの文書の本文が「${DOCUMENT_MARKER}」として渡されます。末尾に途中までと書かれていたら、その先は渡されていません。`,
     `「${SELECTION_MARKER}」があれば、利用者がいま選んでいるところです。場所の指示が無ければ、まずそこを見ます。`,

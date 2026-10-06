@@ -275,6 +275,28 @@ describe("parseToolArguments", () => {
     expect(parseToolArguments(TOOL_INSERT_BLANK_BEFORE, '{"paragraphs":[0]}').ok).toBe(false);
   });
 
+  it("rejects a non-positive size and an unknown line spacing on insert_blocks", () => {
+    expect(
+      parseToolArguments(TOOL_INSERT_BLOCKS, '{"blocks":[{"type":"body","text":"本文"}],"bodyPt":0}').ok
+    ).toBe(false);
+    expect(
+      parseToolArguments(
+        TOOL_INSERT_BLOCKS,
+        '{"blocks":[{"type":"body","text":"本文"}],"lineSpacingChars":3}'
+      ).ok
+    ).toBe(false);
+    const result = parseToolArguments(
+      TOOL_INSERT_BLOCKS,
+      '{"blocks":[{"type":"body","text":"本文"}],"bodyPt":14,"fontName":"游ゴシック"}'
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.call.name === TOOL_INSERT_BLOCKS) {
+      expect(result.call.args.bodyPt).toBe(14);
+      expect(result.call.args.fontName).toBe("游ゴシック");
+      expect(result.call.args.titlePt).toBeUndefined();
+    }
+  });
+
   it("drops malformed blocks but keeps usable ones", () => {
     const result = parseToolArguments(
       TOOL_INSERT_BLOCKS,

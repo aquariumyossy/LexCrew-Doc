@@ -1,4 +1,5 @@
 import { BLOCK_TYPES, DraftBlock, Severity, normalizeBlock } from "./blocks";
+import { LINE_SPACING_CHARS, LineSpacingChars } from "./constants";
 import { ListStyle, isListStyle, listStyleEnum, listStyleToolDescription } from "./listStyles";
 
 export type { ListStyle } from "./listStyles";
@@ -105,6 +106,11 @@ export type InsertBlocksArgs = {
   at?: InsertAtArg;
   quote?: string;
   paragraph?: number;
+  /** Set only when the user asked for that property. */
+  fontName?: string;
+  bodyPt?: number;
+  titlePt?: number;
+  lineSpacingChars?: LineSpacingChars;
 };
 export type InsertBlankBeforeArgs = { paragraphs: number[] };
 export type InsertCommentArgs = {
@@ -316,8 +322,9 @@ function replaceSelectionTool(): ToolDefinition {
     function: {
       name: TOOL_REPLACE_SELECTION,
       description:
-        "選択範囲をプレーンテキストで置き換える。修正履歴に残る。" +
-        "太字や表は消えるので、書式を残したいときは format_text / format_paragraph を使う。",
+        "選択範囲を、渡した全文で置き換える。履歴に残るのは、そのうち実際に違った部分だけです。" +
+        "変わった数語だけを渡すと、残りの文が削除になります。段落をまたぐ選択は、範囲全体が一つの履歴になります。" +
+        "変わった部分の太字は消えるので、書式を残したいときは format_text / format_paragraph を使う。",
       parameters: {
         type: "object",
         properties: { text: stringParam("置換後の本文") },
@@ -333,9 +340,11 @@ function replaceQuoteTool(target: TargetHints, numbered: boolean): ToolDefinitio
     function: {
       name: TOOL_REPLACE_QUOTE,
       description:
-        "本文の特定の文字列だけを置き換える。修正履歴に残る。書き換えの基本はこのツール。" +
+        "本文の範囲を、渡した全文で置き換える。書き換えの基本はこのツール。" +
+        "履歴に残るのは、範囲のうち実際に違った部分だけです。text はその範囲の置換後全文です。" +
+        "変わった数語だけを渡すと、残りの文が削除になります。" +
         (numbered
-          ? "paragraph で段落を指し、quote でその段落の中の置き換える文字列を渡す。quote を省くと段落全体を置き換える。"
+          ? "paragraph で段落を指します。quote でその中の範囲を絞れます。quote を省くと段落全体が範囲になります。"
           : "選択があればその中を先に探し、無ければ本文全体から探す。"),
       parameters: {
         type: "object",
@@ -369,7 +378,8 @@ function insertBlocksTool(numbered: boolean): ToolDefinition {
         "item は項・号（直前がリストなら番号を継ぐ。番号そのものは本文に書かない）、" +
         "center は日付など、right は当事者名など。表・罫線・余白は出さない。" +
         "番号の付け外しと 1 からの振り直しは format_list。" +
-        "結果に、入れた段落の番号 [12] が返る。同じターンでその段落を指すときは、quote ではなくその番号を paragraph / through に渡す。",
+        "結果に、入れた段落の番号 [12] が返る。同じターンでその段落を指すときは、quote ではなくその番号を paragraph / through に渡す。" +
+        "fontName、bodyPt、titlePt、lineSpacingChars は、利用者がその項目をチャットで指定したときだけ入れる。空欄は設定で埋める指示ではない。行間の pt 指定は format_paragraph に残す。",
       parameters: {
         type: "object",
         properties: {
@@ -405,6 +415,20 @@ function insertBlocksTool(numbered: boolean): ToolDefinition {
             enum: ["cursor", "continue", "end"],
             description:
               "cursor はカーソル直後、continue は直前の挿入の続き、end は文書末尾。分割した続きは continue。quote があるときは見ない。",
+          },
+          fontName: stringParam("利用者が指定したフォント名。指定が無いときは省略する。"),
+          bodyPt: {
+            type: "number",
+            description: "利用者が指定した本文の大きさ（pt）。指定が無いときは省略する。",
+          },
+          titlePt: {
+            type: "number",
+            description: "利用者が指定したタイトルの大きさ（pt）。本文の大きさとは別に、指定が無いときは省略する。",
+          },
+          lineSpacingChars: {
+            type: "number",
+            enum: [...LINE_SPACING_CHARS],
+            description: "利用者が指定した行間（字）。1、1.25、1.5、2。指定が無いときは省略する。",
           },
         },
         required: ["blocks"],
@@ -866,6 +890,39 @@ function optionalString(row: Record<string, unknown>, key: string): string | und
   return typeof value === "string" ? value : undefined;
 }
 
+function optionalPositive(
+  row: Record<string, unknown>,
+  key: string
+): number | undefined | { error: string } {
+  if (row[key] === undefined || row[key] === null || row[key] === "") {
+    return undefined;
+  }
+  const value = typeof row[key] === "number" ? row[key] : Number(row[key]);
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return { error: `${key} は正の数にしてください。` };
+  }
+  return value;
+}
+
+function optionalLineSpacing(
+  row: Record<string, unknown>
+): LineSpacingChars | undefined | { error: string } {
+  if (
+    row.lineSpacingChars === undefined ||
+    row.lineSpacingChars === null ||
+    row.lineSpacingChars === ""
+  ) {
+    return undefined;
+  }
+  const value =
+    typeof row.lineSpacingChars === "number" ? row.lineSpacingChars : Number(row.lineSpacingChars);
+  const found = LINE_SPACING_CHARS.find((chars) => chars === value);
+  if (found === undefined) {
+    return { error: "lineSpacingChars は 1、1.25、1.5、2 のいずれかです。" };
+  }
+  return found;
+}
+
 /**
  * A paragraph number must be a real address. A zero, a fraction or a stray
  * string would otherwise land on a paragraph the model did not mean.
@@ -1217,6 +1274,19 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
           error: "blocks に有効な段落がありません。type と text を入れてください。",
         };
       }
+      const fontName = optionalString(row, "fontName")?.trim();
+      const bodyPt = optionalPositive(row, "bodyPt");
+      if (isArgError(bodyPt)) {
+        return { ok: false, error: bodyPt.error };
+      }
+      const titlePt = optionalPositive(row, "titlePt");
+      if (isArgError(titlePt)) {
+        return { ok: false, error: titlePt.error };
+      }
+      const lineSpacingChars = optionalLineSpacing(row);
+      if (isArgError(lineSpacingChars)) {
+        return { ok: false, error: lineSpacingChars.error };
+      }
       return {
         ok: true,
         call: {
@@ -1226,6 +1296,10 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
             ...(at ? { at } : {}),
             ...(quote ? { quote } : {}),
             ...(paragraph === undefined ? {} : { paragraph }),
+            ...(fontName ? { fontName } : {}),
+            ...(bodyPt === undefined ? {} : { bodyPt }),
+            ...(titlePt === undefined ? {} : { titlePt }),
+            ...(lineSpacingChars === undefined ? {} : { lineSpacingChars }),
           },
         },
       };

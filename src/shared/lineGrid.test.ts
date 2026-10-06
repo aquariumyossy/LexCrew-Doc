@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { patchParagraphFormat, unsetParagraphLineGrid } from "./lineGrid";
+import { patchParagraphFormat, readParagraphLineSpacing, unsetParagraphLineGrid } from "./lineGrid";
 
 const SNAP_ON = '<w:snapToGrid w:val="1"/>';
 const SNAP_OFF = '<w:snapToGrid w:val="0"/>';
@@ -213,5 +213,35 @@ describe("patchParagraphFormat indent", () => {
     });
     expect(result.changed).toBe(false);
     expect(result.ooxml).toBe(xml);
+  });
+});
+
+describe("readParagraphLineSpacing", () => {
+  it("reads an explicit snap-off and the line rule", () => {
+    const xml = documentXml(
+      `<w:p><w:pPr>${SNAP_OFF}<w:spacing w:line="360" w:lineRule="auto"/></w:pPr><w:r><w:t>本文</w:t></w:r></w:p>`
+    );
+    expect(readParagraphLineSpacing(xml)).toEqual({
+      snapOff: true,
+      line: "360",
+      lineRule: "auto",
+    });
+  });
+
+  it("treats a missing snap flag as still on the grid", () => {
+    const xml = documentXml(`<w:p><w:pPr><w:spacing w:line="240" w:lineRule="exact"/></w:pPr><w:r><w:t>本文</w:t></w:r></w:p>`);
+    expect(readParagraphLineSpacing(xml).snapOff).toBe(false);
+  });
+
+  it("copies the sample line rule onto a paragraph and turns the grid off", () => {
+    const xml = documentXml("<w:p><w:r><w:t>続き</w:t></w:r></w:p>");
+    const result = patchParagraphFormat(xml, {
+      unsetLineGrid: true,
+      lineCopy: { line: "360", lineRule: "auto" },
+    });
+    expect(result.changed).toBe(true);
+    expect(result.ooxml).toContain(SNAP_OFF);
+    expect(result.ooxml).toContain('w:line="360"');
+    expect(result.ooxml).toContain('w:lineRule="auto"');
   });
 });

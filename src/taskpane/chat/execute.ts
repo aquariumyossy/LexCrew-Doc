@@ -70,6 +70,8 @@ export type ExecuteOptions = {
   argosPathPrefixes?: string[];
   /** Characters this read may return without exceeding the tool-result share. */
   indexedReadChars?: number;
+  /** The open document already has body text, so settings are not the default face. */
+  hasBody?: boolean;
 };
 
 function failed(message: string): ToolOutcome {
@@ -215,9 +217,10 @@ export async function executeToolCall(
         };
       }
 
-      case TOOL_REPLACE_SELECTION:
-        await replaceSelection(invocation.args.text);
-        return { content: "選択範囲を置き換えました（変更履歴に記録）。", ok: true };
+      case TOOL_REPLACE_SELECTION: {
+        const note = await replaceSelection(invocation.args.text);
+        return { content: withNote("選択範囲を置き換えました（変更履歴に記録）。", note), ok: true };
+      }
 
       case TOOL_REPLACE_QUOTE: {
         const note = await replaceQuote(invocation.args);
@@ -240,7 +243,22 @@ export async function executeToolCall(
           specs,
           at,
           invocation.args.quote,
-          invocation.args.paragraph
+          invocation.args.paragraph,
+          {
+            hasBody: extras.hasBody === true,
+            user: {
+              fontName: invocation.args.fontName,
+              bodyPt: invocation.args.bodyPt,
+              titlePt: invocation.args.titlePt,
+              lineSpacingChars: invocation.args.lineSpacingChars,
+            },
+            settings: {
+              fontName: settings.fontName,
+              bodyPt: settings.bodyPt,
+              titlePt: settings.titlePt,
+              lineSpacingChars: settings.lineSpacingChars,
+            },
+          }
         );
         return {
           content: summarizeInsertedBlocks(invocation.args.blocks, landing),

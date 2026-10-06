@@ -14,11 +14,24 @@ export type IndentFormat = {
   fontPt: number;
 };
 
+export type LineSpacingCopy = {
+  line: string | null;
+  lineRule: string | null;
+};
+
 export type ParagraphFormatOptions = {
   unsetLineGrid?: boolean;
   spaceBeforePt?: number;
   spaceAfterPt?: number;
   indent?: IndentFormat;
+  /** Copy `w:line` / `w:lineRule` from a sample paragraph. */
+  lineCopy?: LineSpacingCopy;
+};
+
+export type ParagraphLineSpacing = {
+  snapOff: boolean;
+  line: string | null;
+  lineRule: string | null;
 };
 
 /**
@@ -36,6 +49,66 @@ export function unsetParagraphLineGrid(ooxml: string): LineGridPatch {
  * and character-unit indent (`w:leftChars` / `w:hangingChars`) that
  * overrides the point values on Japanese Word.
  */
+/**
+ * Direct line spacing of the first paragraph. Snap is off only when the
+ * paragraph says so. A missing flag means the document grid still applies.
+ */
+export function readParagraphLineSpacing(ooxml: string): ParagraphLineSpacing {
+  const none: ParagraphLineSpacing = { snapOff: false, line: null, lineRule: null };
+  if (!ooxml) {
+    return none;
+  }
+  const part = documentXmlRange(ooxml);
+  const xml = part ? ooxml.slice(part.start, part.end) : ooxml;
+  const stack: string[] = [];
+  let inFirst = false;
+  let inPPr = false;
+  let seen = false;
+  let snapOff = false;
+  let spacingAttrs: string | null = null;
+  for (const token of scanXmlTokens(xml)) {
+    if (token.kind === "open") {
+      const local = localName(token.name);
+      const parent = stack.length ? stack[stack.length - 1] : "";
+      if (local === "p" && !seen) {
+        seen = true;
+        inFirst = !token.empty;
+        if (token.empty) {
+          break;
+        }
+      } else if (local === "pPr" && parent === "p" && inFirst && !inPPr) {
+        inPPr = !token.empty;
+      } else if (local === "snapToGrid" && parent === "pPr" && inFirst && inPPr && token.empty) {
+        snapOff = snapIsOff(token.attrs);
+      } else if (local === "spacing" && parent === "pPr" && inFirst && inPPr && token.empty) {
+        spacingAttrs = token.attrs;
+      }
+      if (!token.empty) {
+        stack.push(local);
+      }
+      continue;
+    }
+    if (token.kind !== "close") {
+      continue;
+    }
+    const local = localName(token.name);
+    if (stack.length && stack[stack.length - 1] === local) {
+      stack.pop();
+    }
+    if (local === "pPr") {
+      inPPr = false;
+    }
+    if (local === "p" && seen) {
+      break;
+    }
+  }
+  return {
+    snapOff,
+    line: spacingAttrs ? localAttr(spacingAttrs, "line") : null,
+    lineRule: spacingAttrs ? localAttr(spacingAttrs, "lineRule") : null,
+  };
+}
+
 export function patchParagraphFormat(
   ooxml: string,
   options: ParagraphFormatOptions
@@ -45,7 +118,8 @@ export function patchParagraphFormat(
     !options.unsetLineGrid &&
     options.spaceBeforePt === undefined &&
     options.spaceAfterPt === undefined &&
-    !options.indent
+    !options.indent &&
+    !options.lineCopy
   ) {
     return empty;
   }
@@ -401,7 +475,11 @@ function spacingPatch(
   prefix: string,
   options: ParagraphFormatOptions
 ): Replacement | null {
-  if (options.spaceBeforePt === undefined && options.spaceAfterPt === undefined) {
+  if (
+    options.spaceBeforePt === undefined &&
+    options.spaceAfterPt === undefined &&
+    !options.lineCopy
+  ) {
     return null;
   }
   const existing = para.pPr && !para.pPr.empty ? para.pPr.spacing : null;
@@ -495,6 +573,12 @@ function buildSpacingTag(
     changed = setAttr(attrs, "after", twips(options.spaceAfterPt), prefix) || changed;
     changed = zeroAttrIfPresent(attrs, "afterLines") || changed;
   }
+  if (options.lineCopy?.line) {
+    changed = setAttr(attrs, "line", options.lineCopy.line, prefix) || changed;
+  }
+  if (options.lineCopy?.lineRule) {
+    changed = setAttr(attrs, "lineRule", options.lineCopy.lineRule, prefix) || changed;
+  }
   const name = qualify(prefix, "spacing");
   const body = writeAttrs(attrs);
   return { tag: body ? `<${name} ${body}/>` : `<${name}/>`, changed };
@@ -567,6 +651,15 @@ function snapIsOff(attrs: string): boolean {
   }
   const lower = val.trim().toLowerCase();
   return lower === "0" || lower === "false" || lower === "off";
+}
+
+function localAttr(attrs: string, local: string): string | null {
+  for (const attr of readAttrs(attrs)) {
+    if (localName(attr.name) === local && attr.value) {
+      return attr.value;
+    }
+  }
+  return null;
 }
 
 function localName(name: string): string {

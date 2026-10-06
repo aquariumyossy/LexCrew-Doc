@@ -55,6 +55,14 @@ describe("systemPrompt", () => {
     expect(text).toContain("SearXNG または Argos");
   });
 
+  it("tells a document that already has a body not to fall back to settings", () => {
+    const text = systemPrompt({ ...base, search: false, argos: false, hasBody: true });
+    expect(text).toContain("この文書には本文があります");
+    expect(text).toContain("行間は 1字");
+    expect(text).toContain("設定の数値では書きません");
+    expect(text).not.toContain("指定がなければこれに合わせます");
+  });
+
   it("keeps reply readability rules off the document body", () => {
     const text = systemPrompt({ ...base, search: false, argos: false });
     const reportAt = text.indexOf("1〜2 文で日本語で報告します");
@@ -67,6 +75,8 @@ describe("systemPrompt", () => {
     expect(text).toContain("チャットと insert_comment の本文には書きません");
     expect(text).toContain("書いていなければ言いません");
     expect(text).toContain("行間は 1字");
+    expect(text).toContain("この文書に本文はありません");
+    expect(text).not.toContain("指定がなければこれに合わせます");
     expect(text).toContain("set_outline_level");
     expect(text).toContain("段落スタイルは変えません");
   });

@@ -17,6 +17,7 @@ import {
 import { ChatMessage } from "../../sidecar/types";
 import { chatStream } from "../api";
 import { Settings } from "../settings";
+import { documentHasVisibleText, isWordHost } from "../word";
 import { fitContext, indexedReadCharLimit, messagesTokens, toChatMessages } from "./context";
 import { beginToolTurn, executeToolCall } from "./execute";
 
@@ -50,12 +51,25 @@ export type TurnResult = {
   nextRequestTokens: number;
 };
 
+function attachmentShowsBody(attachment: Attachment): boolean | null {
+  if (attachment.scope === "document") {
+    if (attachment.document.trim() || attachment.truncated) {
+      return true;
+    }
+    return false;
+  }
+  return null;
+}
+
 export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   const { settings, signal } = options;
   const limit = settings.contextLimit;
   const hasSelection = Boolean(options.attachment.focus.trim());
   // Numbers are only addresses if the model was handed them with the body.
   const numbered = Boolean(options.attachment.document.trim());
+  const shown = attachmentShowsBody(options.attachment);
+  const hasBody =
+    shown !== null ? shown : isWordHost() ? await documentHasVisibleText() : false;
   const system: ChatMessage = {
     role: "system",
     content: systemPrompt({
@@ -63,6 +77,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       bodyPt: settings.bodyPt,
       titlePt: settings.titlePt,
       lineSpacingChars: settings.lineSpacingChars,
+      hasBody,
       search: Boolean(settings.searxngUrl.trim()),
       argos: Boolean(settings.argosBaseUrl.trim()),
       argosPathPrefix: joinArgosScopes(options.argosPathPrefixes || []),
@@ -183,6 +198,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       const outcome = await executeToolCall(call, settings, signal, {
         argosPathPrefixes: options.argosPathPrefixes,
         indexedReadChars: indexedReadCharLimit(limit, toolContents),
+        hasBody,
       });
       await options.onMessage({ role: "tool", content: outcome.content, toolCallId: call.id });
       messages.push({ role: "tool", content: outcome.content, tool_call_id: call.id });

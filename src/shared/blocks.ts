@@ -1,4 +1,5 @@
 import { DEFAULT_BODY_PT, DEFAULT_FONT_NAME, DEFAULT_LINE_SPACING_CHARS, DEFAULT_TITLE_PT, lineSpacingPt } from "./constants";
+import { BlockFormat } from "./typography";
 
 export type BlockType = "title" | "heading" | "body" | "clause" | "item" | "center" | "right";
 
@@ -29,12 +30,26 @@ export type ParagraphSpec = {
   type: BlockType;
   alignment: ParagraphAlignment;
   fontName: string;
+  /** Far-east face. Falls back to `fontName` when absent. */
+  fontNameFarEast?: string;
   fontSize: number;
   bold: boolean;
   firstLineIndentPt: number;
   leftIndentPt: number;
   /** Exact line box, in points. One 字 is this paragraph's font size. */
   lineSpacingPt: number;
+  /** Omitted means write the font. `false` leaves the inserted paragraph's face. */
+  applyFont?: boolean;
+  /** Omitted means write the size. */
+  applySize?: boolean;
+  /** Omitted means write the point indents. */
+  applyIndent?: boolean;
+  /**
+   * Omitted means exact `lineSpacingPt`. `keep` writes nothing.
+   * `copy` writes `spacingCopy` and turns snap-to-grid off.
+   */
+  spacingKind?: "exact" | "copy" | "keep";
+  spacingCopy?: { line: string | null; lineRule: string | null };
   runs: TextRun[];
 };
 
@@ -191,6 +206,50 @@ export function mapBlockToParagraph(block: DraftBlock, options: FontOptions = {}
 
 export function mapBlocks(blocks: DraftBlock[], options: FontOptions = {}): ParagraphSpec[] {
   return blocks.map((block) => mapBlockToParagraph(block, options));
+}
+
+/** Overlay one block's resolved face onto a spec built from settings. */
+export function paintParagraph(spec: ParagraphSpec, format: BlockFormat): ParagraphSpec {
+  const next: ParagraphSpec = {
+    ...spec,
+    runs: spec.runs.map((run) => ({ ...run })),
+  };
+  if (format.font.write) {
+    next.fontName = format.font.name;
+    next.fontNameFarEast = format.font.nameFarEast;
+    next.applyFont = true;
+  } else {
+    next.applyFont = false;
+  }
+  if (format.size.write) {
+    next.fontSize = format.size.pt;
+    next.applySize = true;
+  } else {
+    next.applySize = false;
+  }
+  if (format.applyIndent) {
+    next.applyIndent = true;
+    if (spec.type === "body") {
+      next.firstLineIndentPt = format.indentEm;
+    }
+    if (spec.type === "item") {
+      next.leftIndentPt = format.indentEm;
+    }
+  } else {
+    next.applyIndent = false;
+  }
+  if (format.spacing.kind === "exact") {
+    next.spacingKind = "exact";
+    next.lineSpacingPt = format.spacing.pt;
+  } else if (format.spacing.kind === "copy") {
+    next.spacingKind = "copy";
+    next.spacingCopy = { line: format.spacing.line, lineRule: format.spacing.lineRule };
+    next.lineSpacingPt = 0;
+  } else {
+    next.spacingKind = "keep";
+    next.lineSpacingPt = 0;
+  }
+  return next;
 }
 
 export function specPlainText(spec: ParagraphSpec): string {

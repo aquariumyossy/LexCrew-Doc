@@ -1392,7 +1392,7 @@ const App: React.FC = () => {
                 <Field
                   size="small"
                   label="本文フォント"
-                  hint="游明朝が無ければ ＭＳ 明朝を選んでください。"
+                  hint="チャットで指定せず、合わせる本文も無いときに使います。游明朝が無ければ ＭＳ 明朝を選んでください。"
                 >
                   <RadioGroup
                     layout="horizontal"
@@ -1407,7 +1407,7 @@ const App: React.FC = () => {
                 <Field
                   size="small"
                   label="行間"
-                  hint="挿入する段落の行の高さです。1字はその段落の文字サイズと同じです。"
+                  hint="チャットで指定せず、合わせる本文も無いときの行の高さです。1字はその段落の文字サイズと同じです。"
                 >
                   <RadioGroup
                     layout="horizontal"
@@ -1422,7 +1422,12 @@ const App: React.FC = () => {
                   </RadioGroup>
                 </Field>
                 <div className={dialog.row}>
-                  <Field size="small" label="本文（pt）" style={{ flex: 1 }}>
+                  <Field
+                    size="small"
+                    label="本文（pt）"
+                    style={{ flex: 1 }}
+                    hint="チャットで指定せず、合わせる本文も無いときの本文の大きさです。"
+                  >
                     <Input
                       size="small"
                       type="number"
@@ -1433,7 +1438,12 @@ const App: React.FC = () => {
                       }}
                     />
                   </Field>
-                  <Field size="small" label="タイトル（pt）" style={{ flex: 1 }}>
+                  <Field
+                    size="small"
+                    label="タイトル（pt）"
+                    style={{ flex: 1 }}
+                    hint="チャットで指定せず、合わせるタイトルも無いときのタイトルの大きさです。"
+                  >
                     <Input
                       size="small"
                       type="number"

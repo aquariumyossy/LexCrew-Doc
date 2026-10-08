@@ -5,6 +5,8 @@ import {
   ChangeNote,
   CommentNote,
   EMPTY_ATTACHMENT,
+  EMPTY_SHAPES,
+  ShapeRead,
   MAX_ANCHOR_CHARS,
   MAX_CHANGE_TEXT_CHARS,
   MAX_CHANGE_WHERE_CHARS,
@@ -45,6 +47,13 @@ import {
   readMarkupBody,
   stripInlineMarkup,
 } from "../shared/markupText";
+import {
+  fitShapeText,
+  pickShapeByText,
+  readShapeBlocks,
+  renderedShapeBody,
+} from "../shared/extract/shapeText";
+import { SHAPES_MARKER, TRUNCATION_NOTE } from "../shared/prompts";
 import { formatParagraphRef, isParagraphRef } from "../shared/paragraphRef";
 import { alignReviewed, opHitsDeletion, planRedline, type RedlineOp, type ReviewedAlignment } from "../shared/redline";
 import {
@@ -66,6 +75,7 @@ import {
 } from "../shared/listStyles";
 import {
   DeleteParagraphsArgs,
+  DeleteShapeArgs,
   FindInDocumentArgs,
   FormatListArgs,
   FormatParagraphArgs,
@@ -234,6 +244,15 @@ function canReadLayoutPage(): boolean {
   }
 }
 
+/** `Shape.delete` is WordApiDesktop 1.2, the same floor as reading a layout page. */
+function canDeleteShapes(): boolean {
+  try {
+    return isWordHost() && Office.context.requirements.isSetSupported("WordApiDesktop", "1.2");
+  } catch {
+    return false;
+  }
+}
+
 function canApplyBuiltinListStyles(): boolean {
   try {
     return isWordHost() && Office.context.requirements.isSetSupported("WordApiDesktop", "1.3");
@@ -272,6 +291,8 @@ export async function getDocumentStats(): Promise<DocumentStats> {
   }
   // The paragraph count comes free with the text: Word ends each one with a
   // carriage return. Loading the paragraph collection would read the body twice.
+  // Text boxes are not in body.text. Counting them would read the whole package
+  // on every meter refresh, so the meter stays low by that amount.
   const size = await Word.run(async (context) => {
     const body = context.document.body;
     body.load("text");
@@ -315,6 +336,7 @@ export type DocumentText = {
   paragraphs: number;
   truncated: boolean;
   listMarks: boolean;
+  shapes: ShapeRead;
 };
 
 type AttachedParagraph = {
@@ -435,10 +457,22 @@ async function loadListStrings(
 let attachedParagraphs = new Map<number, AttachedParagraph>();
 /** How many paragraphs the document had when those numbers were handed over. */
 let attachedParagraphCount = 0;
+/**
+ * Shape text shown this turn, in `[図1]` order. The strings stay after a delete
+ * so a later duplicate still means the same occurrence.
+ */
+let attachedShapes: string[] = [];
+/** `[図]` numbers already deleted this turn. */
+let spentShapes = new Set<number>();
+/** Shape ids already deleted. Tracked changes may leave them in the collection. */
+let deletedShapeIds = new Set<number>();
 
 function forgetParagraphNumbers(): void {
   attachedParagraphs = new Map();
   attachedParagraphCount = 0;
+  attachedShapes = [];
+  spentShapes = new Set();
+  deletedShapeIds = new Set();
   allParagraphRawTexts = new Map();
   attachmentReviewedFallback = false;
   attachmentUsesInlineMarkup = false;
@@ -499,13 +533,27 @@ type ReadDocumentOptions = {
  * on each attached row stays raw so paragraph numbers still resolve through
  * `search`.
  */
+function shapeReadWithin(documentXml: string, maxChars: number): ShapeRead {
+  const overhead = `\n\n${SHAPES_MARKER}\n`.length;
+  const room = Math.max(0, maxChars - overhead);
+  const fitted = fitShapeText(readShapeBlocks(documentXml), room, TRUNCATION_NOTE);
+  attachedShapes = fitted.shown;
+  spentShapes = new Set();
+  return {
+    text: fitted.text,
+    truncated: fitted.truncated,
+    error: "",
+    count: fitted.shown.length,
+  };
+}
+
 export async function readDocumentText(
   maxChars: number,
   options: ReadDocumentOptions = {}
 ): Promise<DocumentText> {
   forgetParagraphNumbers();
   if (!isWordHost() || maxChars <= 0) {
-    return { text: "", paragraphs: 0, truncated: false, listMarks: false };
+    return { text: "", paragraphs: 0, truncated: false, listMarks: false, shapes: EMPTY_SHAPES };
   }
   return Word.run(async (context) => {
     const paragraphs = context.document.body.paragraphs;
@@ -532,17 +580,26 @@ export async function readDocumentText(
       attachmentReviewedFallback = true;
     }
 
+    let documentXml = "";
+    let commentsXml: string | undefined;
+    let shapeError = "";
+    try {
+      const pkg = context.document.body.getOoxml();
+      await context.sync();
+      const raw = pkg.value || "";
+      documentXml = documentXmlFromPackage(raw);
+      commentsXml = commentsXmlFromPackage(raw);
+    } catch (error) {
+      shapeError = readFailed(error);
+    }
+
     let inlineMarked: string[] | null = null;
     let inlineChanges: ChangeNote[] = [];
     let inlineChangesTruncated = false;
     let appendixComments: CommentNote[] = [];
-    if (options.markup && !attachmentReviewedFallback) {
+    if (options.markup && !attachmentReviewedFallback && !shapeError) {
       try {
-        const pkg = context.document.body.getOoxml();
-        await context.sync();
-        const documentXml = documentXmlFromPackage(pkg.value || "");
-        const commentsXml = commentsXmlFromPackage(pkg.value || "");
-        const parsed = readMarkupBody(documentXml, commentsXml);
+        const parsed = readMarkupBody(documentXml, commentsXml, { skipShapeParagraphs: true });
         if (parsed.paragraphCount === paragraphs.items.length) {
           const overhead = parsed.markupOverhead;
           const budget = options.markupBudget ?? maxChars;
@@ -559,6 +616,13 @@ export async function readDocumentText(
         // Fall back to reviewed text without inline markers.
       }
     }
+
+    const shapes = shapeError
+      ? { text: "", truncated: false, error: shapeError }
+      : shapeReadWithin(documentXml, maxChars);
+    const shapeBody = renderedShapeBody(shapes);
+    const shapeReserve = shapeBody ? `\n\n${SHAPES_MARKER}\n`.length + shapeBody.length : 0;
+    const bodyBudget = Math.max(0, maxChars - shapeReserve);
 
     const lines: string[] = [];
     const attached = new Map<number, AttachedParagraph>();
@@ -586,7 +650,7 @@ export async function readDocumentText(
       }
       const mark = listMarkOf(paragraph);
       const numbered = formatAttachedLine(number, display, mark);
-      if (used + numbered.length + 1 > maxChars) {
+      if (used + numbered.length + 1 > bodyBudget) {
         truncated = true;
         break;
       }
@@ -605,7 +669,7 @@ export async function readDocumentText(
 
     if (inlineMarked && attachmentUsesInlineMarkup) {
       const legend = `${MARKUP_LEGEND}\n\n`;
-      if (used + legend.length <= maxChars) {
+      if (used + legend.length <= bodyBudget) {
         lines.unshift(legend.trimEnd());
         used += legend.length;
       }
@@ -620,7 +684,7 @@ export async function readDocumentText(
       lastInlineAppendixComments = appendixComments;
     }
 
-    return { text: lines.join("\n"), paragraphs: lines.length, truncated, listMarks };
+    return { text: lines.join("\n"), paragraphs: lines.length, truncated, listMarks, shapes };
   });
 }
 
@@ -873,6 +937,7 @@ export async function readAttachment(
     reviewedFallback: attachmentReviewedFallback,
     inlineMarkup: attachmentUsesInlineMarkup,
     inlineCommentCount: attachmentUsesInlineMarkup ? lastInlineCommentCount : undefined,
+    shapes: body.shapes,
   };
 }
 
@@ -3622,6 +3687,137 @@ export async function deleteParagraphs(args: DeleteParagraphsArgs): Promise<stri
       `${labels.join("、")}を削除しました（変更履歴に記録）。` +
       "この番号はもう使えません。続きは read_paragraphs で読み直してください。"
     );
+  });
+}
+
+const SHAPE_TEXT_BOX = "TextBox";
+const SHAPE_GEOMETRIC = "GeometricShape";
+const SHAPE_GROUP = "Group";
+const SHAPE_CANVAS = "Canvas";
+
+/**
+ * The installed `@types/office-js` has no `Word.Shape`. The desktop host does,
+ * from WordApiDesktop 1.2, so the calls go through this narrow shape.
+ */
+type HostShape = {
+  id: number;
+  type: string;
+  body: { text: string; load: (propertyNames: string) => void };
+  shapeGroup: {
+    isNullObject: boolean;
+    shapes: { items: HostShape[] };
+  };
+  canvas: {
+    isNullObject: boolean;
+    shapes: { items: HostShape[] };
+  };
+  load: (propertyNames: string) => void;
+  delete: () => void;
+};
+
+type HostShapeCollection = {
+  items: HostShape[];
+  load: (propertyNames?: string) => void;
+};
+
+type ShapeLeaf = { id: number; text: string; delete: () => void };
+
+function childShapes(shape: HostShape): HostShape[] {
+  try {
+    if (shape.type === SHAPE_GROUP) {
+      if (!shape.shapeGroup || shape.shapeGroup.isNullObject) {
+        return [];
+      }
+      return shape.shapeGroup.shapes.items || [];
+    }
+    if (shape.type === SHAPE_CANVAS) {
+      if (!shape.canvas || shape.canvas.isNullObject) {
+        return [];
+      }
+      return shape.canvas.shapes.items || [];
+    }
+  } catch {
+    return [];
+  }
+  return [];
+}
+
+/**
+ * Text boxes and geometric shapes, in collection order. A group or canvas
+ * contributes its children in that same order, which is the order the shape
+ * section was numbered from the package.
+ */
+async function loadShapeLeaves(
+  context: Word.RequestContext,
+  shapes: HostShape[]
+): Promise<ShapeLeaf[]> {
+  if (!shapes.length) {
+    return [];
+  }
+  for (const shape of shapes) {
+    shape.load("type,id");
+  }
+  await context.sync();
+  for (const shape of shapes) {
+    if (shape.type === SHAPE_GROUP) {
+      shape.load("shapeGroup/shapes/items");
+    } else if (shape.type === SHAPE_CANVAS) {
+      shape.load("canvas/shapes/items");
+    } else if (shape.type === SHAPE_TEXT_BOX || shape.type === SHAPE_GEOMETRIC) {
+      shape.body.load("text");
+    }
+  }
+  await context.sync();
+  const leaves: ShapeLeaf[] = [];
+  for (const shape of shapes) {
+    if (shape.type === SHAPE_GROUP || shape.type === SHAPE_CANVAS) {
+      leaves.push(...(await loadShapeLeaves(context, childShapes(shape))));
+    } else if (shape.type === SHAPE_TEXT_BOX || shape.type === SHAPE_GEOMETRIC) {
+      leaves.push({ id: shape.id, text: shape.body.text || "", delete: () => shape.delete() });
+    }
+  }
+  return leaves;
+}
+
+/**
+ * Delete the text box numbered in this turn's shape section. Tracking stays
+ * on, the same as every other edit. Older Word is told why, and the paragraph
+ * is left alone.
+ */
+export async function deleteShape(args: DeleteShapeArgs): Promise<string> {
+  if (!isWordHost()) {
+    throw new Error("Word で開いてください。");
+  }
+  const number = args.shape;
+  if (!Number.isInteger(number) || number < 1 || number > attachedShapes.length) {
+    throw new Error(`図${number} はこのターンの図形節にありません。`);
+  }
+  if (spentShapes.has(number)) {
+    throw new Error(`図${number} は削除済みです。この番号はもう使えません。`);
+  }
+  if (!canDeleteShapes()) {
+    throw new Error("この Word ではテキストボックスを削除できません。");
+  }
+  return Word.run(async (context) => {
+    const host = context.document.body as unknown as { shapes: HostShapeCollection };
+    host.shapes.load("items");
+    await context.sync();
+    const leaves = (await loadShapeLeaves(context, host.shapes.items)).filter(
+      (leaf) => !deletedShapeIds.has(leaf.id)
+    );
+    const pick = pickShapeByText(attachedShapes, leaves, number, spentShapes);
+    if (!pick.ok) {
+      throw new Error(
+        `図${number} に一致するテキストボックスが見つかりません。ワードアートのように図形の本文を持たないものは削除できません。`
+      );
+    }
+    startTracking(context);
+    pick.shape.delete();
+    await context.sync();
+    spentShapes.add(number);
+    deletedShapeIds.add(pick.shape.id);
+    const first = attachedShapes[number - 1].split("\n")[0] || "";
+    return `図${number}「${clipNote(first, 24)}」を削除しました（変更履歴に記録）。この番号はもう使えません。`;
   });
 }
 

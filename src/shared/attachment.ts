@@ -45,6 +45,20 @@ export type MarkupList<T> = {
   error: string;
 };
 
+/**
+ * Text inside text boxes and shapes. It is not a body paragraph.
+ * `count` is how many `[図1]` addresses were shown; deletion uses those.
+ */
+export type ShapeRead = {
+  text: string;
+  truncated: boolean;
+  error: string;
+  /** `[図1]` addresses included in `text`. Omitted when none were shown. */
+  count?: number;
+};
+
+export const EMPTY_SHAPES: ShapeRead = { text: "", truncated: false, error: "" };
+
 export type Attachment = {
   scope: AttachmentScope;
   /** Whole body, paragraph per line. Empty unless the scope asks for it. */
@@ -67,6 +81,8 @@ export type Attachment = {
   inlineMarkup?: boolean;
   /** Comments shown in the body as 〔注…〕 when inline markup is on. */
   inlineCommentCount?: number;
+  /** Present after a full-document read. Absent when the body was not read. */
+  shapes?: ShapeRead;
 };
 
 export function emptyMarkup<T>(): MarkupList<T> {

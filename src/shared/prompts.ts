@@ -1,5 +1,6 @@
 import { Attachment, ChangeKind, ChangeNote, CommentNote, MarkupList } from "./attachment";
 import { argosScopeSystemLine } from "./argos";
+import { renderedShapeBody } from "./extract/shapeText";
 import { MARKUP_LEGEND } from "./markupText";
 import { isParagraphRef } from "./paragraphRef";
 import { CommittedFile, FileOrigin, fileTextChars } from "./fileSource";
@@ -36,6 +37,10 @@ export type PromptOptions = {
   inlineMarkup?: boolean;
   /** 資料ファイルが 1 件でも載るターンだけ、その扱いを説明する。 */
   files?: boolean;
+  /** 図形の節を渡したターンだけ、そこが段落ではないと説明する。 */
+  shapes?: boolean;
+  /** [図1] を渡したターンだけ、delete_shape の指し方を説明する。 */
+  shapeNumbers?: boolean;
 };
 
 /**
@@ -79,6 +84,19 @@ export function systemPrompt(options: PromptOptions): string {
     `「${SELECTION_MARKER}」があれば、利用者がいま選んでいるところです。場所の指示が無ければ、まずそこを見ます。`,
     "添付は毎回いまの文書から作り直します。過去のやりとりに本文は残らないので、前のターンで見た本文を覚えている前提で書かず、いま渡された本文で確かめます。",
     "添付は、そのターンでツールを動かす前の文書です。書き込んだあとの本文は、添付ではなく read_paragraphs の結果で確かめてください。",
+    ...(options.shapeNumbers
+      ? [
+          "「" +
+            SHAPES_MARKER +
+            "」はテキストボックスや図形の中の文字です。行頭の [図1] は段落番号ではありません。read_paragraphs には出ません。消すときは delete_shape にその数字を渡します。置換、コメント、挿入の対象にしません。チャットの返事には [図1] を書きません。",
+        ]
+      : options.shapes
+        ? [
+            "「" +
+              SHAPES_MARKER +
+              "」はテキストボックスや図形の中の文字です。read_paragraphs には出ません。置換、コメント、挿入の対象にしません。",
+          ]
+        : []),
     "ツールを実行したら、何をしたかを 1〜2 文で日本語で報告します。",
     "チャットの返事と insert_comment の本文は、次のように書きます。insert_blocks や置換で文書に入れる文言には適用しません。",
     "最初の文で、したこと、または本文から読めた事実を言います。法律上の結論は断定しません。「以下に示します」のような前置きは書きません。",
@@ -201,6 +219,7 @@ export function systemPrompt(options: PromptOptions): string {
 
 export const SELECTION_MARKER = "--- 選択範囲 ---";
 export const DOCUMENT_MARKER = "--- 文書全体 ---";
+export const SHAPES_MARKER = "--- 図形 ---";
 export const COMMENTS_MARKER = "--- コメント ---";
 export const CHANGES_MARKER = "--- 変更履歴 ---";
 /**
@@ -341,10 +360,13 @@ function documentSection(attachment: Attachment): string {
     return section(DOCUMENT_MARKER, DOCUMENT_SELECTION_ONLY_NOTE);
   }
   if (!attachment.document) {
-    return section(
-      DOCUMENT_MARKER,
-      attachment.truncated ? DOCUMENT_NO_ROOM_NOTE : DOCUMENT_EMPTY_NOTE
-    );
+    if (attachment.truncated) {
+      return section(DOCUMENT_MARKER, DOCUMENT_NO_ROOM_NOTE);
+    }
+    if (attachment.shapes && renderedShapeBody(attachment.shapes)) {
+      return "";
+    }
+    return section(DOCUMENT_MARKER, DOCUMENT_EMPTY_NOTE);
   }
   const body = attachment.truncated
     ? `${attachment.document}\n${TRUNCATION_NOTE}`
@@ -360,12 +382,24 @@ export function userMessageWithAttachment(
 ): string {
   let out = instruction;
   out += documentSection(attachment);
+  out += shapeSection(attachment);
   out += renderMarkup(attachment);
   out += renderFiles(files);
   if (attachment.focus.trim()) {
     out += section(SELECTION_MARKER, attachment.focus);
   }
   return out;
+}
+
+function shapeSection(attachment: Attachment): string {
+  if (!attachment.shapes) {
+    return "";
+  }
+  const body = renderedShapeBody(attachment.shapes);
+  if (!body) {
+    return "";
+  }
+  return section(SHAPES_MARKER, body);
 }
 
 /** Both lists, in the form the model and the saved transcript share. */
@@ -407,14 +441,23 @@ export function userMessageForHistory(
   } else if (attachment.scope !== "none") {
     // Record the absence too. Without this line the transcript cannot tell a
     // turn that carried the body from one that silently carried nothing.
-    out += section(
-      DOCUMENT_MARKER,
-      attachment.scope === "selection"
-        ? "本文なし（選択範囲だけを添付）"
-        : attachment.truncated
-          ? "本文なし（添付の余白が足りず渡せませんでした）"
-          : "本文なし（空の文書）"
-    );
+    // A text box that holds the only words is not an empty document.
+    const shapesCarry = Boolean(attachment.shapes && renderedShapeBody(attachment.shapes));
+    if (attachment.truncated || !shapesCarry) {
+      out += section(
+        DOCUMENT_MARKER,
+        attachment.scope === "selection"
+          ? "本文なし（選択範囲だけを添付）"
+          : attachment.truncated
+            ? "本文なし（添付の余白が足りず渡せませんでした）"
+            : "本文なし（空の文書）"
+      );
+    }
+  }
+  if (attachment.shapes?.error) {
+    out += section(SHAPES_MARKER, "図形の文字は読めませんでした");
+  } else if (attachment.shapes?.text) {
+    out += section(SHAPES_MARKER, "図形の文字を渡した");
   }
   // The markup is short and is the record of what the counterparty asked for, so
   // it is kept verbatim; replay strips it all the same.
@@ -444,6 +487,7 @@ export function filesStub(files: CommittedFile[]): string {
 export type UserMessageParts = {
   instruction: string;
   document: string;
+  shapes: string;
   comments: string;
   changes: string;
   files: string;
@@ -452,6 +496,7 @@ export type UserMessageParts = {
 
 const SECTIONS: { marker: string; key: keyof Omit<UserMessageParts, "instruction"> }[] = [
   { marker: DOCUMENT_MARKER, key: "document" },
+  { marker: SHAPES_MARKER, key: "shapes" },
   { marker: COMMENTS_MARKER, key: "comments" },
   { marker: CHANGES_MARKER, key: "changes" },
   { marker: FILES_MARKER, key: "files" },
@@ -468,6 +513,7 @@ export function splitUserMessage(content: string): UserMessageParts {
   const parts: UserMessageParts = {
     instruction: found.length ? content.slice(0, found[0].at) : content,
     document: "",
+    shapes: "",
     comments: "",
     changes: "",
     files: "",

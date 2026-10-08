@@ -89,6 +89,13 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       inlineMarkup: options.attachment.inlineMarkup === true,
       files: Boolean(options.files?.length),
       listMarks: Boolean(options.attachment.listMarks),
+      shapes: Boolean(
+        options.attachment.shapes &&
+          (options.attachment.shapes.text ||
+            options.attachment.shapes.error ||
+            options.attachment.shapes.truncated)
+      ),
+      shapeNumbers: (options.attachment.shapes?.count ?? 0) > 0,
     }),
   };
 
@@ -125,6 +132,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       selection: hasSelection,
       numbered,
       insertedNumbers: numbersHandedOut,
+      shapes: (options.attachment.shapes?.count ?? 0) > 0,
     });
   let tools = toolsFor();
   let toolsSupported = true;

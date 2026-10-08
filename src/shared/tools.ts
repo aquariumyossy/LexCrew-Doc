@@ -20,6 +20,7 @@ export const TOOL_SET_OUTLINE = "set_outline_level";
 export const TOOL_READ_PARAGRAPHS = "read_paragraphs";
 export const TOOL_FIND_IN_DOCUMENT = "find_in_document";
 export const TOOL_DELETE_PARAGRAPHS = "delete_paragraphs";
+export const TOOL_DELETE_SHAPE = "delete_shape";
 export const TOOL_READ_INDEXED_FILE = "read_indexed_file";
 
 /** Word's search string cannot exceed this, and cannot span paragraphs. */
@@ -191,6 +192,11 @@ export type DeleteParagraphsArgs = {
   follows?: number;
 };
 
+export type DeleteShapeArgs = {
+  /** The `[図1]` number from this turn's shape section. */
+  shape: number;
+};
+
 export type ReadIndexedFileArgs = {
   path: string;
   offset?: number;
@@ -213,6 +219,7 @@ export type ToolInvocation =
   | { name: typeof TOOL_READ_PARAGRAPHS; args: ReadParagraphsArgs }
   | { name: typeof TOOL_FIND_IN_DOCUMENT; args: FindInDocumentArgs }
   | { name: typeof TOOL_DELETE_PARAGRAPHS; args: DeleteParagraphsArgs }
+  | { name: typeof TOOL_DELETE_SHAPE; args: DeleteShapeArgs }
   | { name: typeof TOOL_READ_INDEXED_FILE; args: ReadIndexedFileArgs };
 
 export type ParsedTool = { ok: true; call: ToolInvocation } | { ok: false; error: string };
@@ -661,6 +668,8 @@ export type ToolSetOptions = {
   numbered?: boolean;
   /** 添付に番号は無いが、このターンの insert_blocks が入れた段落には番号がある。 */
   insertedNumbers?: boolean;
+  /** 図形節に [図1] を渡したターンだけ、その番号でテキストボックスを消させる。 */
+  shapes?: boolean;
 };
 
 /**
@@ -753,6 +762,30 @@ function findInDocumentTool(): ToolDefinition {
   };
 }
 
+function deleteShapeTool(): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_DELETE_SHAPE,
+      description:
+        "図形節の [図1] のテキストボックスを削除する。修正履歴に残る。" +
+        "shape には [図1] の数字を渡す。段落番号ではない。" +
+        "同じ文言が複数あるときは、図形節での出現順のその番号の箱を消す。" +
+        "消した番号はもう使えない。中の文字の置換、コメント、挿入はできない。",
+      parameters: {
+        type: "object",
+        required: ["shape"],
+        properties: {
+          shape: {
+            type: "number",
+            description: "消すテキストボックスの番号。図形節の [図1] の数字。",
+          },
+        },
+      },
+    },
+  };
+}
+
 function deleteParagraphsTool(): ToolDefinition {
   return {
     type: "function",
@@ -808,6 +841,9 @@ export function buildTools(options: ToolSetOptions = {}): ToolDefinition[] {
   if (numbered || inserted) {
     tools.push(insertBlankBeforeTool());
     tools.push(deleteParagraphsTool());
+  }
+  if (options.shapes) {
+    tools.push(deleteShapeTool());
   }
   tools.push(insertCommentTool(target));
   tools.push(formatTextTool(target));
@@ -1168,6 +1204,18 @@ function parseDeleteParagraphs(row: Record<string, unknown>): ParsedTool {
   };
 }
 
+function parseDeleteShape(row: Record<string, unknown>): ParsedTool {
+  const raw = row.shape;
+  if (raw === undefined || raw === null || raw === "") {
+    return { ok: false, error: "shape に、図形節の [図1] の数字を入れてください。" };
+  }
+  const shape = paragraphNumber(raw);
+  if (shape === undefined) {
+    return { ok: false, error: "shape は図形節の [図1] の数字（1 以上の整数）にしてください。" };
+  }
+  return { ok: true, call: { name: TOOL_DELETE_SHAPE, args: { shape } } };
+}
+
 export function parseToolArguments(name: string, rawArguments: string): ParsedTool {
   const raw = (rawArguments || "").trim();
   let parsed: unknown = {};
@@ -1526,6 +1574,8 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
       return parseFindInDocument(row);
     case TOOL_DELETE_PARAGRAPHS:
       return parseDeleteParagraphs(row);
+    case TOOL_DELETE_SHAPE:
+      return parseDeleteShape(row);
     case TOOL_READ_INDEXED_FILE:
       return parseReadIndexedFile(row);
     default:
@@ -1726,6 +1776,8 @@ export function describeToolCall(name: string, rawArguments: string): string {
       }
       return `${numbers.length} 段落を削除${follows}`;
     }
+    case TOOL_DELETE_SHAPE:
+      return `図${call.args.shape} を削除`;
     default:
       return name;
   }

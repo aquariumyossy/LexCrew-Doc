@@ -2,6 +2,7 @@ import { mapBlocks, summarizeInsertedBlocks } from "../../shared/blocks";
 import { foreignCharToolError } from "../../shared/japaneseHan";
 import {
   TOOL_DELETE_PARAGRAPHS,
+  TOOL_DELETE_SHAPE,
   TOOL_FIND_IN_DOCUMENT,
   TOOL_FORMAT_LIST,
   TOOL_FORMAT_PARAGRAPH,
@@ -26,6 +27,7 @@ import { sliceIndexedText } from "../../shared/indexedRead";
 import { Settings } from "../settings";
 import {
   deleteParagraphs,
+  deleteShape,
   findInDocument,
   formatList,
   formatParagraph,
@@ -333,6 +335,11 @@ export async function executeToolCall(
 
       case TOOL_DELETE_PARAGRAPHS: {
         const note = await deleteParagraphs(invocation.args);
+        return { content: note, ok: true };
+      }
+
+      case TOOL_DELETE_SHAPE: {
+        const note = await deleteShape(invocation.args);
         return { content: note, ok: true };
       }
 

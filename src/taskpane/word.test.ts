@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mapBlocks } from "../shared/blocks";
+import { SHAPE_NOTE } from "../shared/extract/shapeText";
+import { SHAPES_MARKER } from "../shared/prompts";
 import {
   formatList,
   formatParagraph,
@@ -13,6 +15,7 @@ import {
   readAttachment,
   setOutlineLevel,
   deleteParagraphs,
+  deleteShape,
   findInDocument,
   readDocumentText,
   readParagraphs,
@@ -48,6 +51,12 @@ type FakeComment = {
 
 type FakeChange = { type: string; author: string; date: Date; text: string; where: string };
 
+type FakeShapeSpec = {
+  text: string;
+  type?: "TextBox" | "GeometricShape" | "Group" | "Canvas" | "Picture";
+  children?: FakeShapeSpec[];
+};
+
 type WordOptions = {
   selection: string;
   body: string;
@@ -77,6 +86,14 @@ type WordOptions = {
   pageIndex?: number;
   /** Per-paragraph tracked changes for resolveTarget deletion checks. */
   paragraphChanges?: FakeChange[][];
+  /** `body.getOoxml()` payload. Raw document XML is enough. */
+  ooxml?: string;
+  /** `body.getOoxml()` throws, so shape text could not be read. */
+  ooxmlFail?: boolean;
+  /** False stands for a Word without Shape.delete (WordApiDesktop 1.2). */
+  wordApiDesktop12?: boolean;
+  /** Text boxes `body.shapes` would return, in collection order. */
+  shapes?: FakeShapeSpec[];
   /** When set, the selection covers these paragraphs, in order. */
   selectionParagraphs?: string[];
 };
@@ -118,9 +135,12 @@ function installWord(options: WordOptions): {
   paragraphs: FakeParagraph[];
   levelWrites: Array<{ level: number; format: string }>;
   getTracking: () => string;
+  deletedShapes: FakeShapeSpec[];
 } {
   const replacements: Replacement[] = [];
   const comments: string[] = [];
+  const deletedShapes: FakeShapeSpec[] = [];
+  let nextShapeId = 1;
 
   const revisionsFilter = {
     markup: "All",
@@ -670,7 +690,12 @@ function installWord(options: WordOptions): {
         }),
       };
     },
-    getOoxml: () => ({ value: "" }),
+    getOoxml: () => {
+      if (options.ooxmlFail) {
+        throw new Error("OOXMLを読めません");
+      }
+      return { value: options.ooxml || "" };
+    },
     paragraphs: {
       load: () => undefined,
       get items() {
@@ -684,6 +709,30 @@ function installWord(options: WordOptions): {
     },
     getComments,
     getTrackedChanges,
+    shapes: {
+      load: () => undefined,
+      items: (options.shapes || []).map(function hostShape(spec: FakeShapeSpec) {
+        const children = (spec.children || []).map(hostShape);
+        const type = spec.type || (spec.children ? "Group" : "TextBox");
+        return {
+          id: nextShapeId++,
+          type,
+          body: { text: spec.text, load: () => undefined },
+          shapeGroup: {
+            isNullObject: type !== "Group",
+            shapes: { items: type === "Group" ? children : [] },
+          },
+          canvas: {
+            isNullObject: type !== "Canvas",
+            shapes: { items: type === "Canvas" ? children : [] },
+          },
+          load: () => undefined,
+          delete: () => {
+            deletedShapes.push(spec);
+          },
+        };
+      }),
+    },
     lists: {
       getByIdOrNullObject: (id: number) => {
         const members = syncBodyParagraphs().filter(
@@ -759,6 +808,9 @@ function installWord(options: WordOptions): {
           if (name === "WordApiDesktop" && version === "1.3") {
             return options.wordApiDesktop13 !== false;
           }
+          if (name === "WordApiDesktop" && version === "1.2") {
+            return options.wordApiDesktop12 !== false;
+          }
           return true;
         },
       },
@@ -772,6 +824,7 @@ function installWord(options: WordOptions): {
     paragraphs: bodyParagraphs,
     levelWrites,
     getTracking: () => context.document.changeTrackingMode,
+    deletedShapes,
   };
 }
 
@@ -1109,7 +1162,169 @@ describe("readDocumentText", () => {
   it("reads nothing when there is no budget left", async () => {
     installWord({ selection: "", body: "", paragraphs });
     const read = await readDocumentText(0);
-    expect(read).toEqual({ text: "", paragraphs: 0, truncated: false, listMarks: false });
+    expect(read).toEqual({
+      text: "",
+      paragraphs: 0,
+      truncated: false,
+      listMarks: false,
+      shapes: { text: "", truncated: false, error: "" },
+    });
+  });
+
+  it("keeps text-box text when the numbered body does not fit", async () => {
+    const box = "当事者目録";
+    const shapeText = `${SHAPE_NOTE}\n[図1]\n${box}`;
+    const budget = `\n\n${SHAPES_MARKER}\n`.length + shapeText.length;
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文は長い契約の本文です。".repeat(8)],
+      ooxml: `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:txbxContent><w:p><w:r><w:t>${box}</w:t></w:r></w:p></w:txbxContent></w:r></w:p></w:body></w:document>`,
+    });
+    const read = await readDocumentText(budget);
+    expect(read.shapes.text).toContain(box);
+    expect(read.shapes.text).toContain("[図1]");
+    expect(read.shapes.text).toContain(SHAPE_NOTE);
+    expect(read.shapes.count).toBe(1);
+    expect(read.text).toBe("");
+    expect(read.truncated).toBe(true);
+  });
+
+  it("does not number text-box text as a body paragraph", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "後文"],
+      ooxml: `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:r><w:t>前文</w:t></w:r><w:ins w:author="甲" w:date="2026-03-01T00:00:00Z"><w:r><w:t>追記</w:t></w:r></w:ins>
+          <w:r><w:txbxContent><w:p><w:r><w:t>当事者目録</w:t></w:r></w:p></w:txbxContent></w:r></w:p>
+        <w:p><w:r><w:t>後文</w:t></w:r></w:p>
+      </w:body></w:document>`,
+    });
+    const read = await readDocumentText(10_000, { markup: true, markupBudget: 10_000 });
+    expect(read.text).toContain("[1]");
+    expect(read.text).toContain("〔+甲: 追記〕");
+    expect(read.text).not.toContain("当事者目録");
+    expect(read.shapes.text).toContain("[図1]");
+    expect(read.shapes.text).toContain("当事者目録");
+    expect(read.shapes.error).toBe("");
+  });
+
+  it("keeps the body when the shape package cannot be read", async () => {
+    installWord({ selection: "", body: "", paragraphs: ["前文"], ooxmlFail: true });
+    const read = await readDocumentText(1_000);
+    expect(read.text).toContain("前文");
+    expect(read.shapes.error).toContain("OOXMLを読めません");
+  });
+});
+
+const BOX = (text: string) =>
+  `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:txbxContent><w:p><w:r><w:t>${text}</w:t></w:r></w:p></w:txbxContent></w:r></w:p></w:body></w:document>`;
+
+describe("deleteShape", () => {
+  it("deletes the text box under tracked changes", async () => {
+    const box = { text: "当事者目録\r" };
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文"],
+      ooxml: BOX("当事者目録"),
+      shapes: [box],
+    });
+    await readDocumentText(10_000);
+    const note = await deleteShape({ shape: 1 });
+    expect(word.deletedShapes).toEqual([box]);
+    expect(word.getTracking()).toBe("trackAll");
+    expect(note).toContain("図1");
+    expect(note).toContain("当事者目録");
+    expect(note).toContain("この番号はもう使えません");
+    await expect(deleteShape({ shape: 1 })).rejects.toThrow(/削除済み/);
+    expect(word.deletedShapes).toEqual([box]);
+  });
+
+  it("deletes the later copy when two boxes share the text", async () => {
+    const first = { text: "甲\r" };
+    const second = { text: "乙\r" };
+    const third = { text: "甲\r" };
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文"],
+      ooxml: `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:r><w:txbxContent><w:p><w:r><w:t>甲</w:t></w:r></w:p></w:txbxContent></w:r></w:p>
+        <w:p><w:r><w:txbxContent><w:p><w:r><w:t>乙</w:t></w:r></w:p></w:txbxContent></w:r></w:p>
+        <w:p><w:r><w:txbxContent><w:p><w:r><w:t>甲</w:t></w:r></w:p></w:txbxContent></w:r></w:p>
+      </w:body></w:document>`,
+      shapes: [first, second, third],
+    });
+    await readDocumentText(10_000);
+    await deleteShape({ shape: 3 });
+    expect(word.deletedShapes).toEqual([third]);
+  });
+
+  it("deletes the later copy after the earlier one stays in the collection", async () => {
+    const first = { text: "甲\r" };
+    const second = { text: "乙\r" };
+    const third = { text: "甲\r" };
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文"],
+      ooxml: `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:r><w:txbxContent><w:p><w:r><w:t>甲</w:t></w:r></w:p></w:txbxContent></w:r></w:p>
+        <w:p><w:r><w:txbxContent><w:p><w:r><w:t>乙</w:t></w:r></w:p></w:txbxContent></w:r></w:p>
+        <w:p><w:r><w:txbxContent><w:p><w:r><w:t>甲</w:t></w:r></w:p></w:txbxContent></w:r></w:p>
+      </w:body></w:document>`,
+      shapes: [first, second, third],
+    });
+    await readDocumentText(10_000);
+    await deleteShape({ shape: 1 });
+    await deleteShape({ shape: 3 });
+    expect(word.deletedShapes).toEqual([first, third]);
+  });
+
+  it("deletes the text box inside a group", async () => {
+    const child = { text: "当事者目録\r", type: "TextBox" as const };
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文"],
+      ooxml: BOX("当事者目録"),
+      shapes: [{ text: "", type: "Group", children: [child] }],
+    });
+    await readDocumentText(10_000);
+    await deleteShape({ shape: 1 });
+    expect(word.deletedShapes).toEqual([child]);
+  });
+
+  it("deletes the text box inside a canvas", async () => {
+    const child = { text: "当事者目録\r", type: "TextBox" as const };
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文"],
+      ooxml: BOX("当事者目録"),
+      shapes: [{ text: "", type: "Canvas", children: [child] }],
+    });
+    await readDocumentText(10_000);
+    await deleteShape({ shape: 1 });
+    expect(word.deletedShapes).toEqual([child]);
+  });
+
+  it("does not delete when this Word has no shape API", async () => {
+    const box = { text: "当事者目録\r" };
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文"],
+      ooxml: BOX("当事者目録"),
+      shapes: [box],
+      wordApiDesktop12: false,
+    });
+    await readDocumentText(10_000);
+    await expect(deleteShape({ shape: 1 })).rejects.toThrow(/この Word ではテキストボックスを削除できません/);
+    expect(word.deletedShapes).toEqual([]);
+    expect(word.getTracking()).toBe("");
   });
 });
 
@@ -1122,6 +1337,19 @@ describe("readAttachment", () => {
     expect(attachment.document).toContain("第1条（目的）");
     expect(attachment.focus).toBe("第2条（代金）");
     expect(attachment.paragraphs).toBe(2);
+  });
+
+  it("does not send every shape when the user asked for the selection only", async () => {
+    installWord({
+      selection: "前文",
+      body: "",
+      paragraphs: ["前文"],
+      ooxml: `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:txbxContent><w:p><w:r><w:t>当事者目録</w:t></w:r></w:p></w:txbxContent></w:r></w:p></w:body></w:document>`,
+    });
+    const attachment = await readAttachment("selection", 1_000, false);
+    expect(attachment.focus).toBe("前文");
+    expect(attachment.document).toBe("");
+    expect(attachment.shapes).toBeUndefined();
   });
 
   it("leaves the body out when the user asked for the selection only", async () => {

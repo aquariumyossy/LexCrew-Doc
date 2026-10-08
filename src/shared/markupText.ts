@@ -1,6 +1,7 @@
 import { ChangeKind, ChangeNote, CommentNote, clipNote, MAX_CHANGE_TEXT_CHARS } from "./attachment";
 import { MAX_CHANGES_READ } from "./constants";
 import { formatParagraphRef } from "./paragraphRef";
+import { ShapeStory } from "./extract/shapeText";
 import { scanXml, xmlAttr, xmlDate } from "./extract/xml";
 
 export const MARKUP_LEGEND = "※ 〔-〕削除  〔+〕挿入  〔注〕コメント";
@@ -253,11 +254,24 @@ export function neutralizeLiteralMarkup(text: string): string {
   return text.replace(/〔([+-\u6ce8][^〕]*)〕/g, (_match, inner) => `［${inner}］`);
 }
 
+export type MarkupBodyOptions = {
+  /**
+   * Live `body.paragraphs` omits text-box paragraphs. Counting them makes the
+   * inline-markup path reject the package. Attached `.docx` files leave this
+   * off so a text box stays in the file body.
+   */
+  skipShapeParagraphs?: boolean;
+};
+
 /**
  * Walk document XML once, producing plain and marked paragraph text plus
  * format-only change notes. Insert/delete live inline when this path is used.
  */
-export function readMarkupBody(documentXml: string, commentsXml?: string): MarkupBodyRead {
+export function readMarkupBody(
+  documentXml: string,
+  commentsXml?: string,
+  options?: MarkupBodyOptions
+): MarkupBodyRead {
   const comments = commentsXml ? parseCommentsXml(commentsXml) : new Map<string, ParsedComment>();
   const emittedComments = new Set<string>();
   const commentsForAppendix: CommentNote[] = [];
@@ -277,6 +291,8 @@ export function readMarkupBody(documentXml: string, commentsXml?: string): Marku
   let pending: ChangeNote[] = [];
   let builder: ParaBuilder | null = null;
   let plainParts: string[] = [];
+  const story = options?.skipShapeParagraphs ? new ShapeStory() : null;
+  const hidden = () => story?.hiddenFromBody() ?? false;
 
   const keepChange = (note: ChangeNote) => {
     if (note.kind === "insert" || note.kind === "delete") {
@@ -314,6 +330,9 @@ export function readMarkupBody(documentXml: string, commentsXml?: string): Marku
 
   for (const event of scanXml(documentXml)) {
     if (event.kind === "text") {
+      if (hidden()) {
+        continue;
+      }
       const leaf = stack[stack.length - 1];
       if (leaf !== "w:t" && leaf !== "w:delText") {
         continue;
@@ -341,17 +360,18 @@ export function readMarkupBody(documentXml: string, commentsXml?: string): Marku
     }
 
     if (event.kind === "close") {
+      const inShape = hidden();
       const found = stack.lastIndexOf(event.name);
       if (found >= 0) {
         stack.length = found;
       }
-      if (event.name === "w:ins" || event.name === "w:moveTo") {
+      if (!inShape && (event.name === "w:ins" || event.name === "w:moveTo")) {
         ins.pop();
       }
-      if (event.name === "w:del" || event.name === "w:moveFrom") {
+      if (!inShape && (event.name === "w:del" || event.name === "w:moveFrom")) {
         del.pop();
       }
-      if (event.name === "w:p") {
+      if (!inShape && event.name === "w:p") {
         paragraphCount += 1;
         const plain = plainParts.join("").trim();
         const markedText = builder ? builder.finish() : plain;
@@ -370,13 +390,25 @@ export function readMarkupBody(documentXml: string, commentsXml?: string): Marku
         plainParts = [];
         builder = null;
       }
-      const kind = markKind(event.name);
-      if (kind && marks.length) {
-        const mark = marks.pop() as Mark;
-        const text = clipNote(mark.text.join(""), MAX_CHANGE_TEXT_CHARS);
-        if (text || mark.kind === "format") {
-          pending.push({ kind: mark.kind, author: mark.author, date: mark.date, text, where: "" });
+      if (!inShape) {
+        const kind = markKind(event.name);
+        if (kind && marks.length) {
+          const mark = marks.pop() as Mark;
+          const text = clipNote(mark.text.join(""), MAX_CHANGE_TEXT_CHARS);
+          if (text || mark.kind === "format") {
+            pending.push({ kind: mark.kind, author: mark.author, date: mark.date, text, where: "" });
+          }
         }
+      }
+      story?.close(event.name);
+      continue;
+    }
+
+    const inShape = hidden();
+    story?.open(event.name);
+    if (inShape) {
+      if (!event.empty) {
+        stack.push(event.name);
       }
       continue;
     }

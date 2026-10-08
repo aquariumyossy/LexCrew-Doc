@@ -7,9 +7,11 @@ import {
   MarkupList,
   emptyMarkup,
 } from "./attachment";
+import { SHAPE_NOTE } from "./extract/shapeText";
 import { CommittedFile } from "./fileSource";
 import {
   DOCUMENT_MARKER,
+  SHAPES_MARKER,
   SELECTION_MARKER,
   splitUserMessage,
   stripAttachment,
@@ -191,6 +193,26 @@ describe("systemPrompt", () => {
     expect(text).toContain("続柄は補っていません");
   });
 
+  it("says a numbered shape is deleted by that number and not otherwise edited", () => {
+    const text = systemPrompt({
+      ...base,
+      search: false,
+      argos: false,
+      shapes: true,
+      shapeNumbers: true,
+    });
+    expect(text).toContain(SHAPES_MARKER);
+    expect(text).toContain("read_paragraphs には出ません");
+    expect(text).toContain("delete_shape");
+    expect(text).toContain("[図1]");
+    expect(text).toContain("段落番号ではありません");
+    expect(text).toContain("置換、コメント、挿入の対象にしません");
+    const unread = systemPrompt({ ...base, search: false, argos: false, shapes: true });
+    expect(unread).not.toContain("delete_shape");
+    const without = systemPrompt({ ...base, search: false, argos: false });
+    expect(without).not.toContain(SHAPES_MARKER);
+  });
+
   it("says nothing about files on a turn that carries none", () => {
     const text = systemPrompt({ ...base, search: false, argos: false });
     expect(text).not.toContain("--- 添付ファイル ---");
@@ -235,6 +257,53 @@ describe("userMessageWithAttachment", () => {
     expect(text).toContain(DOCUMENT_MARKER);
     expect(text).toContain("余白が足りず");
     expect(text).toContain("本文が無いという意味ではありません");
+  });
+
+  it("does not call a document empty when the words are in a shape", () => {
+    const text = userMessageWithAttachment(
+      "点検して",
+      attachment({
+        document: "",
+        paragraphs: 0,
+        truncated: false,
+        shapes: { text: `${SHAPE_NOTE}\n当事者目録`, truncated: false, error: "" },
+      })
+    );
+    expect(text).not.toContain("空の文書");
+    expect(text).toContain(SHAPES_MARKER);
+    expect(text).toContain("当事者目録");
+    expect(text).toContain("read_paragraphs には出ません");
+    const stored = userMessageForHistory(
+      "点検して",
+      attachment({
+        document: "",
+        paragraphs: 0,
+        shapes: { text: `${SHAPE_NOTE}\n当事者目録`, truncated: false, error: "" },
+      })
+    );
+    expect(stored).toContain("図形の文字を渡した");
+    expect(stored).not.toContain("当事者目録");
+    expect(stored).not.toContain("空の文書");
+  });
+
+  it("does not call a document empty when the shape text could not be read", () => {
+    const text = userMessageWithAttachment(
+      "点検して",
+      attachment({
+        document: "",
+        paragraphs: 0,
+        truncated: false,
+        shapes: { text: "", truncated: false, error: "OOXMLを読めません" },
+      })
+    );
+    expect(text).not.toContain("空の文書");
+    expect(text).toContain("図形の文字は読めませんでした");
+    expect(text).toContain("無いとは限りません");
+  });
+
+  it("leaves the shape section out when the document has no shapes", () => {
+    const text = userMessageWithAttachment("点検して", attachment());
+    expect(text).not.toContain(SHAPES_MARKER);
   });
 
   it("distinguishes an empty document from a body that would not fit", () => {
@@ -383,6 +452,7 @@ describe("splitUserMessage", () => {
       changes: "",
       files: "",
       selection: "",
+      shapes: "",
     });
   });
 });

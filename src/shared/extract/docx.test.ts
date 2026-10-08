@@ -73,6 +73,26 @@ function numberedParagraph(text: string, withInsert = false): string {
   return `<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>${text}</w:t></w:r>${insert}</w:p>`;
 }
 
+describe("extractDocx text boxes", () => {
+  const boxed = `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+    <w:p><w:r><w:t>前文</w:t></w:r><w:r><w:txbxContent><w:p><w:r><w:t>当事者目録</w:t></w:r></w:p></w:txbxContent></w:r></w:p>
+  </w:body></w:document>`;
+
+  it("includes text that sits inside a text box", () => {
+    expect(extractDocx({ document: boxed }).body).toContain("当事者目録");
+  });
+
+  it("includes text-box text when the file also has a tracked change", () => {
+    const marked = `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+      <w:p><w:r><w:t>前文</w:t></w:r><w:ins w:author="甲" w:date="2026-03-01T00:00:00Z"><w:r><w:t>追記</w:t></w:r></w:ins></w:p>
+      <w:p><w:r><w:txbxContent><w:p><w:r><w:t>当事者目録</w:t></w:r></w:p></w:txbxContent></w:r></w:p>
+    </w:body></w:document>`;
+    const read = extractDocx({ document: marked });
+    expect(read.body).toContain("当事者目録");
+    expect(read.body).toContain("〔+甲: 追記〕");
+  });
+});
+
 describe("extractDocx list marks", () => {
   it("puts the list label outside the paragraph text", () => {
     const document = `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>

@@ -5,6 +5,7 @@ import {
   TOOL_FORMAT_LIST,
   TOOL_SET_OUTLINE,
   TOOL_DELETE_PARAGRAPHS,
+  TOOL_DELETE_SHAPE,
   TOOL_FIND_IN_DOCUMENT,
   TOOL_INSERT_BLANK_BEFORE,
   TOOL_INSERT_BLOCKS,
@@ -126,6 +127,8 @@ describe("buildTools", () => {
     expect(names({})).toContain(TOOL_FIND_IN_DOCUMENT);
     expect(names({ numbered: true })).toContain(TOOL_INSERT_BLANK_BEFORE);
     expect(names({ numbered: true })).toContain(TOOL_DELETE_PARAGRAPHS);
+    expect(names({})).not.toContain(TOOL_DELETE_SHAPE);
+    expect(buildTools({ shapes: true }).map((tool) => tool.function.name)).toContain(TOOL_DELETE_SHAPE);
     expect(names({ insertedNumbers: true })).toContain(TOOL_INSERT_BLANK_BEFORE);
     const description = buildTools({ numbered: true }).find(
       (tool) => tool.function.name === TOOL_INSERT_BLANK_BEFORE
@@ -618,6 +621,8 @@ describe("describeToolCall", () => {
     expect(describeToolCall(TOOL_DELETE_PARAGRAPHS, '{"paragraphs":[14]}')).toBe(
       "段落 14 を削除"
     );
+    expect(describeToolCall(TOOL_DELETE_SHAPE, '{"shape":2}')).toBe("図2 を削除");
+    expect(parseToolArguments(TOOL_DELETE_SHAPE, '{"shape":0}').ok).toBe(false);
     expect(
       describeToolCall(TOOL_READ_INDEXED_FILE, '{"path":"C:\\\\案件\\\\委託基本契約書.docx"}')
     ).toBe("資料を読む「C:\\案件\\委託基本契約書.docx」");

@@ -76,6 +76,14 @@ describe("loadSettings timeout migration", () => {
     expect(loadSettings().contextLimit).toBe(DEFAULT_CONTEXT_LIMIT);
   });
 
+  it("keeps formatting on the same thinking level until the user picks another", () => {
+    expect(loadSettings().formatThinkingLevel).toBe("same");
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ formatThinkingLevel: "low" }));
+    expect(loadSettings().formatThinkingLevel).toBe("low");
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ formatThinkingLevel: "loud" }));
+    expect(loadSettings().formatThinkingLevel).toBe("same");
+  });
+
   it("defaults the tool-round cap and keeps unlimited", () => {
     expect(loadSettings().maxToolRounds).toBe(MAX_TOOL_ROUNDS);
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ maxToolRounds: 0 }));

@@ -60,7 +60,14 @@ import { REMOTE_OCR_NOTICE, isLoopbackUrl } from "../../shared/ocr";
 import { ConversationSummary, NewMessage, StoredMessage } from "../../shared/history";
 import { joinArgosScopes, parseArgosScopes } from "../../shared/argos";
 import { systemPrompt } from "../../shared/prompts";
-import { THINKING_LEVELS, THINKING_LEVEL_LABELS, ThinkingLevel } from "../../shared/thinking";
+import {
+  FORMAT_THINKING_LEVELS,
+  FORMAT_THINKING_LABELS,
+  THINKING_LEVELS,
+  THINKING_LEVEL_LABELS,
+  ThinkingLevel,
+  normalizeFormatThinkingLevel,
+} from "../../shared/thinking";
 import {
   TOOL_ROUND_PRESETS,
   normalizeMaxToolRounds,
@@ -1329,6 +1336,23 @@ const App: React.FC = () => {
                   >
                     {THINKING_LEVELS.map((level) => (
                       <Radio key={level} value={level} label={THINKING_LEVEL_LABELS[level]} />
+                    ))}
+                  </RadioGroup>
+                </Field>
+                <Field
+                  size="small"
+                  label="書式のときの思考"
+                  hint="書式の作業だけ、この思考レベルにします。既定は上と同じです。オフは推奨しません。"
+                >
+                  <RadioGroup
+                    layout="horizontal"
+                    value={settings.formatThinkingLevel}
+                    onChange={(_, d) =>
+                      patch({ formatThinkingLevel: normalizeFormatThinkingLevel(d.value) })
+                    }
+                  >
+                    {FORMAT_THINKING_LEVELS.map((level) => (
+                      <Radio key={level} value={level} label={FORMAT_THINKING_LABELS[level]} />
                     ))}
                   </RadioGroup>
                 </Field>

@@ -1,4 +1,5 @@
 import { BLOCK_TYPES, DraftBlock, Severity, normalizeBlock } from "./blocks";
+import { FormatSelect, isListFilter, listFilterEnum, replacePatternError } from "./bulkFormat";
 import { LINE_SPACING_CHARS, LineSpacingChars } from "./constants";
 import { ListStyle, isListStyle, listStyleEnum, listStyleToolDescription } from "./listStyles";
 
@@ -15,8 +16,25 @@ export const TOOL_INSERT_COMMENT = "insert_comment";
 export const TOOL_INSERT_CITATION = "insert_citation";
 export const TOOL_FORMAT_TEXT = "format_text";
 export const TOOL_FORMAT_PARAGRAPH = "format_paragraph";
+export const TOOL_APPLY_FORMAT = "apply_format";
+export const TOOL_REPLACE_ALL = "replace_all";
+export const TOOL_COPY_FORMAT = "copy_format";
 export const TOOL_FORMAT_LIST = "format_list";
 export const TOOL_SET_OUTLINE = "set_outline_level";
+
+const FORMATTING_TOOLS = new Set<string>([
+  TOOL_FORMAT_TEXT,
+  TOOL_FORMAT_PARAGRAPH,
+  TOOL_APPLY_FORMAT,
+  TOOL_COPY_FORMAT,
+  TOOL_FORMAT_LIST,
+  TOOL_SET_OUTLINE,
+]);
+
+/** True for tools that change appearance. `replace_all` is a text edit, so it stays out. */
+export function isFormattingTool(name: string): boolean {
+  return FORMATTING_TOOLS.has(name);
+}
 export const TOOL_READ_PARAGRAPHS = "read_paragraphs";
 export const TOOL_FIND_IN_DOCUMENT = "find_in_document";
 export const TOOL_DELETE_PARAGRAPHS = "delete_paragraphs";
@@ -126,9 +144,7 @@ export type InsertCitationArgs = {
   snippet: string;
   as: "comment" | "text";
 };
-export type FormatTextArgs = {
-  quote: string;
-  paragraph?: number;
+export type TextFormatFields = {
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
@@ -137,15 +153,59 @@ export type FormatTextArgs = {
   color?: string;
   highlightColor?: string;
 };
-export type FormatParagraphArgs = {
-  quote: string;
-  paragraph?: number;
+
+export type ParagraphFormatFields = {
   alignment?: ParagraphAlignmentArg;
   firstLineIndent?: number;
   leftIndent?: number;
   spaceBefore?: number;
   spaceAfter?: number;
   lineSpacing?: number;
+};
+
+export type FormatTextArgs = TextFormatFields & {
+  quote: string;
+  paragraph?: number;
+  /** Inclusive end of a span that starts at `paragraph` or at `quote`. */
+  through?: number;
+  /** Explicit paragraph numbers. When set, `paragraph` and `through` are not used. */
+  paragraphs?: number[];
+};
+export type FormatParagraphArgs = ParagraphFormatFields & {
+  quote: string;
+  paragraph?: number;
+  through?: number;
+  paragraphs?: number[];
+};
+
+export type ApplyFormatArgs = {
+  select: FormatSelect;
+  format: TextFormatFields & ParagraphFormatFields;
+};
+
+export type ReplaceAllArgs = {
+  find: string;
+  /** Absent leaves the text. An empty string deletes each hit. */
+  replace?: string;
+  regex?: boolean;
+  matchCase?: boolean;
+  wholeWord?: boolean;
+  format?: TextFormatFields;
+};
+
+export type CopyFormatWhat = "both" | "character" | "paragraph";
+
+export type CopyFormatArgs = {
+  /** Sample paragraph number. */
+  from?: number;
+  /** Sample quote, when this turn has no paragraph numbers. */
+  quote: string;
+  paragraph?: number;
+  through?: number;
+  paragraphs?: number[];
+  select?: FormatSelect;
+  /** Default is both character and paragraph formatting. */
+  what?: CopyFormatWhat;
 };
 
 export type ListAction = "apply" | "remove" | "restart";
@@ -214,6 +274,9 @@ export type ToolInvocation =
   | { name: typeof TOOL_INSERT_CITATION; args: InsertCitationArgs }
   | { name: typeof TOOL_FORMAT_TEXT; args: FormatTextArgs }
   | { name: typeof TOOL_FORMAT_PARAGRAPH; args: FormatParagraphArgs }
+  | { name: typeof TOOL_APPLY_FORMAT; args: ApplyFormatArgs }
+  | { name: typeof TOOL_REPLACE_ALL; args: ReplaceAllArgs }
+  | { name: typeof TOOL_COPY_FORMAT; args: CopyFormatArgs }
   | { name: typeof TOOL_FORMAT_LIST; args: FormatListArgs }
   | { name: typeof TOOL_SET_OUTLINE; args: SetOutlineArgs }
   | { name: typeof TOOL_READ_PARAGRAPHS; args: ReadParagraphsArgs }
@@ -352,7 +415,8 @@ function replaceQuoteTool(target: TargetHints, numbered: boolean): ToolDefinitio
         "変わった数語だけを渡すと、残りの文が削除になります。" +
         (numbered
           ? "paragraph で段落を指します。quote でその中の範囲を絞れます。quote を省くと段落全体が範囲になります。"
-          : "選択があればその中を先に探し、無ければ本文全体から探す。"),
+          : "選択があればその中を先に探し、無ければ本文全体から探す。") +
+        "同じ文字列を文書中のすべてで置き換えるときは replace_all。",
       parameters: {
         type: "object",
         properties: { ...target.properties, text: stringParam("置換後の本文") },
@@ -524,6 +588,93 @@ function insertCitationTool(): ToolDefinition {
   };
 }
 
+const BULK_FORMAT_HINT =
+  "複数の段落は paragraphs（番号の配列）か、paragraph から through までの区間で 1 回にまとめる。1 段落ずつ繰り返さない。" +
+  "段落の中の一部だけを変えるときは quote を使い、through と paragraphs は付けない（付けると段落全体が対象）。" +
+  "条件で選ぶときは apply_format。見本から写すときは copy_format。同じ応答で他の書式ツールとまとめて呼ぶ。";
+
+function bulkAddressProperties(target: TargetHints): Record<string, unknown> {
+  if (!Object.prototype.hasOwnProperty.call(target.properties, "paragraph")) {
+    return {};
+  }
+  return {
+    through: {
+      type: "number",
+      description:
+        "paragraph（無ければ quote の段落）からこの段落番号まで（この番号を含む）。段落全体が対象。空段落は飛ばす。paragraphs とは同時に使わない。",
+    },
+    paragraphs: {
+      type: "array",
+      items: { type: "number" },
+      description:
+        "対象にする段落番号。あるときはこの配列だけが対象で、paragraph と through は見ない。段落全体が対象。",
+    },
+  };
+}
+
+const TEXT_FORMAT_PROPERTIES: Record<string, unknown> = {
+  bold: { type: "boolean", description: "太字" },
+  italic: { type: "boolean", description: "斜体" },
+  underline: { type: "boolean", description: "下線" },
+  size: { type: "number", description: "文字の大きさ（pt）" },
+  fontName: stringParam("フォント名（例: 游明朝）"),
+  color: stringParam("文字色。#RRGGBB。"),
+  highlightColor: stringParam("蛍光ペン。#RRGGBB。解除は空文字。"),
+};
+
+const PARAGRAPH_FORMAT_PROPERTIES: Record<string, unknown> = {
+  alignment: {
+    type: "string",
+    enum: ["left", "center", "right", "justify"],
+    description: "揃え",
+  },
+  firstLineIndent: {
+    type: "number",
+    description:
+      "1行目の位置（pt）。左インデントからの差分。正は字下げ（1行目が右へ）、負はぶら下げ（1行目が左へ出る）。本文12ptでぶら下げ2字なら -24。",
+  },
+  leftIndent: {
+    type: "number",
+    description:
+      "左インデント（pt）。2行目以降の位置。本文12ptで3字なら 36。ぶら下げのとき、1行目はここより firstLineIndent の分だけ左。",
+  },
+  spaceBefore: {
+    type: "number",
+    description: "段落前の間隔（pt）。0 で詰める。指定すると「自動」を外す。",
+  },
+  spaceAfter: {
+    type: "number",
+    description: "段落後の間隔（pt）。0 で詰める。指定すると「自動」を外す。",
+  },
+  lineSpacing: { type: "number", description: "行間（pt）" },
+};
+
+function selectProperties(): Record<string, unknown> {
+  return {
+    style: stringParam("スタイル名（見出し 1、標準）または組み込み名（Heading1）。完全一致。"),
+    outlineLevel: {
+      type: "number",
+      description: "ナビゲーションの見出しレベル。1 から 9。",
+    },
+    text: stringParam("段落本文との部分一致。regex が true のときは正規表現。"),
+    regex: { type: "boolean", description: "text を正規表現として扱う。一致は 1 段落の中だけ。" },
+    matchCase: {
+      type: "boolean",
+      description: "true で大文字小文字を区別する。省くと区別しない。",
+    },
+    empty: { type: "boolean", description: "true は空段落だけ。false は文字のある段落だけ。" },
+    list: {
+      type: "string",
+      enum: listFilterEnum(),
+      description: "any は箇条書きか番号、bullet は箇条書き、numbered は番号、none はどちらでもない。",
+    },
+    tableCell: {
+      type: "boolean",
+      description: "true は表のセルだけ。false は表の外だけ。表の作成や罫線はできない。",
+    },
+  };
+}
+
 function formatTextTool(target: TargetHints): ToolDefinition {
   return {
     type: "function",
@@ -531,19 +682,15 @@ function formatTextTool(target: TargetHints): ToolDefinition {
       name: TOOL_FORMAT_TEXT,
       description:
         "文字書式を変える。本文は変えない。修正履歴に書式変更として残る。" +
-        "指定しなかった項目は元のまま。",
+        "指定しなかった項目は元のまま。" +
+        BULK_FORMAT_HINT,
       parameters: {
         type: "object",
         ...(target.required.length ? { required: target.required } : {}),
         properties: {
           ...target.properties,
-          bold: { type: "boolean", description: "太字" },
-          italic: { type: "boolean", description: "斜体" },
-          underline: { type: "boolean", description: "下線" },
-          size: { type: "number", description: "文字の大きさ（pt）" },
-          fontName: stringParam("フォント名（例: 游明朝）"),
-          color: stringParam("文字色。#RRGGBB。"),
-          highlightColor: stringParam("蛍光ペン。#RRGGBB。解除は空文字。"),
+          ...bulkAddressProperties(target),
+          ...TEXT_FORMAT_PROPERTIES,
         },
       },
     },
@@ -561,36 +708,144 @@ function formatParagraphTool(target: TargetHints): ToolDefinition {
         "行間を指定すると、対象段落は行グリッドへの合わせを外す（狭くしても効くようにするため）。" +
         "段落前・段落後の間隔を指定すると、「自動」を外してその値にする。" +
         "左インデントは折り返し（2行目以降）の位置。1行目は正の値で字下げ、負の値でぶら下げ。" +
-        "本文12ptの左3字・ぶら下げ2字は、左36、1行目-24。",
+        "本文12ptの左3字・ぶら下げ2字は、左36、1行目-24。" +
+        BULK_FORMAT_HINT,
       parameters: {
         type: "object",
         ...(target.required.length ? { required: target.required } : {}),
         properties: {
           ...target.properties,
-          alignment: {
+          ...bulkAddressProperties(target),
+          ...PARAGRAPH_FORMAT_PROPERTIES,
+        },
+      },
+    },
+  };
+}
+
+function applyFormatTool(): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_APPLY_FORMAT,
+      description:
+        "条件に合う段落すべてに、同じ書式を 1 回で当てる。本文は変えない。修正履歴に書式変更として残る。" +
+        "select の条件はすべて AND。段落番号を並べない。" +
+        "format に文字書式と段落書式を混ぜてよい。指定しなかった項目は元のまま。" +
+        "行間を指定すると、対象段落は行グリッドへの合わせを外す。" +
+        "戻り値は件数だけ。同じ応答で他の書式ツールとまとめて呼ぶ。",
+      parameters: {
+        type: "object",
+        required: ["select", "format"],
+        properties: {
+          select: {
+            type: "object",
+            description: "どれも指定が無い呼び出しは、文書全体には当たらず失敗する。",
+            properties: selectProperties(),
+          },
+          format: {
+            type: "object",
+            description: "当てる書式。文字と段落を同じオブジェクトに入れてよい。",
+            properties: { ...TEXT_FORMAT_PROPERTIES, ...PARAGRAPH_FORMAT_PROPERTIES },
+          },
+        },
+      },
+    },
+  };
+}
+
+function replaceAllTool(): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_REPLACE_ALL,
+      description:
+        "文書全体を検索して、一致した箇所をまとめて置換する。修正履歴に残る。" +
+        "段落ごとに replace_quote を繰り返さない。" +
+        "find は 1 段落の中だけで探す。regex を true にすると find は正規表現。" +
+        "matchCase を省くと大文字小文字を区別しない。" +
+        "wholeWord を true にすると、前後が英数字・かな・漢字でないときだけ一致する。日本語は空白が無くても、隣の文字が語なら一致しない。" +
+        "replace を省くと文字は変えず、format の文字書式だけを一致箇所に当てる。replace が空文字ならその箇所を削除する。" +
+        "戻り値は件数だけ。",
+      parameters: {
+        type: "object",
+        required: ["find"],
+        properties: {
+          find: stringParam("探す文字列。regex が true のときは正規表現。"),
+          replace: stringParam("置換後の文字列。省くと文字は変えない。空文字は削除。"),
+          regex: { type: "boolean", description: "find を正規表現として扱う。" },
+          matchCase: {
+            type: "boolean",
+            description: "true で大文字小文字を区別する。省くと区別しない。",
+          },
+          wholeWord: {
+            type: "boolean",
+            description: "true で語の途中は一致させない。",
+          },
+          format: {
+            type: "object",
+            description: "一致箇所に当てる文字書式。段落書式は入れない。",
+            properties: TEXT_FORMAT_PROPERTIES,
+          },
+        },
+      },
+    },
+  };
+}
+
+function copyFormatTool(target: TargetHints): ToolDefinition {
+  const numbered = Object.prototype.hasOwnProperty.call(target.properties, "paragraph");
+  return {
+    type: "function",
+    function: {
+      name: TOOL_COPY_FORMAT,
+      description:
+        "見本の段落から、直接の文字書式と段落書式を写す。本文は変えない。修正履歴に書式変更として残る。" +
+        "スタイル名は変えない。見本の中で混在している項目は省く。見本自身には書き戻さない。" +
+        (numbered
+          ? "from は見本の段落番号。写す先は paragraph から through、paragraphs、select のどれか一つ。"
+          : "quote は見本の引用。写す先は select。") +
+        "what を省くと文字と段落の両方。戻り値は件数だけ。同じ応答で他の書式ツールとまとめて呼ぶ。",
+      parameters: {
+        type: "object",
+        required: numbered ? ["from"] : ["quote"],
+        properties: {
+          ...(numbered
+            ? {
+                from: {
+                  type: "number",
+                  description: "見本の段落番号。添付または insert_blocks の [12]。",
+                },
+                paragraph: {
+                  type: "number",
+                  description: "写す先の先頭の段落番号。through と組む。見本の from とは別。",
+                },
+                through: {
+                  type: "number",
+                  description: "写す先の末尾の段落番号（この番号を含む）。",
+                },
+                paragraphs: {
+                  type: "array",
+                  items: { type: "number" },
+                  description: "写す先の段落番号。paragraph / through / select とは同時に使わない。",
+                },
+              }
+            : {}),
+          quote: stringParam(
+            numbered
+              ? "見本を番号で指せないときの引用。from があるときは見ない。"
+              : "見本にする段落の引用。添付された本文から字句どおりに写す。"
+          ),
+          select: {
+            type: "object",
+            description: "写す先を apply_format と同じ条件で選ぶ。範囲の指定とは同時に使わない。",
+            properties: selectProperties(),
+          },
+          what: {
             type: "string",
-            enum: ["left", "center", "right", "justify"],
-            description: "揃え",
+            enum: ["both", "character", "paragraph"],
+            description: "both は文字と段落。character は文字だけ。paragraph は段落だけ。省くと both。",
           },
-          firstLineIndent: {
-            type: "number",
-            description:
-              "1行目の位置（pt）。左インデントからの差分。正は字下げ（1行目が右へ）、負はぶら下げ（1行目が左へ出る）。本文12ptでぶら下げ2字なら -24。",
-          },
-          leftIndent: {
-            type: "number",
-            description:
-              "左インデント（pt）。2行目以降の位置。本文12ptで3字なら 36。ぶら下げのとき、1行目はここより firstLineIndent の分だけ左。",
-          },
-          spaceBefore: {
-            type: "number",
-            description: "段落前の間隔（pt）。0 で詰める。指定すると「自動」を外す。",
-          },
-          spaceAfter: {
-            type: "number",
-            description: "段落後の間隔（pt）。0 で詰める。指定すると「自動」を外す。",
-          },
-          lineSpacing: { type: "number", description: "行間（pt）" },
         },
       },
     },
@@ -837,6 +1092,7 @@ export function buildTools(options: ToolSetOptions = {}): ToolDefinition[] {
     tools.push(replaceSelectionTool());
   }
   tools.push(replaceQuoteTool(target, numbered));
+  tools.push(replaceAllTool());
   tools.push(insertBlocksTool(numbered || inserted));
   if (numbered || inserted) {
     tools.push(insertBlankBeforeTool());
@@ -848,6 +1104,8 @@ export function buildTools(options: ToolSetOptions = {}): ToolDefinition[] {
   tools.push(insertCommentTool(target));
   tools.push(formatTextTool(target));
   tools.push(formatParagraphTool(target));
+  tools.push(applyFormatTool());
+  tools.push(copyFormatTool(target));
   tools.push(formatListTool(target));
   tools.push(setOutlineTool(target));
   return tools;
@@ -1069,12 +1327,431 @@ function severityOf(row: Record<string, unknown>): Severity {
   return value === "high" || value === "low" || value === "medium" ? value : "medium";
 }
 
-function alignmentOf(row: Record<string, unknown>): ParagraphAlignmentArg | undefined {
+function alignmentOf(
+  row: Record<string, unknown>
+): ParagraphAlignmentArg | undefined | { error: string } {
   const value = row.alignment;
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
   if (value === "left" || value === "center" || value === "right" || value === "justify") {
     return value;
   }
-  return undefined;
+  return { error: 'alignment は "left"、"center"、"right"、"justify" のどれかにしてください。' };
+}
+
+function optionalParagraphNumbers(
+  row: Record<string, unknown>
+): number[] | undefined | { error: string } {
+  if (!Object.prototype.hasOwnProperty.call(row, "paragraphs")) {
+    return undefined;
+  }
+  const raw = row.paragraphs;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { error: "paragraphs に、対象の段落番号を 1 つ以上入れてください。" };
+  }
+  const numbers: number[] = [];
+  const seen = new Set<number>();
+  for (const item of raw) {
+    const number = paragraphNumber(item);
+    if (number === undefined) {
+      return {
+        error: "paragraphs は添付された本文の行頭にある [番号] の数字（1 以上の整数）の配列にしてください。",
+      };
+    }
+    if (!seen.has(number)) {
+      seen.add(number);
+      numbers.push(number);
+    }
+  }
+  return numbers;
+}
+
+/**
+ * `paragraphs` wins over `paragraph`, so a schema that still requires `paragraph`
+ * can send both and the list is what gets formatted.
+ */
+function formatAddress(row: Record<string, unknown>): FormatSpan | { error: string } {
+  const quote = text(row, "quote");
+  const paragraphs = optionalParagraphNumbers(row);
+  if (isArgError(paragraphs)) {
+    return paragraphs;
+  }
+  const paragraph = paragraphOf(row);
+  if (isArgError(paragraph)) {
+    return paragraph;
+  }
+  const through = throughOf(row);
+  if (isArgError(through)) {
+    return through;
+  }
+  if (paragraphs && through !== undefined) {
+    return { error: "paragraphs と through は同時に使えません。どちらか一方にしてください。" };
+  }
+  if (paragraphs) {
+    return { quote, paragraphs };
+  }
+  if (through !== undefined && paragraph === undefined && !quote.trim()) {
+    return {
+      error: "through を使うときは、区間の先頭を paragraph（または quote）で渡してください。",
+    };
+  }
+  if (through !== undefined && paragraph !== undefined && through < paragraph) {
+    return { error: "through は paragraph と同じか、それより後ろの番号にしてください。" };
+  }
+  return {
+    quote,
+    ...(paragraph === undefined ? {} : { paragraph }),
+    ...(through === undefined ? {} : { through }),
+  };
+}
+
+type FormatSpan = {
+  quote: string;
+  paragraph?: number;
+  through?: number;
+  paragraphs?: number[];
+};
+
+function readTextFormat(row: Record<string, unknown>): TextFormatFields | { error: string } {
+  const size = num(row, "size");
+  if (size !== undefined && size <= 0) {
+    return { error: "size は正の数にしてください。" };
+  }
+  return {
+    bold: bool(row, "bold"),
+    italic: bool(row, "italic"),
+    underline: bool(row, "underline"),
+    size,
+    fontName: optionalString(row, "fontName"),
+    color: optionalString(row, "color"),
+    highlightColor: optionalString(row, "highlightColor"),
+  };
+}
+
+function hasTextFormat(fields: TextFormatFields): boolean {
+  return (
+    fields.bold !== undefined ||
+    fields.italic !== undefined ||
+    fields.underline !== undefined ||
+    fields.size !== undefined ||
+    fields.fontName !== undefined ||
+    fields.color !== undefined ||
+    fields.highlightColor !== undefined
+  );
+}
+
+function readParagraphFormat(
+  row: Record<string, unknown>
+): ParagraphFormatFields | { error: string } {
+  const alignment = alignmentOf(row);
+  if (isArgError(alignment)) {
+    return alignment;
+  }
+  const spaceBefore = num(row, "spaceBefore");
+  const spaceAfter = num(row, "spaceAfter");
+  if (spaceBefore !== undefined && spaceBefore < 0) {
+    return { error: "spaceBefore は 0 以上にしてください。" };
+  }
+  if (spaceAfter !== undefined && spaceAfter < 0) {
+    return { error: "spaceAfter は 0 以上にしてください。" };
+  }
+  return {
+    alignment,
+    firstLineIndent: num(row, "firstLineIndent"),
+    leftIndent: num(row, "leftIndent"),
+    spaceBefore,
+    spaceAfter,
+    lineSpacing: num(row, "lineSpacing"),
+  };
+}
+
+function hasParagraphFormat(fields: ParagraphFormatFields): boolean {
+  return (
+    fields.alignment !== undefined ||
+    fields.firstLineIndent !== undefined ||
+    fields.leftIndent !== undefined ||
+    fields.spaceBefore !== undefined ||
+    fields.spaceAfter !== undefined ||
+    fields.lineSpacing !== undefined
+  );
+}
+
+function omitEmptyFormat<T extends Record<string, unknown>>(fields: T): T {
+  const kept = {} as T;
+  for (const key of Object.keys(fields) as (keyof T)[]) {
+    if (fields[key] !== undefined) {
+      kept[key] = fields[key];
+    }
+  }
+  return kept;
+}
+
+function parseSelect(value: unknown): FormatSelect | { error: string } {
+  const row = asRecord(value);
+  if (!row) {
+    return { error: "select はオブジェクトにしてください。" };
+  }
+  const select: FormatSelect = {};
+  if (row.style !== undefined) {
+    const style = text(row, "style").trim();
+    if (!style) {
+      return { error: "style が空です。" };
+    }
+    select.style = style;
+  }
+  if (row.outlineLevel !== undefined && row.outlineLevel !== null && row.outlineLevel !== "") {
+    const level = num(row, "outlineLevel");
+    if (level === undefined || !Number.isInteger(level) || level < 1 || level > 9) {
+      return { error: "outlineLevel は 1 から 9 の整数にしてください。" };
+    }
+    select.outlineLevel = level;
+  }
+  if (row.text !== undefined) {
+    const sample = text(row, "text");
+    if (!sample) {
+      return { error: "text が空です。" };
+    }
+    select.text = sample;
+  }
+  const regex = bool(row, "regex");
+  if (regex) {
+    select.regex = true;
+  }
+  const matchCase = bool(row, "matchCase");
+  if (matchCase) {
+    select.matchCase = true;
+  }
+  if (select.regex && select.text === undefined) {
+    return { error: "regex を使うときは text に正規表現を入れてください。" };
+  }
+  if (row.empty !== undefined) {
+    const empty = bool(row, "empty");
+    if (empty === undefined) {
+      return { error: "empty は true か false にしてください。" };
+    }
+    select.empty = empty;
+  }
+  if (select.empty === true && select.text !== undefined) {
+    return { error: "empty が true のときに text は使えません。" };
+  }
+  if (row.list !== undefined && row.list !== null && row.list !== "") {
+    if (!isListFilter(row.list)) {
+      return {
+        error: `list は ${listFilterEnum().map((name) => `"${name}"`).join("、")} のどれかにしてください。`,
+      };
+    }
+    select.list = row.list;
+  }
+  if (row.tableCell !== undefined) {
+    const tableCell = bool(row, "tableCell");
+    if (tableCell === undefined) {
+      return { error: "tableCell は true か false にしてください。" };
+    }
+    select.tableCell = tableCell;
+  }
+  if (
+    select.style === undefined &&
+    select.outlineLevel === undefined &&
+    select.text === undefined &&
+    select.empty === undefined &&
+    select.list === undefined &&
+    select.tableCell === undefined
+  ) {
+    return {
+      error: "select に条件がありません。style、outlineLevel、text、empty、list、tableCell のいずれかを入れてください。",
+    };
+  }
+  if (select.regex && select.text) {
+    const patternError = replacePatternError(
+      { find: select.text, regex: true, matchCase: select.matchCase },
+      MAX_FIND_CHARS
+    );
+    if (patternError && patternError !== "find が空です。") {
+      return { error: patternError };
+    }
+  }
+  return select;
+}
+
+function parseApplyFormat(row: Record<string, unknown>): ParsedTool {
+  const select = parseSelect(row.select);
+  if (isArgError(select)) {
+    return { ok: false, error: select.error };
+  }
+  const formatRow = asRecord(row.format);
+  if (!formatRow) {
+    return { ok: false, error: "format はオブジェクトにしてください。" };
+  }
+  const textFormat = readTextFormat(formatRow);
+  if (isArgError(textFormat)) {
+    return { ok: false, error: textFormat.error };
+  }
+  const paragraphFormat = readParagraphFormat(formatRow);
+  if (isArgError(paragraphFormat)) {
+    return { ok: false, error: paragraphFormat.error };
+  }
+  if (!hasTextFormat(textFormat) && !hasParagraphFormat(paragraphFormat)) {
+    return { ok: false, error: "変更する書式が指定されていません。" };
+  }
+  return {
+    ok: true,
+    call: {
+      name: TOOL_APPLY_FORMAT,
+      args: { select, format: { ...omitEmptyFormat(textFormat), ...omitEmptyFormat(paragraphFormat) } },
+    },
+  };
+}
+
+function parseReplaceAll(row: Record<string, unknown>): ParsedTool {
+  const find = text(row, "find");
+  if (!find) {
+    return { ok: false, error: "find が空です。" };
+  }
+  let replace: string | undefined;
+  if (row.replace !== undefined && row.replace !== null) {
+    if (typeof row.replace !== "string") {
+      return { ok: false, error: "replace は文字列にしてください。" };
+    }
+    replace = row.replace;
+  }
+  const regex = bool(row, "regex") === true;
+  const matchCase = bool(row, "matchCase") === true;
+  const wholeWord = bool(row, "wholeWord") === true;
+  const patternError = replacePatternError(
+    { find, regex, matchCase, wholeWord },
+    MAX_FIND_CHARS
+  );
+  if (patternError) {
+    return { ok: false, error: patternError };
+  }
+  let format: TextFormatFields | undefined;
+  if (row.format !== undefined && row.format !== null) {
+    const formatRow = asRecord(row.format);
+    if (!formatRow) {
+      return { ok: false, error: "format はオブジェクトにしてください。" };
+    }
+    if (
+      formatRow.alignment !== undefined ||
+      formatRow.firstLineIndent !== undefined ||
+      formatRow.leftIndent !== undefined ||
+      formatRow.spaceBefore !== undefined ||
+      formatRow.spaceAfter !== undefined ||
+      formatRow.lineSpacing !== undefined
+    ) {
+      return { ok: false, error: "replace_all の format は文字書式だけです。" };
+    }
+    const textFormat = readTextFormat(formatRow);
+    if (isArgError(textFormat)) {
+      return { ok: false, error: textFormat.error };
+    }
+    if (!hasTextFormat(textFormat)) {
+      return { ok: false, error: "format に文字書式がありません。" };
+    }
+    format = omitEmptyFormat(textFormat);
+  }
+  if (replace === undefined && !format) {
+    return { ok: false, error: "replace か format のどちらかが必要です。" };
+  }
+  return {
+    ok: true,
+    call: {
+      name: TOOL_REPLACE_ALL,
+      args: {
+        find,
+        ...(replace === undefined ? {} : { replace }),
+        ...(regex ? { regex } : {}),
+        ...(matchCase ? { matchCase } : {}),
+        ...(wholeWord ? { wholeWord } : {}),
+        ...(format ? { format } : {}),
+      },
+    },
+  };
+}
+
+function copyWhatOf(row: Record<string, unknown>): CopyFormatWhat | undefined | { error: string } {
+  const value = row.what;
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (value === "both" || value === "character" || value === "paragraph") {
+    return value;
+  }
+  return { error: 'what は "both"、"character"、"paragraph" のどれかにしてください。' };
+}
+
+function parseCopyFormat(row: Record<string, unknown>): ParsedTool {
+  const from = paragraphOf(row, "from");
+  if (isArgError(from)) {
+    return { ok: false, error: from.error };
+  }
+  const quote = text(row, "quote");
+  if (from === undefined && !quote.trim()) {
+    return {
+      ok: false,
+      error: "見本が指定されていません。from に段落番号を渡すか、quote に見本の引用を入れてください。",
+    };
+  }
+  const what = copyWhatOf(row);
+  if (isArgError(what)) {
+    return { ok: false, error: what.error };
+  }
+  const paragraphs = optionalParagraphNumbers(row);
+  if (isArgError(paragraphs)) {
+    return { ok: false, error: paragraphs.error };
+  }
+  const paragraph = paragraphOf(row);
+  if (isArgError(paragraph)) {
+    return { ok: false, error: paragraph.error };
+  }
+  const through = throughOf(row);
+  if (isArgError(through)) {
+    return { ok: false, error: through.error };
+  }
+  let select: FormatSelect | undefined;
+  if (row.select !== undefined && row.select !== null) {
+    const parsed = parseSelect(row.select);
+    if (isArgError(parsed)) {
+      return { ok: false, error: parsed.error };
+    }
+    select = parsed;
+  }
+  const modes = [Boolean(paragraphs), paragraph !== undefined || through !== undefined, Boolean(select)].filter(
+    Boolean
+  ).length;
+  if (modes === 0) {
+    return {
+      ok: false,
+      error: "写す先がありません。paragraph と through、paragraphs、select のどれか一つを入れてください。",
+    };
+  }
+  if (modes > 1) {
+    return {
+      ok: false,
+      error: "写す先は paragraph と through、paragraphs、select のどれか一つにしてください。",
+    };
+  }
+  if (through !== undefined && paragraph === undefined) {
+    return { ok: false, error: "through を使うときは、写す先の先頭を paragraph で渡してください。" };
+  }
+  if (through !== undefined && paragraph !== undefined && through < paragraph) {
+    return { ok: false, error: "through は paragraph と同じか、それより後ろの番号にしてください。" };
+  }
+  return {
+    ok: true,
+    call: {
+      name: TOOL_COPY_FORMAT,
+      args: {
+        quote,
+        ...(from === undefined ? {} : { from }),
+        ...(paragraphs ? { paragraphs } : {}),
+        ...(paragraph === undefined || paragraphs ? {} : { paragraph }),
+        ...(through === undefined || paragraphs ? {} : { through }),
+        ...(select ? { select } : {}),
+        ...(what === undefined ? {} : { what }),
+      },
+    },
+  };
 }
 
 function insertAtOf(row: Record<string, unknown>): InsertAtArg | { error: string } | undefined {
@@ -1407,70 +2084,42 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
       };
     }
     case TOOL_FORMAT_TEXT: {
-      const paragraph = paragraphOf(row);
-      if (isArgError(paragraph)) {
-        return { ok: false, error: paragraph.error };
+      const address = formatAddress(row);
+      if (isArgError(address)) {
+        return { ok: false, error: address.error };
       }
-      const args: FormatTextArgs = {
-        quote: text(row, "quote"),
-        ...(paragraph === undefined ? {} : { paragraph }),
-        bold: bool(row, "bold"),
-        italic: bool(row, "italic"),
-        underline: bool(row, "underline"),
-        size: num(row, "size"),
-        fontName: optionalString(row, "fontName"),
-        color: optionalString(row, "color"),
-        highlightColor: optionalString(row, "highlightColor"),
-      };
-      if (
-        args.bold === undefined &&
-        args.italic === undefined &&
-        args.underline === undefined &&
-        args.size === undefined &&
-        args.fontName === undefined &&
-        args.color === undefined &&
-        args.highlightColor === undefined
-      ) {
+      const fields = readTextFormat(row);
+      if (isArgError(fields)) {
+        return { ok: false, error: fields.error };
+      }
+      if (!hasTextFormat(fields)) {
         return { ok: false, error: "変更する書式が指定されていません。" };
       }
-      if (args.size !== undefined && args.size <= 0) {
-        return { ok: false, error: "size は正の数にしてください。" };
-      }
-      return { ok: true, call: { name: TOOL_FORMAT_TEXT, args } };
+      return { ok: true, call: { name: TOOL_FORMAT_TEXT, args: { ...address, ...omitEmptyFormat(fields) } } };
     }
     case TOOL_FORMAT_PARAGRAPH: {
-      const paragraph = paragraphOf(row);
-      if (isArgError(paragraph)) {
-        return { ok: false, error: paragraph.error };
+      const address = formatAddress(row);
+      if (isArgError(address)) {
+        return { ok: false, error: address.error };
       }
-      const args: FormatParagraphArgs = {
-        quote: text(row, "quote"),
-        ...(paragraph === undefined ? {} : { paragraph }),
-        alignment: alignmentOf(row),
-        firstLineIndent: num(row, "firstLineIndent"),
-        leftIndent: num(row, "leftIndent"),
-        spaceBefore: num(row, "spaceBefore"),
-        spaceAfter: num(row, "spaceAfter"),
-        lineSpacing: num(row, "lineSpacing"),
-      };
-      if (
-        args.alignment === undefined &&
-        args.firstLineIndent === undefined &&
-        args.leftIndent === undefined &&
-        args.spaceBefore === undefined &&
-        args.spaceAfter === undefined &&
-        args.lineSpacing === undefined
-      ) {
+      const fields = readParagraphFormat(row);
+      if (isArgError(fields)) {
+        return { ok: false, error: fields.error };
+      }
+      if (!hasParagraphFormat(fields)) {
         return { ok: false, error: "変更する書式が指定されていません。" };
       }
-      if (args.spaceBefore !== undefined && args.spaceBefore < 0) {
-        return { ok: false, error: "spaceBefore は 0 以上にしてください。" };
-      }
-      if (args.spaceAfter !== undefined && args.spaceAfter < 0) {
-        return { ok: false, error: "spaceAfter は 0 以上にしてください。" };
-      }
-      return { ok: true, call: { name: TOOL_FORMAT_PARAGRAPH, args } };
+      return {
+        ok: true,
+        call: { name: TOOL_FORMAT_PARAGRAPH, args: { ...address, ...omitEmptyFormat(fields) } },
+      };
     }
+    case TOOL_APPLY_FORMAT:
+      return parseApplyFormat(row);
+    case TOOL_REPLACE_ALL:
+      return parseReplaceAll(row);
+    case TOOL_COPY_FORMAT:
+      return parseCopyFormat(row);
     case TOOL_FORMAT_LIST: {
       const action = listActionOf(row);
       if (isArgError(action)) {
@@ -1600,7 +2249,7 @@ function shorten(text: string, chars: number): string {
   return trimmed.length > chars ? `${trimmed.slice(0, chars)}…` : trimmed;
 }
 
-function textFormatParts(args: FormatTextArgs): string[] {
+function textFormatParts(args: TextFormatFields): string[] {
   const parts: string[] = [];
   if (args.bold !== undefined) {
     parts.push(args.bold ? "太字" : "太字を解除");
@@ -1633,7 +2282,24 @@ const ALIGNMENT_LABELS: Record<ParagraphAlignmentArg, string> = {
   justify: "両端揃え",
 };
 
-function paragraphFormatParts(args: FormatParagraphArgs): string[] {
+function formatSpanLabel(args: {
+  paragraph?: number;
+  through?: number;
+  paragraphs?: number[];
+}): string {
+  if (args.paragraphs && args.paragraphs.length > 1) {
+    return `（${args.paragraphs.length} 段落）`;
+  }
+  if (args.paragraphs && args.paragraphs.length === 1) {
+    return `（段落 ${args.paragraphs[0]}）`;
+  }
+  if (args.through !== undefined && args.paragraph !== undefined) {
+    return `（段落 ${args.paragraph}〜${args.through}）`;
+  }
+  return "";
+}
+
+function paragraphFormatParts(args: ParagraphFormatFields): string[] {
   const parts: string[] = [];
   if (args.alignment) {
     parts.push(ALIGNMENT_LABELS[args.alignment]);
@@ -1718,9 +2384,29 @@ export function describeToolCall(name: string, rawArguments: string): string {
     case TOOL_INSERT_CITATION:
       return call.args.as === "text" ? "出典を本文に挿入" : "出典をコメントに追加";
     case TOOL_FORMAT_TEXT:
-      return `文字書式: ${textFormatParts(call.args).join("・")}`;
+      return `文字書式: ${textFormatParts(call.args).join("・")}${formatSpanLabel(call.args)}`;
     case TOOL_FORMAT_PARAGRAPH:
-      return `段落書式: ${paragraphFormatParts(call.args).join("・")}`;
+      return `段落書式: ${paragraphFormatParts(call.args).join("・")}${formatSpanLabel(call.args)}`;
+    case TOOL_APPLY_FORMAT: {
+      const parts = [
+        ...textFormatParts(call.args.format),
+        ...paragraphFormatParts(call.args.format),
+      ];
+      return `条件で書式: ${parts.join("・")}`;
+    }
+    case TOOL_REPLACE_ALL:
+      return call.args.replace === undefined
+        ? `一括書式「${shorten(call.args.find, 12)}」`
+        : `一括置換「${shorten(call.args.find, 12)}」`;
+    case TOOL_COPY_FORMAT: {
+      const dest = call.args.paragraphs
+        ? `${call.args.paragraphs.length} 段落`
+        : call.args.through !== undefined && call.args.paragraph !== undefined
+          ? `段落 ${call.args.paragraph}〜${call.args.through}`
+          : "条件に合う段落";
+      const from = call.args.from !== undefined ? `段落 ${call.args.from} から` : "見本から";
+      return `${from} ${dest}へ書式を写す`;
+    }
     case TOOL_FORMAT_LIST: {
       const action =
         call.args.action === "remove"

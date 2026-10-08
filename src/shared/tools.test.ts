@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  TOOL_APPLY_FORMAT,
+  TOOL_COPY_FORMAT,
   TOOL_FORMAT_PARAGRAPH,
   TOOL_FORMAT_TEXT,
   TOOL_FORMAT_LIST,
+  TOOL_REPLACE_ALL,
   TOOL_SET_OUTLINE,
+  isFormattingTool,
   TOOL_DELETE_PARAGRAPHS,
   TOOL_DELETE_SHAPE,
   TOOL_FIND_IN_DOCUMENT,
@@ -35,6 +39,9 @@ describe("buildTools", () => {
     expect(names).not.toContain("insert_citation");
     expect(names).toContain("replace_quote");
     expect(names).toContain("format_text");
+    expect(names).toContain("apply_format");
+    expect(names).toContain("replace_all");
+    expect(names).toContain("copy_format");
     expect(names).toContain("format_list");
     expect(names).toContain("set_outline_level");
   });
@@ -660,6 +667,111 @@ describe("max tool rounds", () => {
     expect(toolRoundPresetLabel(0)).toBe("制限なし");
     expect(toolRoundLimitNotice(8)).toContain("上限の 8 回");
     expect(toolRoundLimitNotice(8)).toContain("ツール往復の上限");
+  });
+});
+
+describe("bulk format tools", () => {
+  it("parses a span and a paragraph list without dropping a single-paragraph call", () => {
+    const span = parseToolArguments(
+      TOOL_FORMAT_TEXT,
+      '{"paragraph":2,"through":8,"bold":true}'
+    );
+    expect(span).toEqual({
+      ok: true,
+      call: {
+        name: TOOL_FORMAT_TEXT,
+        args: { quote: "", paragraph: 2, through: 8, bold: true },
+      },
+    });
+    const list = parseToolArguments(TOOL_FORMAT_PARAGRAPH, '{"paragraph":1,"paragraphs":[4,4,9],"alignment":"left"}');
+    expect(list.ok).toBe(true);
+    if (list.ok && list.call.name === TOOL_FORMAT_PARAGRAPH) {
+      expect(list.call.args.paragraphs).toEqual([4, 9]);
+      expect(list.call.args.paragraph).toBeUndefined();
+      expect(list.call.args.alignment).toBe("left");
+    }
+    expect(parseToolArguments(TOOL_FORMAT_TEXT, '{"bold":true,"size":12}').ok).toBe(true);
+  });
+
+  it("refuses a span that also lists paragraphs", () => {
+    expect(
+      parseToolArguments(TOOL_FORMAT_TEXT, '{"paragraphs":[1,2],"through":4,"bold":true}').ok
+    ).toBe(false);
+  });
+
+  it("parses apply_format, replace_all, and copy_format", () => {
+    const applied = parseToolArguments(
+      TOOL_APPLY_FORMAT,
+      '{"select":{"style":"見出し 1","list":"none"},"format":{"bold":true,"spaceAfter":0}}'
+    );
+    expect(applied.ok).toBe(true);
+    if (applied.ok && applied.call.name === TOOL_APPLY_FORMAT) {
+      expect(applied.call.args.select).toEqual({ style: "見出し 1", list: "none" });
+      expect(applied.call.args.format).toEqual({ bold: true, spaceAfter: 0 });
+    }
+    expect(parseToolArguments(TOOL_APPLY_FORMAT, '{"select":{},"format":{"bold":true}}').ok).toBe(false);
+
+    const replaced = parseToolArguments(
+      TOOL_REPLACE_ALL,
+      '{"find":"甲","replace":"乙","wholeWord":true}'
+    );
+    expect(replaced).toEqual({
+      ok: true,
+      call: {
+        name: TOOL_REPLACE_ALL,
+        args: { find: "甲", replace: "乙", wholeWord: true },
+      },
+    });
+    expect(parseToolArguments(TOOL_REPLACE_ALL, '{"find":"甲"}').ok).toBe(false);
+    const formatted = parseToolArguments(
+      TOOL_REPLACE_ALL,
+      '{"find":"甲","format":{"bold":true}}'
+    );
+    expect(formatted.ok).toBe(true);
+
+    const copied = parseToolArguments(
+      TOOL_COPY_FORMAT,
+      '{"from":3,"paragraph":10,"through":12}'
+    );
+    expect(copied).toEqual({
+      ok: true,
+      call: {
+        name: TOOL_COPY_FORMAT,
+        args: { quote: "", from: 3, paragraph: 10, through: 12 },
+      },
+    });
+    expect(parseToolArguments(TOOL_COPY_FORMAT, '{"from":3,"paragraphs":[4],"select":{"empty":true}}').ok).toBe(
+      false
+    );
+  });
+
+  it("labels bulk calls with a count instead of every paragraph", () => {
+    expect(describeToolCall(TOOL_FORMAT_TEXT, '{"paragraphs":[1,2,3],"bold":true}')).toBe(
+      "文字書式: 太字（3 段落）"
+    );
+    expect(describeToolCall(TOOL_APPLY_FORMAT, '{"select":{"empty":true},"format":{"bold":true}}')).toBe(
+      "条件で書式: 太字"
+    );
+    expect(describeToolCall(TOOL_REPLACE_ALL, '{"find":"甲は乙に","replace":"丙"}')).toBe(
+      "一括置換「甲は乙に」"
+    );
+    expect(describeToolCall(TOOL_COPY_FORMAT, '{"from":2,"paragraphs":[4,5]}')).toBe(
+      "段落 2 から 2 段落へ書式を写す"
+    );
+    expect(isFormattingTool(TOOL_FORMAT_TEXT)).toBe(true);
+    expect(isFormattingTool(TOOL_REPLACE_ALL)).toBe(false);
+  });
+
+  it("offers the span on a numbered turn and keeps a quote-only schema otherwise", () => {
+    const numbered = buildTools({ numbered: true }).find((tool) => tool.function.name === TOOL_FORMAT_TEXT);
+    const properties = numbered?.function.parameters.properties as Record<string, unknown>;
+    expect(properties.through).toBeDefined();
+    expect(properties.paragraphs).toBeDefined();
+    const plain = buildTools({ selection: false }).find((tool) => tool.function.name === TOOL_FORMAT_TEXT);
+    const plainProps = plain?.function.parameters.properties as Record<string, unknown>;
+    expect(plainProps.through).toBeUndefined();
+    expect(plainProps.paragraphs).toBeUndefined();
+    expect(numbered?.function.description).toContain("apply_format");
   });
 });
 

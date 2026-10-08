@@ -210,6 +210,67 @@ describe("runTurn", () => {
     expect(names).toContain("replace_selection");
   });
 
+  it("keeps thinking unchanged until format thinking is set", async () => {
+    chatStream.mockResolvedValue(completion({ content: "太字にしました。" }));
+    await run("見出しを太字にして");
+    expect((chatStream.mock.calls[0][0] as { thinkingLevel: string }).thinkingLevel).toBe("medium");
+  });
+
+  it("lowers thinking for a formatting instruction, and after a format tool, when asked", async () => {
+    chatStream.mockResolvedValue(completion({ content: "太字にしました。" }));
+    await runTurn({
+      settings: { ...settings, formatThinkingLevel: "off" },
+      instruction: "見出しを太字にして",
+      attachment: attach(""),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+    });
+    expect((chatStream.mock.calls[0][0] as { thinkingLevel: string }).thinkingLevel).toBe("off");
+
+    chatStream.mockReset();
+    chatStream
+      .mockResolvedValueOnce(
+        completion({
+          toolCalls: [toolCall("c1", "format_text", '{"bold":true}')],
+          finishReason: "tool_calls",
+          usage: { promptTokens: 10, completionTokens: 4, totalTokens: 14, reasoningTokens: 0 },
+        })
+      )
+      .mockResolvedValueOnce(
+        completion({
+          content: "太字にしました。",
+          usage: { promptTokens: 20, completionTokens: 6, totalTokens: 26, reasoningTokens: 0 },
+        })
+      );
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    let logged: unknown[] | undefined;
+    try {
+      await runTurn({
+        settings: { ...settings, formatThinkingLevel: "low" },
+        instruction: "本文を整えて",
+        attachment: attach("本文"),
+        history: [],
+        signal: new AbortController().signal,
+        onMessage: () => undefined,
+      });
+      expect((chatStream.mock.calls[0][0] as { thinkingLevel: string }).thinkingLevel).toBe(
+        "medium"
+      );
+      expect((chatStream.mock.calls[1][0] as { thinkingLevel: string }).thinkingLevel).toBe("low");
+      logged = info.mock.calls.find((call) => call[1] === "turn");
+    } finally {
+      info.mockRestore();
+    }
+    expect(logged?.[2]).toMatchObject({
+      toolRounds: 1,
+      llmCalls: 2,
+      promptTokens: 30,
+      completionTokens: 10,
+      totalTokens: 40,
+    });
+  });
+
   it("runs tool calls, feeds the results back, then answers", async () => {
     chatStream
       .mockResolvedValueOnce(

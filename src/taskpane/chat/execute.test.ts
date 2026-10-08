@@ -9,6 +9,9 @@ const insertComment = vi.hoisted(() => vi.fn());
 const insertCitationText = vi.hoisted(() => vi.fn());
 const formatList = vi.hoisted(() => vi.fn());
 const setOutlineLevel = vi.hoisted(() => vi.fn());
+const applyFormat = vi.hoisted(() => vi.fn());
+const replaceAll = vi.hoisted(() => vi.fn());
+const copyFormat = vi.hoisted(() => vi.fn());
 
 vi.mock("../word", () => ({
   insertDraftParagraphs,
@@ -23,6 +26,9 @@ vi.mock("../word", () => ({
   formatParagraph: vi.fn(),
   formatList,
   setOutlineLevel,
+  applyFormat,
+  replaceAll,
+  copyFormat,
 }));
 
 vi.mock("../api", () => ({ search: vi.fn(), searchArgosIndex: vi.fn(), readArgosFile: vi.fn() }));
@@ -286,6 +292,50 @@ describe("foreign Han in tool arguments", () => {
       paragraph: 12,
       style: "arabic",
     });
+  });
+
+  it("returns only the count from a bulk format tool", async () => {
+    applyFormat.mockResolvedValue("8 段落に書式を当てました（変更履歴に書式変更として記録）。");
+    replaceAll.mockResolvedValue("3 件置換しました（変更履歴に記録）。");
+    const applied = await executeToolCall(
+      {
+        id: "c1",
+        type: "function" as const,
+        function: {
+          name: "apply_format",
+          arguments: '{"select":{"style":"見出し 1"},"format":{"bold":true}}',
+        },
+      },
+      DEFAULT_SETTINGS,
+      new AbortController().signal
+    );
+    expect(applied.content).toBe("8 段落に書式を当てました（変更履歴に書式変更として記録）。");
+    expect(applyFormat).toHaveBeenCalledTimes(1);
+
+    const replaced = await executeToolCall(
+      {
+        id: "c2",
+        type: "function" as const,
+        function: { name: "replace_all", arguments: '{"find":"甲","replace":"这个"}' },
+      },
+      DEFAULT_SETTINGS,
+      new AbortController().signal
+    );
+    expect(replaced.ok).toBe(false);
+    expect(replaceAll).not.toHaveBeenCalled();
+
+    copyFormat.mockResolvedValue("2 段落に書式を写しました（変更履歴に書式変更として記録）。");
+    const copied = await executeToolCall(
+      {
+        id: "c3",
+        type: "function" as const,
+        function: { name: "copy_format", arguments: '{"from":1,"paragraphs":[2,3]}' },
+      },
+      DEFAULT_SETTINGS,
+      new AbortController().signal
+    );
+    expect(copied.content).toContain("2 段落");
+    expect(copyFormat).toHaveBeenCalledTimes(1);
   });
 
   it("runs set_outline_level without wrapping a second success sentence", async () => {

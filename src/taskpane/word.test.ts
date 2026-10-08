@@ -3,8 +3,12 @@ import { mapBlocks } from "../shared/blocks";
 import { SHAPE_NOTE } from "../shared/extract/shapeText";
 import { SHAPES_MARKER } from "../shared/prompts";
 import {
+  applyFormat,
+  copyFormat,
   formatList,
   formatParagraph,
+  formatText,
+  replaceAll,
   getDocumentStats,
   getSelectionInfo,
   getSelectionText,
@@ -124,7 +128,17 @@ type FakeParagraph = {
   lineUnitAfter: number;
   restyleOnOutline: boolean;
   ignoreOutline: boolean;
-  font: { bold: boolean; name: string; nameFarEast: string; size: number };
+  alignment: string;
+  font: {
+    bold: boolean;
+    italic: boolean;
+    underline: string;
+    name: string;
+    nameFarEast: string;
+    size: number;
+    color: string;
+    highlightColor: string | null;
+  };
   lineSpacing?: number;
   delete: () => void;
 };
@@ -156,8 +170,20 @@ function installWord(options: WordOptions): {
     }
     const slice = (start: number, end: number): ReturnType<typeof makeRange> => {
       const value = text.slice(offsets[start], offsets[end]);
+      const font = {
+        bold: false,
+        italic: false,
+        underline: "None",
+        size: 0,
+        name: "",
+        nameFarEast: "",
+        color: "",
+        highlightColor: null as string | null,
+        load: () => undefined,
+      };
       const range = {
         text: value,
+        font,
         startIndex: start,
         endIndex: end,
         load: () => undefined,
@@ -170,6 +196,7 @@ function installWord(options: WordOptions): {
               ? { target: anchor, text: inserted, where }
               : { target: value, text: inserted }
           );
+          return { font };
         },
         delete: () => {
           replacements.push({ target: value, text: "", where: "Delete" });
@@ -373,7 +400,17 @@ function installWord(options: WordOptions): {
       alignment: string;
       firstLineIndent: number;
       leftIndent: number;
-      font: { bold: boolean; name: string; nameFarEast: string; size: number; load: () => void };
+      font: {
+        bold: boolean;
+        italic: boolean;
+        underline: string;
+        name: string;
+        nameFarEast: string;
+        size: number;
+        color: string;
+        highlightColor: string | null;
+        load: () => void;
+      };
     } = {
       get text() {
         return state.text;
@@ -535,7 +572,17 @@ function installWord(options: WordOptions): {
       spaceAfter: 0,
       lineUnitBefore: 0,
       lineUnitAfter: 0,
-      font: { bold: false, name: "", nameFarEast: "", size: 12, load: () => undefined },
+      font: {
+        bold: false,
+        italic: false,
+        underline: "None",
+        name: "",
+        nameFarEast: "",
+        size: 12,
+        color: "",
+        highlightColor: null as string | null,
+        load: () => undefined,
+      },
       lineSpacing: undefined,
       get outlineLevel() {
         return state.outlineLevel;
@@ -781,6 +828,7 @@ function installWord(options: WordOptions): {
   (globalThis as unknown as { Word: unknown }).Word = {
     run: (callback: (ctx: unknown) => Promise<unknown>) => callback(context),
     ChangeTrackingMode: { trackAll: "trackAll", off: "off" },
+    UnderlineType: { single: "Single", none: "None" },
     ChangeTrackingVersion: { current: "Current", original: "Original" },
     InsertLocation: { replace: "Replace", after: "After", before: "Before" },
     RangeLocation: { start: "Start", end: "End", content: "Content" },
@@ -2644,6 +2692,87 @@ describe("insert format priority", () => {
     expect(created.font.size).toBe(14);
     expect(created.lineSpacing).toBe(14);
     expect(created.firstLineIndent).toBe(14);
+  });
+});
+
+describe("bulk formatting", () => {
+  async function openParagraphs(paragraphs: string[], listStrings?: (string | null)[]) {
+    const word = installWord({ selection: "", body: "", paragraphs, listStrings });
+    await readDocumentText(20_000);
+    return word;
+  }
+
+  it("bolds a list of paragraphs in one call", async () => {
+    const { paragraphs } = await openParagraphs(["甲は委託する。", "乙は受託する。", "丙は確認する。"]);
+    const note = await formatText({ quote: "", paragraphs: [1, 3], bold: true });
+    expect(note).toBe("対象は 2 段落です。");
+    expect(paragraphs[0].font.bold).toBe(true);
+    expect(paragraphs[1].font.bold).toBe(false);
+    expect(paragraphs[2].font.bold).toBe(true);
+  });
+
+  it("formats an inclusive span and skips a blank line inside it", async () => {
+    const { paragraphs } = await openParagraphs(["甲は委託する。", "", "丙は確認する。"]);
+    const note = await formatParagraph({
+      quote: "",
+      paragraph: 1,
+      through: 3,
+      alignment: "center",
+    });
+    expect(note).toContain("対象は 2 段落です。");
+    expect(paragraphs[0].alignment).toBe("Centered");
+    expect(paragraphs[1].alignment).toBe("");
+    expect(paragraphs[2].alignment).toBe("Centered");
+  });
+
+  it("applies one format to every paragraph of a style", async () => {
+    const { paragraphs } = await openParagraphs(["請求の趣旨", "本文です。", "請求の原因"]);
+    paragraphs[0].style = "見出し 1";
+    paragraphs[2].style = "見出し 1";
+    const note = await applyFormat({
+      select: { style: "見出し 1" },
+      format: { bold: true },
+    });
+    expect(note).toContain("2 段落に書式を当てました");
+    expect(paragraphs[0].font.bold).toBe(true);
+    expect(paragraphs[1].font.bold).toBe(false);
+    expect(paragraphs[2].font.bold).toBe(true);
+  });
+
+  it("replaces every hit, including a regex, and can require a whole word", async () => {
+    const word = await openParagraphs(["甲は甲に委託する。", "乙は受託する。"]);
+    const note = await replaceAll({ find: "甲", replace: "丙" });
+    expect(note).toBe("2 件置換しました（変更履歴に記録）。");
+    expect(word.replacements.filter((row) => row.text === "丙")).toHaveLength(2);
+
+    const regex = await openParagraphs(["第1条（目的）と第12条"]);
+    const regexNote = await replaceAll({ find: "第\\d+条", replace: "条", regex: true });
+    expect(regexNote).toContain("2 件置換しました");
+    expect(regex.replacements.map((row) => row.target).sort()).toEqual(["第12条", "第1条"]);
+
+    const words = await openParagraphs(["foo bar foobar"]);
+    const whole = await replaceAll({ find: "foo", replace: "baz", wholeWord: true });
+    expect(whole).toContain("1 件置換しました");
+    expect(words.replacements).toEqual([{ target: "foo", text: "baz" }]);
+  });
+
+  it("copies character and paragraph format and leaves the sample alone", async () => {
+    const { paragraphs } = await openParagraphs(["見本", "甲", "乙"]);
+    paragraphs[0].font.bold = true;
+    paragraphs[0].font.size = 16;
+    paragraphs[0].font.name = "游明朝";
+    paragraphs[0].alignment = "Centered";
+    paragraphs[0].firstLineIndent = 12;
+    const note = await copyFormat({ from: 1, paragraphs: [1, 2, 3], quote: "" });
+    expect(note).toContain("2 段落に書式を写しました");
+    expect(paragraphs[0].font.size).toBe(16);
+    expect(paragraphs[1].font.bold).toBe(true);
+    expect(paragraphs[1].font.size).toBe(16);
+    expect(paragraphs[1].font.name).toBe("游明朝");
+    expect(paragraphs[1].font.nameFarEast).toBe("游明朝");
+    expect(paragraphs[1].alignment).toBe("Centered");
+    expect(paragraphs[1].firstLineIndent).toBe(12);
+    expect(paragraphs[2].font.bold).toBe(true);
   });
 });
 

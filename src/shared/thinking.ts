@@ -2,7 +2,20 @@ import { DEFAULT_THINKING_BUDGET, MIN_THINKING_BUDGET } from "./constants";
 
 export type ThinkingLevel = "low" | "medium" | "high" | "off";
 
+/** Use the chat's thinking level. The default, so formatting does not get quieter on its own. */
+export type FormatThinkingLevel = ThinkingLevel | "same";
+
 export const THINKING_LEVELS: ThinkingLevel[] = ["low", "medium", "high", "off"];
+
+export const FORMAT_THINKING_LEVELS: FormatThinkingLevel[] = ["same", ...THINKING_LEVELS];
+
+export const FORMAT_THINKING_LABELS: Record<FormatThinkingLevel, string> = {
+  same: "同じ",
+  low: "低",
+  medium: "中",
+  high: "高",
+  off: "オフ",
+};
 
 export const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
   low: "低",
@@ -24,6 +37,32 @@ export type ThinkingFields = {
 
 export function normalizeThinkingLevel(value: unknown): ThinkingLevel {
   return THINKING_LEVELS.includes(value as ThinkingLevel) ? (value as ThinkingLevel) : "medium";
+}
+
+/** Unknown values stay on "same" so an old settings file does not change thinking. */
+export function normalizeFormatThinkingLevel(value: unknown): FormatThinkingLevel {
+  if (value === "same" || value === undefined || value === null || value === "") {
+    return "same";
+  }
+  return THINKING_LEVELS.includes(value as ThinkingLevel) ? (value as ThinkingLevel) : "same";
+}
+
+export function resolveFormatThinking(
+  formatLevel: FormatThinkingLevel,
+  thinkingLevel: ThinkingLevel
+): ThinkingLevel {
+  return formatLevel === "same" ? thinkingLevel : formatLevel;
+}
+
+/**
+ * A coarse hint that this instruction is about appearance rather than drafting.
+ * Used only when the user has set a separate thinking level for formatting.
+ */
+const FORMAT_INSTRUCTION =
+  /書式|フォント|字体|太字|斜体|下線|インデント|字下げ|ぶら下げ|行間|行送り|段落前|段落後|両端揃え|中央揃え|文字色|蛍光ペン|アウトライン|見出しレベル|文字の大きさ|文字サイズ/;
+
+export function looksLikeFormatInstruction(instruction: string): boolean {
+  return FORMAT_INSTRUCTION.test(instruction || "");
 }
 
 export function normalizeThinkingBudget(value: unknown): number {

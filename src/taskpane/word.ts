@@ -29,7 +29,19 @@ import {
   specPlainText,
 } from "../shared/blocks";
 import { MAX_CHANGES_READ, MAX_COMMENTS_READ, MAX_COMMENT_CHARS } from "../shared/constants";
-import { ParagraphFormatOptions, patchParagraphFormat, readParagraphLineSpacing } from "../shared/lineGrid";
+import {
+  MAX_REPLACE_MATCHES,
+  compileParagraphMatcher,
+  planTextMatches,
+  type ParagraphFact,
+  type TextMatch,
+} from "../shared/bulkFormat";
+import {
+  LineSpacingCopy,
+  ParagraphFormatOptions,
+  patchParagraphFormat,
+  readParagraphLineSpacing,
+} from "../shared/lineGrid";
 import {
   SAMPLE_RADIUS,
   FaceReading,
@@ -74,6 +86,8 @@ import {
   type ListStyle,
 } from "../shared/listStyles";
 import {
+  ApplyFormatArgs,
+  CopyFormatArgs,
   DeleteParagraphsArgs,
   DeleteShapeArgs,
   FindInDocumentArgs,
@@ -81,6 +95,9 @@ import {
   FormatParagraphArgs,
   FormatTextArgs,
   InsertAtArg,
+  ParagraphFormatFields,
+  ReplaceAllArgs,
+  TextFormatFields,
   InsertCommentArgs,
   MAX_FIND_CHARS,
   ReadParagraphsArgs,
@@ -2167,33 +2184,159 @@ export async function clearDraftAnchor(): Promise<void> {
   });
 }
 
+function hasBulkAddress(args: { through?: number; paragraphs?: number[] }): boolean {
+  return args.through !== undefined || Boolean(args.paragraphs && args.paragraphs.length);
+}
+
+async function loadBodyItems(context: Word.RequestContext): Promise<Word.Paragraph[]> {
+  const collection = context.document.body.paragraphs;
+  collection.load("items/text");
+  await context.sync();
+  return collection.items;
+}
+
+/**
+ * Paragraphs a format call named by number. One load of the body, then either
+ * the explicit list or the inclusive span `format_list` already uses.
+ */
+async function addressedParagraphs(
+  context: Word.RequestContext,
+  items: Word.Paragraph[],
+  args: { paragraph?: number; through?: number; paragraphs?: number[]; quote?: string }
+): Promise<Word.Paragraph[]> {
+  if (args.paragraphs && args.paragraphs.length) {
+    const seen = new Set<number>();
+    const found: Word.Paragraph[] = [];
+    for (const number of args.paragraphs) {
+      const row = locateParagraph(items, number);
+      if (seen.has(row.index)) {
+        continue;
+      }
+      seen.add(row.index);
+      found.push(row.paragraph);
+    }
+    if (!found.length) {
+      throw new Error("対象の段落がありません。");
+    }
+    return found;
+  }
+
+  let start: Word.Paragraph;
+  if (args.paragraph !== undefined) {
+    start = locateParagraph(items, args.paragraph).paragraph;
+  } else {
+    const target = await resolveTarget(context, { quote: args.quote }, "paragraph");
+    const ranged = target.range.paragraphs;
+    ranged.load("items/text");
+    await context.sync();
+    const nonempty = ranged.items.filter((paragraph) => paragraphText(paragraph).trim());
+    if (!nonempty.length) {
+      throw new Error("対象の段落がありません。");
+    }
+    start = await anchorInBody(context, items, nonempty[0]);
+  }
+  if (args.through === undefined) {
+    return [start];
+  }
+  const fromIndex = items.indexOf(start);
+  if (fromIndex < 0) {
+    throw new Error(
+      "対象の段落を本文の中で特定できませんでした。paragraph に添付本文の段落番号を渡してください。"
+    );
+  }
+  return spanListTargets(items, fromIndex, locateParagraph(items, args.through).index);
+}
+
+function paintFont(font: Word.Font, fields: TextFormatFields): void {
+  if (fields.bold !== undefined) {
+    font.bold = fields.bold;
+  }
+  if (fields.italic !== undefined) {
+    font.italic = fields.italic;
+  }
+  if (fields.underline !== undefined) {
+    font.underline = fields.underline ? Word.UnderlineType.single : Word.UnderlineType.none;
+  }
+  if (fields.size !== undefined) {
+    font.size = fields.size;
+  }
+  if (fields.fontName !== undefined) {
+    font.name = fields.fontName;
+    font.nameFarEast = fields.fontName;
+  }
+  if (fields.color !== undefined) {
+    font.color = fields.color;
+  }
+  if (fields.highlightColor !== undefined) {
+    font.highlightColor = fields.highlightColor.trim() ? fields.highlightColor : null;
+  }
+}
+
+function paintParagraphFields(paragraph: Word.Paragraph, fields: ParagraphFormatFields): void {
+  if (fields.alignment !== undefined) {
+    paragraph.alignment = wordAlignment(fields.alignment);
+  }
+  if (fields.firstLineIndent !== undefined) {
+    paragraph.firstLineIndent = fields.firstLineIndent;
+  }
+  if (fields.leftIndent !== undefined) {
+    paragraph.leftIndent = fields.leftIndent;
+  }
+  if (fields.spaceBefore !== undefined) {
+    paragraph.spaceBefore = fields.spaceBefore;
+    paragraph.lineUnitBefore = 0;
+  }
+  if (fields.spaceAfter !== undefined) {
+    paragraph.spaceAfter = fields.spaceAfter;
+    paragraph.lineUnitAfter = 0;
+  }
+  if (fields.lineSpacing !== undefined) {
+    paragraph.lineSpacing = fields.lineSpacing;
+  }
+}
+
+function withCountNote(note: string, extra: string): string {
+  return extra ? `${note} ${extra}` : note;
+}
+
+async function applyParagraphFormat(
+  context: Word.RequestContext,
+  targets: Word.Paragraph[],
+  fields: ParagraphFormatFields,
+  note: string
+): Promise<string> {
+  const wantsIndent = fields.firstLineIndent !== undefined || fields.leftIndent !== undefined;
+  for (const paragraph of targets) {
+    paintParagraphFields(paragraph, fields);
+    if (wantsIndent) {
+      paragraph.font.load("size");
+      paragraph.load("isListItem");
+    }
+  }
+  await context.sync();
+  const listed = wantsIndent && targets.some((paragraph) => isListed(paragraph));
+  const ooxml = paragraphOoxmlOptions({ quote: "", ...fields });
+  const extra = ooxml ? await rewriteParagraphOoxml(context, targets, ooxml) : "";
+  const listNote = listed
+    ? "番号の位置はリストが持っているので、段落のインデントでは番号は動きません。"
+    : "";
+  return withCountNote(note, [extra, listNote].filter(Boolean).join(" "));
+}
+
 export async function formatText(args: FormatTextArgs): Promise<string> {
   return Word.run(async (context) => {
     startTracking(context);
+    if (hasBulkAddress(args)) {
+      const items = await loadBodyItems(context);
+      const targets = await addressedParagraphs(context, items, args);
+      for (const paragraph of targets) {
+        paintFont(paragraph.font, args);
+      }
+      await context.sync();
+      return `対象は ${targets.length} 段落です。`;
+    }
     const target = await resolveTarget(context, args);
-    const font = target.range.font;
-    if (args.bold !== undefined) {
-      font.bold = args.bold;
-    }
-    if (args.italic !== undefined) {
-      font.italic = args.italic;
-    }
-    if (args.underline !== undefined) {
-      font.underline = args.underline ? Word.UnderlineType.single : Word.UnderlineType.none;
-    }
-    if (args.size !== undefined) {
-      font.size = args.size;
-    }
-    if (args.fontName !== undefined) {
-      font.name = args.fontName;
-      font.nameFarEast = args.fontName;
-    }
-    if (args.color !== undefined) {
-      font.color = args.color;
-    }
-    if (args.highlightColor !== undefined) {
-      font.highlightColor = args.highlightColor.trim() ? args.highlightColor : null;
-    }
+    paintFont(target.range.font, args);
     await context.sync();
     return target.note;
   });
@@ -2215,6 +2358,11 @@ function wordAlignment(alignment: NonNullable<FormatParagraphArgs["alignment"]>)
 export async function formatParagraph(args: FormatParagraphArgs): Promise<string> {
   return Word.run(async (context) => {
     startTracking(context);
+    if (hasBulkAddress(args)) {
+      const items = await loadBodyItems(context);
+      const targets = await addressedParagraphs(context, items, args);
+      return applyParagraphFormat(context, targets, args, `対象は ${targets.length} 段落です。`);
+    }
     const target = await resolveTarget(context, args, "paragraph");
     const paragraphs = target.range.paragraphs;
     paragraphs.load("items");
@@ -2226,26 +2374,7 @@ export async function formatParagraph(args: FormatParagraphArgs): Promise<string
     }
 
     for (const paragraph of paragraphs.items) {
-      if (args.alignment !== undefined) {
-        paragraph.alignment = wordAlignment(args.alignment);
-      }
-      if (args.firstLineIndent !== undefined) {
-        paragraph.firstLineIndent = args.firstLineIndent;
-      }
-      if (args.leftIndent !== undefined) {
-        paragraph.leftIndent = args.leftIndent;
-      }
-      if (args.spaceBefore !== undefined) {
-        paragraph.spaceBefore = args.spaceBefore;
-        paragraph.lineUnitBefore = 0;
-      }
-      if (args.spaceAfter !== undefined) {
-        paragraph.spaceAfter = args.spaceAfter;
-        paragraph.lineUnitAfter = 0;
-      }
-      if (args.lineSpacing !== undefined) {
-        paragraph.lineSpacing = args.lineSpacing;
-      }
+      paintParagraphFields(paragraph, args);
       if (wantsIndent) {
         paragraph.font.load("size");
         paragraph.load("isListItem");
@@ -2263,6 +2392,436 @@ export async function formatParagraph(args: FormatParagraphArgs): Promise<string
       : "";
     const suffix = [extra, listNote].filter(Boolean).join(" ");
     return suffix ? `${target.note} ${suffix}` : target.note;
+  });
+}
+
+function paragraphFact(paragraph: Word.Paragraph): ParagraphFact {
+  let list: ParagraphFact["list"] = "none";
+  if (isListed(paragraph)) {
+    const mark = listMarkOf(paragraph);
+    if (isBulletMark(mark)) {
+      list = "bullet";
+    } else if (isNumberMark(mark)) {
+      list = "numbered";
+    } else {
+      list = "unknown";
+    }
+  }
+  let outline: number | null = null;
+  try {
+    outline = readOutlineLevel(paragraph.outlineLevel);
+  } catch {
+    outline = null;
+  }
+  let inTable = false;
+  try {
+    inTable = (paragraph.tableNestingLevel || 0) > 0;
+  } catch {
+    inTable = false;
+  }
+  return {
+    text: paragraphText(paragraph),
+    style: readStyleName(paragraph),
+    styleBuiltIn: readBuiltInStyle(paragraph),
+    outlineLevel: outline,
+    list,
+    inTable,
+  };
+}
+
+function readStyleName(paragraph: Word.Paragraph): string {
+  try {
+    return paragraph.style || "";
+  } catch {
+    return "";
+  }
+}
+
+function readBuiltInStyle(paragraph: Word.Paragraph): string {
+  try {
+    return String(paragraph.styleBuiltIn || "");
+  } catch {
+    return "";
+  }
+}
+
+const MATCH_LOAD =
+  "items/text,items/style,items/styleBuiltIn,items/outlineLevel,items/isListItem,items/tableNestingLevel";
+
+async function loadParagraphCollection(
+  context: Word.RequestContext,
+  properties: string
+): Promise<Word.Paragraph[]> {
+  const collection = context.document.body.paragraphs;
+  collection.load(properties);
+  await context.sync();
+  return collection.items;
+}
+
+export async function applyFormat(args: ApplyFormatArgs): Promise<string> {
+  return Word.run(async (context) => {
+    startTracking(context);
+    const items = await loadParagraphCollection(context, MATCH_LOAD);
+    const listDetail = args.select.list === "bullet" || args.select.list === "numbered";
+    if (listDetail) {
+      await loadListMembership(context, items);
+    }
+    const facts = items.map((paragraph) => paragraphFact(paragraph));
+    const match = compileParagraphMatcher(args.select);
+    const targets = items.filter((_, index) => match(facts[index]));
+    if (!targets.length) {
+      return "条件に合う段落はありませんでした。";
+    }
+    for (const paragraph of targets) {
+      paintFont(paragraph.font, args.format);
+    }
+    const note = `${targets.length} 段落に書式を当てました（変更履歴に書式変更として記録）。`;
+    return applyParagraphFormat(context, targets, args.format, note);
+  });
+}
+
+function replaceAllNote(count: number, skipped: number, args: ReplaceAllArgs): string {
+  if (!count && !skipped) {
+    return "一致する箇所はありませんでした。";
+  }
+  const changed = args.replace !== undefined;
+  const formatted = Boolean(args.format);
+  let note: string;
+  if (!count) {
+    note = "一致箇所はありましたが、置換できませんでした。";
+  } else if (changed && formatted) {
+    note = `${count} 件を置換し、書式を当てました（変更履歴に記録）。`;
+  } else if (changed) {
+    note = `${count} 件置換しました（変更履歴に記録）。`;
+  } else {
+    note = `${count} 件に書式を当てました（変更履歴に書式変更として記録）。`;
+  }
+  if (!skipped) {
+    return note;
+  }
+  return `${note}${skipped} 件は長すぎるか位置を特定できず飛ばしました。`;
+}
+
+export async function replaceAll(args: ReplaceAllArgs): Promise<string> {
+  return Word.run(async (context) => {
+    startTracking(context);
+    const items = await loadBodyItems(context);
+    const query = {
+      find: args.find,
+      regex: args.regex,
+      matchCase: args.matchCase,
+      wholeWord: args.wholeWord,
+    };
+    type Pending = { paragraphIndex: number; match: TextMatch; search: Word.RangeCollection };
+    const grouped: Pending[] = [];
+    let planned = 0;
+    let tooLong = 0;
+    for (let index = 0; index < items.length; index += 1) {
+      const matches = planTextMatches(paragraphText(items[index]), query);
+      planned += matches.length;
+      if (planned > MAX_REPLACE_MATCHES) {
+        throw new Error(`一致が ${MAX_REPLACE_MATCHES} 件を超えています。検索を絞ってください。`);
+      }
+      const byNeedle = new Map<string, TextMatch[]>();
+      for (const match of matches) {
+        if ([...match.text].length > MAX_FIND_CHARS) {
+          tooLong += 1;
+          continue;
+        }
+        const list = byNeedle.get(match.text) || [];
+        list.push(match);
+        byNeedle.set(match.text, list);
+      }
+      for (const [needle, group] of byNeedle) {
+        const search = items[index].search(needle, { matchCase: true, matchWholeWord: false });
+        search.load("items");
+        for (const match of group) {
+          grouped.push({ paragraphIndex: index, match, search });
+        }
+      }
+    }
+    if (!grouped.length) {
+      return replaceAllNote(0, tooLong, args);
+    }
+    await context.sync();
+
+    type Write = { paragraphIndex: number; start: number; range: Word.Range };
+    const writes: Write[] = [];
+    for (const row of grouped) {
+      const range = row.search.items[row.match.occurrence];
+      if (!range) {
+        continue;
+      }
+      writes.push({ paragraphIndex: row.paragraphIndex, start: row.match.start, range });
+    }
+    writes.sort((a, b) => b.paragraphIndex - a.paragraphIndex || b.start - a.start);
+    for (const write of writes) {
+      if (args.replace !== undefined) {
+        const written = write.range.insertText(args.replace, Word.InsertLocation.replace);
+        if (args.format) {
+          paintFont(written.font, args.format);
+        }
+      } else if (args.format) {
+        paintFont(write.range.font, args.format);
+      }
+    }
+    if (writes.length) {
+      await context.sync();
+    }
+    const skipped = tooLong + (grouped.length - writes.length);
+    return replaceAllNote(writes.length, skipped, args);
+  });
+}
+
+type CopiedCharacter = {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: string;
+  size?: number;
+  fontName?: string;
+  color?: string;
+  highlightColor?: string;
+};
+
+function readOptionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function readOptionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function readOptionalName(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function readCopiedCharacter(paragraph: Word.Paragraph): CopiedCharacter {
+  const font = paragraph.font;
+  let underline: string | undefined;
+  try {
+    const value = font.underline as unknown;
+    if (typeof value === "string" && value && value !== "Mixed") {
+      underline = value;
+    }
+  } catch {
+    underline = undefined;
+  }
+  let highlight: string | undefined;
+  try {
+    const value = font.highlightColor;
+    if (typeof value === "string" && value.trim()) {
+      highlight = value;
+    }
+  } catch {
+    highlight = undefined;
+  }
+  return {
+    bold: readOptionalBoolean(font.bold),
+    italic: readOptionalBoolean(font.italic),
+    underline,
+    size: readOptionalNumber(font.size),
+    fontName: readOptionalName(font.name) || readOptionalName(font.nameFarEast),
+    color: readOptionalName(font.color),
+    highlightColor: highlight,
+  };
+}
+
+function paintCopiedCharacter(font: Word.Font, copied: CopiedCharacter): boolean {
+  let wrote = false;
+  if (copied.bold !== undefined) {
+    font.bold = copied.bold;
+    wrote = true;
+  }
+  if (copied.italic !== undefined) {
+    font.italic = copied.italic;
+    wrote = true;
+  }
+  if (copied.underline) {
+    font.underline = copied.underline as Word.UnderlineType;
+    wrote = true;
+  }
+  if (copied.size !== undefined && copied.size > 0) {
+    font.size = copied.size;
+    wrote = true;
+  }
+  if (copied.fontName) {
+    font.name = copied.fontName;
+    font.nameFarEast = copied.fontName;
+    wrote = true;
+  }
+  if (copied.color) {
+    font.color = copied.color;
+    wrote = true;
+  }
+  if (copied.highlightColor) {
+    font.highlightColor = copied.highlightColor;
+    wrote = true;
+  }
+  return wrote;
+}
+
+function alignmentArg(value: unknown): ParagraphFormatFields["alignment"] | undefined {
+  const name = String(value ?? "");
+  if (!name) {
+    return undefined;
+  }
+  if (name === String(Word.Alignment.centered) || name === "Centered") {
+    return "center";
+  }
+  if (name === String(Word.Alignment.right) || name === "Right") {
+    return "right";
+  }
+  if (name === String(Word.Alignment.justified) || name === "Justified") {
+    return "justify";
+  }
+  if (name === String(Word.Alignment.left) || name === "Left") {
+    return "left";
+  }
+  return undefined;
+}
+
+function readCopiedParagraph(paragraph: Word.Paragraph): ParagraphFormatFields {
+  const fields: ParagraphFormatFields = {};
+  const alignment = alignmentArg(paragraph.alignment);
+  if (alignment) {
+    fields.alignment = alignment;
+  }
+  const first = readOptionalNumber(paragraph.firstLineIndent);
+  if (first !== undefined) {
+    fields.firstLineIndent = first;
+  }
+  const left = readOptionalNumber(paragraph.leftIndent);
+  if (left !== undefined) {
+    fields.leftIndent = left;
+  }
+  const before = readOptionalNumber(paragraph.spaceBefore);
+  if (before !== undefined) {
+    fields.spaceBefore = before;
+  }
+  const after = readOptionalNumber(paragraph.spaceAfter);
+  if (after !== undefined) {
+    fields.spaceAfter = after;
+  }
+  const spacing = readOptionalNumber(paragraph.lineSpacing);
+  if (spacing !== undefined && spacing > 0) {
+    fields.lineSpacing = spacing;
+  }
+  return fields;
+}
+
+async function resolveSample(
+  context: Word.RequestContext,
+  items: Word.Paragraph[],
+  args: CopyFormatArgs
+): Promise<Word.Paragraph> {
+  if (args.from !== undefined) {
+    return locateParagraph(items, args.from).paragraph;
+  }
+  const target = await resolveTarget(context, { quote: args.quote }, "paragraph");
+  const ranged = target.range.paragraphs;
+  ranged.load("items/text");
+  await context.sync();
+  const nonempty = ranged.items.filter((paragraph) => paragraphText(paragraph).trim());
+  if (!nonempty.length) {
+    throw new Error("見本の段落が見つかりませんでした。");
+  }
+  return anchorInBody(context, items, nonempty[0]);
+}
+
+export async function copyFormat(args: CopyFormatArgs): Promise<string> {
+  return Word.run(async (context) => {
+    startTracking(context);
+    const copyCharacter = args.what !== "paragraph";
+    const copyParagraph = args.what !== "character";
+    const fontLoad = copyCharacter
+      ? ",items/font/bold,items/font/italic,items/font/underline,items/font/size,items/font/name,items/font/nameFarEast,items/font/color,items/font/highlightColor"
+      : "";
+    const items = await loadParagraphCollection(
+      context,
+      MATCH_LOAD +
+        ",items/alignment,items/firstLineIndent,items/leftIndent,items/spaceBefore,items/spaceAfter,items/lineUnitBefore,items/lineUnitAfter,items/lineSpacing" +
+        fontLoad
+    );
+
+    const source = await resolveSample(context, items, args);
+    let destinations: Word.Paragraph[];
+    if (args.select && !args.paragraphs && args.paragraph === undefined && args.through === undefined) {
+      const listDetail = args.select.list === "bullet" || args.select.list === "numbered";
+      if (listDetail) {
+        await loadListMembership(context, items);
+      }
+      const match = compileParagraphMatcher(args.select);
+      destinations = items.filter((paragraph) => match(paragraphFact(paragraph)));
+    } else {
+      destinations = await addressedParagraphs(context, items, args);
+    }
+    const sourceIndex = items.indexOf(source);
+    destinations = destinations.filter((paragraph) => items.indexOf(paragraph) !== sourceIndex);
+    if (!destinations.length) {
+      return "写す先がありません。見本の段落自身は対象にしません。";
+    }
+
+    const copiedFont = copyCharacter ? readCopiedCharacter(source) : null;
+    const copiedParagraph = copyParagraph ? readCopiedParagraph(source) : null;
+    const lineUnitBefore = copyParagraph ? readOptionalNumber(source.lineUnitBefore) : undefined;
+    const lineUnitAfter = copyParagraph ? readOptionalNumber(source.lineUnitAfter) : undefined;
+    let wroteCharacter = false;
+    for (const paragraph of destinations) {
+      if (copiedFont && paintCopiedCharacter(paragraph.font, copiedFont)) {
+        wroteCharacter = true;
+      }
+    }
+    if (copyCharacter && !wroteCharacter && !copyParagraph) {
+      return "見本の文字書式が混在しているため、写せませんでした。";
+    }
+
+    let lineCopy: LineSpacingCopy | undefined;
+    let snapOff = false;
+    if (copyParagraph) {
+      try {
+        const ooxml = source.getOoxml();
+        await context.sync();
+        // getOoxml returns a ClientResult filled by the sync above.
+        // eslint-disable-next-line office-addins/load-object-before-read
+        const reading = readParagraphLineSpacing(ooxml.value || "");
+        snapOff = reading.snapOff;
+        if (reading.line !== null || reading.lineRule !== null) {
+          lineCopy = { line: reading.line, lineRule: reading.lineRule };
+        }
+      } catch {
+        lineCopy = undefined;
+      }
+    }
+
+    const note = `${destinations.length} 段落に書式を写しました（変更履歴に書式変更として記録）。`;
+    if (!copiedParagraph) {
+      await context.sync();
+      return note;
+    }
+    const fields: ParagraphFormatFields = { ...copiedParagraph };
+    if (!snapOff) {
+      delete fields.lineSpacing;
+    }
+    const options = paragraphOoxmlOptions({ quote: "", ...fields });
+    if (options && snapOff && lineCopy) {
+      options.unsetLineGrid = true;
+      options.lineCopy = lineCopy;
+    }
+    for (const paragraph of destinations) {
+      paintParagraphFields(paragraph, copiedParagraph);
+      if (lineUnitBefore !== undefined) {
+        paragraph.lineUnitBefore = lineUnitBefore;
+      }
+      if (lineUnitAfter !== undefined) {
+        paragraph.lineUnitAfter = lineUnitAfter;
+      }
+    }
+    await context.sync();
+    if (!options) {
+      return note;
+    }
+    const extra = await rewriteParagraphOoxml(context, destinations, options);
+    return withCountNote(note, extra);
   });
 }
 

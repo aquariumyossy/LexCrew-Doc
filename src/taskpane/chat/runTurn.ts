@@ -9,11 +9,17 @@ import {
 import { joinArgosScopes } from "../../shared/argos";
 import { Usage } from "../../shared/stripThinking";
 import {
+  looksLikeFormatInstruction,
+  resolveFormatThinking,
+} from "../../shared/thinking";
+import {
   UNLIMITED_TOOL_ROUNDS,
   buildTools,
+  isFormattingTool,
   isToolsUnsupportedError,
   toolRoundLimitNotice,
 } from "../../shared/tools";
+import { logInfo } from "../../sidecar/logger";
 import { ChatMessage } from "../../sidecar/types";
 import { chatStream } from "../api";
 import { Settings } from "../settings";
@@ -137,16 +143,56 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   let tools = toolsFor();
   let toolsSupported = true;
   let lastUsage: Usage | null = null;
+  // Lower thinking only after the user opts in. The first call uses the hint;
+  // later calls follow it once a formatting tool has actually run.
+  let formatWork = looksLikeFormatInstruction(options.instruction);
+  const started = Date.now();
+  const meter = {
+    toolRounds: 0,
+    llmCalls: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  };
   beginToolTurn();
 
+  const thinkingFor = () =>
+    formatWork
+      ? resolveFormatThinking(settings.formatThinkingLevel, settings.thinkingLevel)
+      : settings.thinkingLevel;
+
+  const noteUsage = (usage: Usage | null) => {
+    if (!usage) {
+      return;
+    }
+    meter.promptTokens += usage.promptTokens || 0;
+    meter.completionTokens += usage.completionTokens || 0;
+    meter.totalTokens += usage.totalTokens || 0;
+  };
+
+  let round = 0;
+  const finish = (usage: Usage | null): TurnResult => {
+    meter.toolRounds = round;
+    logInfo("turn", {
+      toolRounds: meter.toolRounds,
+      llmCalls: meter.llmCalls,
+      promptTokens: meter.promptTokens,
+      completionTokens: meter.completionTokens,
+      totalTokens: meter.totalTokens,
+      elapsedMs: Date.now() - started,
+    });
+    return { usage, nextRequestTokens: messagesTokens(fitContext(messages, limit)) };
+  };
+
   const send = async (withTools: boolean) => {
+    meter.llmCalls += 1;
     const body = {
       llmBaseUrl: settings.llmBaseUrl,
       llmApiKey: settings.llmApiKey,
       model: settings.llmModel,
       messages: fitContext(messages, limit),
       tools: withTools && toolsSupported ? tools : undefined,
-      thinkingLevel: settings.thinkingLevel,
+      thinkingLevel: thinkingFor(),
       thinkingBudget: settings.thinkingBudget,
       timeoutMs: settings.timeoutMs,
     };
@@ -159,12 +205,14 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
         throw error;
       }
       toolsSupported = false;
+      meter.llmCalls += 1;
       return chatStream({ ...body, tools: undefined }, { signal, onDelta: options.onDelta });
     }
   };
 
   const emitAssistant = async (completion: Awaited<ReturnType<typeof send>>): Promise<void> => {
     lastUsage = completion.usage;
+    noteUsage(completion.usage);
     await options.onMessage({
       role: "assistant",
       content: completion.content,
@@ -182,20 +230,19 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   };
 
   const maxRounds = settings.maxToolRounds;
-  let round = 0;
   while (true) {
     if (maxRounds !== UNLIMITED_TOOL_ROUNDS && round >= maxRounds) {
       const notice = toolRoundLimitNotice(maxRounds);
       await options.onMessage({ role: "assistant", content: notice });
       messages.push({ role: "assistant", content: notice });
-      return { usage: lastUsage, nextRequestTokens: messagesTokens(fitContext(messages, limit)) };
+      return finish(lastUsage);
     }
 
     const completion = await send(true);
     await emitAssistant(completion);
 
     if (!completion.toolCalls.length) {
-      return { usage: lastUsage, nextRequestTokens: messagesTokens(fitContext(messages, limit)) };
+      return finish(lastUsage);
     }
 
     for (const call of completion.toolCalls) {
@@ -213,6 +260,9 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       if (outcome.numbered && !numbersHandedOut) {
         numbersHandedOut = true;
         tools = toolsFor();
+      }
+      if (isFormattingTool(call.function.name)) {
+        formatWork = true;
       }
     }
     round += 1;

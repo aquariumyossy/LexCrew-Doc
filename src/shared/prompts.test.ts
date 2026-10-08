@@ -80,6 +80,10 @@ describe("systemPrompt", () => {
     expect(text).toContain("この文書に本文はありません");
     expect(text).not.toContain("指定がなければこれに合わせます");
     expect(text).toContain("set_outline_level");
+    expect(text).toContain("apply_format");
+    expect(text).toContain("replace_all");
+    expect(text).toContain("copy_format");
+    expect(text).toContain("1 回の応答にまとめ");
     expect(text).toContain("段落スタイルは変えません");
   });
 

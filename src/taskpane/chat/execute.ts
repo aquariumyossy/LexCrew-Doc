@@ -1,12 +1,15 @@
 import { mapBlocks, summarizeInsertedBlocks } from "../../shared/blocks";
 import { foreignCharToolError } from "../../shared/japaneseHan";
 import {
+  TOOL_APPLY_FORMAT,
+  TOOL_COPY_FORMAT,
   TOOL_DELETE_PARAGRAPHS,
   TOOL_DELETE_SHAPE,
   TOOL_FIND_IN_DOCUMENT,
   TOOL_FORMAT_LIST,
   TOOL_FORMAT_PARAGRAPH,
   TOOL_FORMAT_TEXT,
+  TOOL_REPLACE_ALL,
   TOOL_GET_SELECTION,
   TOOL_INSERT_BLANK_BEFORE,
   TOOL_INSERT_BLOCKS,
@@ -26,12 +29,15 @@ import { readArgosFile, search, searchArgosIndex } from "../api";
 import { sliceIndexedText } from "../../shared/indexedRead";
 import { Settings } from "../settings";
 import {
+  applyFormat,
+  copyFormat,
   deleteParagraphs,
   deleteShape,
   findInDocument,
   formatList,
   formatParagraph,
   formatText,
+  replaceAll,
   getSelectionInfo,
   readParagraphs,
   insertCitationComment,
@@ -308,6 +314,21 @@ export async function executeToolCall(
           content: withNote("段落書式を変えました（変更履歴に書式変更として記録）。", note),
           ok: true,
         };
+      }
+
+      case TOOL_APPLY_FORMAT: {
+        const note = await applyFormat(invocation.args);
+        return { content: note, ok: true };
+      }
+
+      case TOOL_REPLACE_ALL: {
+        const note = await replaceAll(invocation.args);
+        return { content: note, ok: true };
+      }
+
+      case TOOL_COPY_FORMAT: {
+        const note = await copyFormat(invocation.args);
+        return { content: note, ok: true };
       }
 
       case TOOL_FORMAT_LIST: {

@@ -17,7 +17,13 @@ import {
   normalizeLineSpacingChars,
   SETTINGS_STORAGE_KEY,
 } from "../shared/constants";
-import { ThinkingLevel, normalizeThinkingBudget, normalizeThinkingLevel } from "../shared/thinking";
+import {
+  FormatThinkingLevel,
+  ThinkingLevel,
+  normalizeFormatThinkingLevel,
+  normalizeThinkingBudget,
+  normalizeThinkingLevel,
+} from "../shared/thinking";
 import { MAX_TOOL_ROUNDS, normalizeMaxToolRounds } from "../shared/tools";
 import { settingsForStorage } from "./connectionState";
 import { UiFontSize, normalizeUiFontSize } from "./uiFont";
@@ -37,6 +43,8 @@ export type Settings = {
   titlePt: number;
   lineSpacingChars: LineSpacingChars;
   thinkingLevel: ThinkingLevel;
+  /** Thinking used on formatting turns. "same" keeps thinkingLevel. */
+  formatThinkingLevel: FormatThinkingLevel;
   thinkingBudget: number;
   contextLimit: number;
   /** 0 means no cap. */
@@ -57,6 +65,7 @@ export const DEFAULT_SETTINGS: Settings = {
   titlePt: DEFAULT_TITLE_PT,
   lineSpacingChars: DEFAULT_LINE_SPACING_CHARS,
   thinkingLevel: "medium",
+  formatThinkingLevel: "same",
   thinkingBudget: DEFAULT_THINKING_BUDGET,
   contextLimit: DEFAULT_CONTEXT_LIMIT,
   maxToolRounds: MAX_TOOL_ROUNDS,
@@ -107,6 +116,7 @@ export function loadSettings(): Settings {
       timeoutMs: migrateTimeoutMs(merged.timeoutMs),
       lineSpacingChars: normalizeLineSpacingChars(merged.lineSpacingChars),
       thinkingLevel: normalizeThinkingLevel(merged.thinkingLevel),
+      formatThinkingLevel: normalizeFormatThinkingLevel(merged.formatThinkingLevel),
       thinkingBudget: normalizeThinkingBudget(merged.thinkingBudget),
       contextLimit: migrateContextLimit(merged.contextLimit),
       maxToolRounds: normalizeMaxToolRounds(merged.maxToolRounds),

@@ -3194,7 +3194,7 @@ async function loadListMembership(
 /**
  * The non-blank paragraphs from `fromIndex` through `toIndex`. Each has to be
  * one the model was shown — attached, or handed out by an insert this turn — so
- * a span cannot number paragraphs past where the attachment was cut off. That
+ * a span cannot edit paragraphs past where the attachment was cut off. That
  * is checked by wording, not by position: an insert above moves everything
  * below it, so a body position no longer says which number a paragraph wore.
  */
@@ -3215,7 +3215,7 @@ function spanListTargets(
     }
     if (shown.size > 0 && !shown.has(compact(text))) {
       throw new Error(
-        `「${clipNote(text, 24)}」は今回の添付に無いので、番号を操作できません。` +
+        `「${clipNote(text, 24)}」は今回の添付に無いので、この区間は操作できません。` +
           `添付されている番号の区間だけを through に渡してください。`
       );
     }

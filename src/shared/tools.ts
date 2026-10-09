@@ -651,7 +651,9 @@ const PARAGRAPH_FORMAT_PROPERTIES: Record<string, unknown> = {
 
 function selectProperties(): Record<string, unknown> {
   return {
-    style: stringParam("スタイル名（見出し 1、標準）または組み込み名（Heading1）。完全一致。"),
+    style: stringParam(
+      "スタイル名（見出し 1、標準）または組み込み名（Heading1）。大文字小文字だけは区別しない。"
+    ),
     outlineLevel: {
       type: "number",
       description: "ナビゲーションの見出しレベル。1 から 9。",
@@ -764,7 +766,7 @@ function replaceAllTool(): ToolDefinition {
         "段落ごとに replace_quote を繰り返さない。" +
         "find は 1 段落の中だけで探す。regex を true にすると find は正規表現。" +
         "matchCase を省くと大文字小文字を区別しない。" +
-        "wholeWord を true にすると、前後が英数字・かな・漢字でないときだけ一致する。日本語は空白が無くても、隣の文字が語なら一致しない。" +
+        "wholeWord を true にすると、前後が文字・数字・_ でないときだけ一致する。日本語は空白が無くても、隣が文字なら一致しない。" +
         "replace を省くと文字は変えず、format の文字書式だけを一致箇所に当てる。replace が空文字ならその箇所を削除する。" +
         "戻り値は件数だけ。",
       parameters: {

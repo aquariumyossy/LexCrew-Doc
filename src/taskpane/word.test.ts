@@ -2725,6 +2725,23 @@ describe("bulk formatting", () => {
     expect(paragraphs[2].alignment).toBe("Centered");
   });
 
+  it("refuses a span that runs past the paragraphs the attachment showed", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["甲は委託する。", "乙は受託する。", "丙は確認する。"],
+    });
+    const read = await readDocumentText(12);
+    expect(read.truncated).toBe(true);
+    expect(read.text).toBe("[1] 甲は委託する。");
+    await expect(
+      formatParagraph({ quote: "", paragraph: 1, through: 3, alignment: "center" })
+    ).rejects.toThrow(
+      "「乙は受託する。」は今回の添付に無いので、この区間は操作できません。添付されている番号の区間だけを through に渡してください。"
+    );
+    expect(word.paragraphs[1].alignment).toBe("");
+  });
+
   it("applies one format to every paragraph of a style", async () => {
     const { paragraphs } = await openParagraphs(["請求の趣旨", "本文です。", "請求の原因"]);
     paragraphs[0].style = "見出し 1";

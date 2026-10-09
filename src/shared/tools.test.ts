@@ -8,6 +8,7 @@ import {
   TOOL_REPLACE_ALL,
   TOOL_SET_OUTLINE,
   isFormattingTool,
+  TOOL_DELETE_MATCHING,
   TOOL_DELETE_PARAGRAPHS,
   TOOL_DELETE_SHAPE,
   TOOL_FIND_IN_DOCUMENT,
@@ -130,10 +131,12 @@ describe("buildTools", () => {
       buildTools({ selection: false, ...options }).map((tool) => tool.function.name);
     expect(names({})).not.toContain(TOOL_INSERT_BLANK_BEFORE);
     expect(names({})).not.toContain(TOOL_DELETE_PARAGRAPHS);
+    expect(names({})).not.toContain(TOOL_DELETE_MATCHING);
     expect(names({})).toContain(TOOL_READ_PARAGRAPHS);
     expect(names({})).toContain(TOOL_FIND_IN_DOCUMENT);
     expect(names({ numbered: true })).toContain(TOOL_INSERT_BLANK_BEFORE);
     expect(names({ numbered: true })).toContain(TOOL_DELETE_PARAGRAPHS);
+    expect(names({ numbered: true })).toContain(TOOL_DELETE_MATCHING);
     expect(names({})).not.toContain(TOOL_DELETE_SHAPE);
     expect(buildTools({ shapes: true }).map((tool) => tool.function.name)).toContain(TOOL_DELETE_SHAPE);
     expect(names({ insertedNumbers: true })).toContain(TOOL_INSERT_BLANK_BEFORE);
@@ -710,6 +713,8 @@ describe("bulk format tools", () => {
       expect(applied.call.args.format).toEqual({ bold: true, spaceAfter: 0 });
     }
     expect(parseToolArguments(TOOL_APPLY_FORMAT, '{"select":{},"format":{"bold":true}}').ok).toBe(false);
+    expect(parseToolArguments(TOOL_DELETE_MATCHING, '{"select":{"empty":true}}').ok).toBe(true);
+    expect(parseToolArguments(TOOL_DELETE_MATCHING, '{"select":{}}').ok).toBe(false);
 
     const replaced = parseToolArguments(
       TOOL_REPLACE_ALL,

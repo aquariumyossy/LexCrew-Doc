@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fitShapeText, pickShapeByText, readShapeBlocks, SHAPE_NOTE } from "./shapeText";
+import { AnchoredShape, fitShapeText, pickShapeByText, readShapeBlocks, SHAPE_NOTE } from "./shapeText";
 
 const BOX = `<?xml version="1.0"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
@@ -34,20 +34,30 @@ const BOX = `<?xml version="1.0"?>
   </w:body>
 </w:document>`;
 
+function shape(lines: string[], anchor: number | null = null): AnchoredShape {
+  return { lines, anchor };
+}
+
 describe("readShapeBlocks", () => {
   it("reads a text box once, keeping tabs, breaks and table cells", () => {
-    expect(readShapeBlocks(BOX)).toEqual([["箱\t甲", "乙\n丙", "残す", "セル"]]);
+    expect(readShapeBlocks(BOX)).toEqual({
+      bodyParagraphs: 3,
+      blocks: [shape(["箱\t甲", "乙\n丙", "残す", "セル"], 1)],
+    });
   });
 
   it("reads a legacy word-art string that is not in the fallback copy", () => {
     const xml = `<w:document><w:body><w:p><w:r><w:pict><v:shape><v:textpath string="アート"/></v:shape></w:pict></w:r></w:p></w:body></w:document>`;
-    expect(readShapeBlocks(xml)).toEqual([["アート"]]);
+    expect(readShapeBlocks(xml)).toEqual({
+      bodyParagraphs: 1,
+      blocks: [shape(["アート"], 1)],
+    });
   });
 });
 
 describe("fitShapeText", () => {
   it("numbers each shape and drops a block that does not fit", () => {
-    const blocks = [["当事者目録"], ["長い本文".repeat(20)]];
+    const blocks = [shape(["当事者目録"]), shape(["長い本文".repeat(20)])];
     const first = `${SHAPE_NOTE}\n[図1]\n当事者目録`;
     const fitted = fitShapeText(blocks, first.length, "…（この先は長いので添付していません）");
     expect(fitted.text).toContain("[図1]\n当事者目録");
@@ -59,7 +69,7 @@ describe("fitShapeText", () => {
   });
 
   it("numbers a second shape when both fit", () => {
-    const fitted = fitShapeText([["甲"], ["乙"]], 10_000, "");
+    const fitted = fitShapeText([shape(["甲"], 2), shape(["乙"], 4)], 10_000, "");
     expect(fitted.text).toContain("[図1]\n甲");
     expect(fitted.text).toContain("[図2]\n乙");
     expect(fitted.shown).toEqual(["甲", "乙"]);

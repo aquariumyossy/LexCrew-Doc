@@ -1,5 +1,7 @@
 # GURU（LexCrew-Doc）引継ぎ — 複数 Word ウィンドウと作業ウィンドウ（タスクペイン）
 
+このリポジトリは Office.js の作業ウィンドウです。VSTO の CustomTaskPanes はありません。
+
 LexCrew-Mail（Outlook）で v1.0.3 まで直した事象と同型の不具合が、複数の Word 画面を開いている環境で GURU でも起きている。本資料は GURU 側で同じ方針で直すための引継ぎである。本リポジトリが LexCrew Doc のソースである。調査・修正はここで行う。
 
 ## 症状（Word で想定される見え方）

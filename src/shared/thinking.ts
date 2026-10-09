@@ -1,4 +1,4 @@
-import { DEFAULT_THINKING_BUDGET, MIN_THINKING_BUDGET } from "./constants";
+import { DEFAULT_THINKING_BUDGET, DEFAULT_THINKING_LEVEL, MIN_THINKING_BUDGET } from "./constants";
 
 export type ThinkingLevel = "low" | "medium" | "high" | "off";
 
@@ -36,7 +36,7 @@ export type ThinkingFields = {
 };
 
 export function normalizeThinkingLevel(value: unknown): ThinkingLevel {
-  return THINKING_LEVELS.includes(value as ThinkingLevel) ? (value as ThinkingLevel) : "medium";
+  return THINKING_LEVELS.includes(value as ThinkingLevel) ? (value as ThinkingLevel) : DEFAULT_THINKING_LEVEL;
 }
 
 /** Unknown values stay on "same" so an old settings file does not change thinking. */

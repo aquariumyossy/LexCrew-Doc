@@ -13,3 +13,11 @@ coverage/
 *.local
 agent-tools/
 tmp-*.png
+docs/word-plugin-thinking-history-2026-10-02.md
+*.pem
+*.key
+*.pfx
+*.p12
+connection.json
+*.sqlite
+*.db

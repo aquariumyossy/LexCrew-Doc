@@ -42,8 +42,22 @@ export class ShapeStory {
   }
 }
 
-/** One shape's paragraphs, in document order. Empty lines are already dropped. */
-export type ShapeBlock = string[];
+/**
+ * One shape's paragraphs, in document order. Empty lines are already dropped.
+ * `anchor` is the 1-based body paragraph that owns the drawing, or null when
+ * the walk cannot say. Empty shapes are dropped later, so this stays with the
+ * block and `[図1]` does not slide.
+ */
+export type AnchoredShape = {
+  lines: string[];
+  anchor: number | null;
+};
+
+export type ShapePlacement = {
+  blocks: AnchoredShape[];
+  /** Body `w:p` elements, excluding paragraphs inside a text box. */
+  bodyParagraphs: number;
+};
 
 export const SHAPE_NOTE =
   "行頭の [図1] は段落番号ではありません。read_paragraphs には出ません。消すときは delete_shape にその数字を渡します。置換、コメント、挿入の対象にしません。";
@@ -78,18 +92,22 @@ function inRemovedRun(stack: string[]): boolean {
  * include them. A frame (`w:framePr`) stays in the body story, so it is not
  * collected here.
  */
-export function readShapeBlocks(xml: string): ShapeBlock[] {
+export function readShapeBlocks(xml: string): ShapePlacement {
   const story = new ShapeStory();
   const stack: string[] = [];
-  const blocks: ShapeBlock[] = [];
-  let block: ShapeBlock | null = null;
+  const blocks: AnchoredShape[] = [];
+  let block: AnchoredShape | null = null;
   let line: string[] = [];
+  let bodyParagraphs = 0;
+  let inBodyParagraph = false;
+
+  const anchorNow = (): number | null => (inBodyParagraph ? bodyParagraphs : null);
 
   const finishLine = () => {
     const text = line.join("").trim();
     line = [];
     if (text && block) {
-      block.push(text);
+      block.lines.push(text);
     }
   };
 
@@ -112,27 +130,38 @@ export function readShapeBlocks(xml: string): ShapeBlock[] {
       const wasShape = story.inShape();
       story.close(event.name);
       if (wasShape && !story.inShape()) {
-        if (block && block.length) {
+        if (block && block.lines.length) {
           blocks.push(block);
         }
         block = null;
         line = [];
       }
+      if (event.name === "w:p" && !wasShape && !story.inFallback()) {
+        inBodyParagraph = false;
+      }
       continue;
+    }
+
+    if (event.name === "w:p" && !story.inShape() && !story.inFallback()) {
+      bodyParagraphs += 1;
+      inBodyParagraph = true;
     }
 
     if (event.name === "v:textpath" && !story.inFallback() && !story.inShape()) {
       const value = xmlAttr(event.attrs, "string").trim();
       if (value) {
-        blocks.push([value]);
+        blocks.push({ lines: [value], anchor: anchorNow() });
       }
     }
 
     const wasShape = story.inShape();
     story.open(event.name);
     if (!wasShape && story.inShape()) {
-      block = [];
+      block = { lines: [], anchor: anchorNow() };
       line = [];
+    }
+    if (event.empty && event.name === "w:p" && !story.inShape() && !story.inFallback()) {
+      inBodyParagraph = false;
     }
 
     if (story.inShape() && !inRemovedRun(stack)) {
@@ -148,40 +177,48 @@ export function readShapeBlocks(xml: string): ShapeBlock[] {
     }
   }
 
-  return blocks;
+  return { blocks, bodyParagraphs };
 }
 
 export function fitShapeText(
-  blocks: ShapeBlock[],
+  blocks: AnchoredShape[],
   maxChars: number,
-  truncationNote: string
-): { text: string; truncated: boolean; shown: string[] } {
-  const chunks = blocks.map((lines) => lines.join("\n")).filter((chunk) => chunk.length > 0);
+  truncationNote: string,
+  headingFor: (shapeNumber: number, anchor: number | null) => string = (shapeNumber) =>
+    shapeLabel(shapeNumber)
+): { text: string; truncated: boolean; shown: string[]; anchors: (number | null)[] } {
+  const chunks = blocks
+    .map((block) => ({ chunk: block.lines.join("\n"), anchor: block.anchor }))
+    .filter((block) => block.chunk.length > 0);
   if (!chunks.length) {
-    return { text: "", truncated: false, shown: [] };
+    return { text: "", truncated: false, shown: [], anchors: [] };
   }
   if (maxChars <= 0) {
-    return { text: "", truncated: true, shown: [] };
+    return { text: "", truncated: true, shown: [], anchors: [] };
   }
 
   const shown: string[] = [];
+  const anchors: (number | null)[] = [];
   let used = SHAPE_NOTE.length;
   let truncated = false;
-  for (const chunk of chunks) {
-    const labeled = `${shapeLabel(shown.length + 1)}\n${chunk}`;
+  for (const block of chunks) {
+    const labeled = `${headingFor(shown.length + 1, block.anchor)}\n${block.chunk}`;
     const gap = shown.length === 0 ? 1 : 2;
     if (used + gap + labeled.length > maxChars) {
       truncated = true;
       break;
     }
-    shown.push(chunk);
+    shown.push(block.chunk);
+    anchors.push(block.anchor);
     used += gap + labeled.length;
   }
   if (!shown.length) {
     truncated = true;
   }
 
-  const labeled = shown.map((chunk, index) => `${shapeLabel(index + 1)}\n${chunk}`);
+  const labeled = shown.map(
+    (chunk, index) => `${headingFor(index + 1, anchors[index])}\n${chunk}`
+  );
   let text = shown.length ? `${SHAPE_NOTE}\n${labeled.join("\n\n")}` : "";
   if (truncated && truncationNote) {
     const extra = text ? `\n${truncationNote}` : truncationNote;
@@ -193,7 +230,7 @@ export function fitShapeText(
     text = text.slice(0, maxChars);
     truncated = true;
   }
-  return { text, truncated, shown };
+  return { text, truncated, shown, anchors };
 }
 
 export type ShapeTextNode = {

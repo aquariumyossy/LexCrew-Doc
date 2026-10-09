@@ -38,6 +38,7 @@ export function isFormattingTool(name: string): boolean {
 export const TOOL_READ_PARAGRAPHS = "read_paragraphs";
 export const TOOL_FIND_IN_DOCUMENT = "find_in_document";
 export const TOOL_DELETE_PARAGRAPHS = "delete_paragraphs";
+export const TOOL_DELETE_MATCHING = "delete_matching";
 export const TOOL_DELETE_SHAPE = "delete_shape";
 export const TOOL_READ_INDEXED_FILE = "read_indexed_file";
 
@@ -45,6 +46,8 @@ export const TOOL_READ_INDEXED_FILE = "read_indexed_file";
 export const MAX_FIND_CHARS = 255;
 /** One delete call. A longer list is a runaway, not a review. */
 export const MAX_DELETE_PARAGRAPHS = 8;
+/** One conditional delete. More than this is refused whole, not cut short. */
+export const MAX_DELETE_MATCHING = 200;
 
 /**
  * Shown on the next turn instead of a document read. The body is stale by then.
@@ -252,6 +255,10 @@ export type DeleteParagraphsArgs = {
   follows?: number;
 };
 
+export type DeleteMatchingArgs = {
+  select: FormatSelect;
+};
+
 export type DeleteShapeArgs = {
   /** The `[図1]` number from this turn's shape section. */
   shape: number;
@@ -282,6 +289,7 @@ export type ToolInvocation =
   | { name: typeof TOOL_READ_PARAGRAPHS; args: ReadParagraphsArgs }
   | { name: typeof TOOL_FIND_IN_DOCUMENT; args: FindInDocumentArgs }
   | { name: typeof TOOL_DELETE_PARAGRAPHS; args: DeleteParagraphsArgs }
+  | { name: typeof TOOL_DELETE_MATCHING; args: DeleteMatchingArgs }
   | { name: typeof TOOL_DELETE_SHAPE; args: DeleteShapeArgs }
   | { name: typeof TOOL_READ_INDEXED_FILE; args: ReadIndexedFileArgs };
 
@@ -664,7 +672,11 @@ function selectProperties(): Record<string, unknown> {
       type: "boolean",
       description: "true で大文字小文字を区別する。省くと区別しない。",
     },
-    empty: { type: "boolean", description: "true は空段落だけ。false は文字のある段落だけ。" },
+    empty: {
+      type: "boolean",
+      description:
+        "true は空段落だけ。false は文字のある段落だけ。apply_format で省いたときは空段落に当たらない。",
+    },
     list: {
       type: "string",
       enum: listFilterEnum(),
@@ -735,7 +747,8 @@ function applyFormatTool(): ToolDefinition {
         "select の条件はすべて AND。段落番号を並べない。" +
         "format に文字書式と段落書式を混ぜてよい。指定しなかった項目は元のまま。" +
         "行間を指定すると、対象段落は行グリッドへの合わせを外す。" +
-        "戻り値は件数だけ。同じ応答で他の書式ツールとまとめて呼ぶ。",
+        "空段落は empty を true にしたときだけ対象にする。項目番号だけの空行は、番号の形だけでは当たらない。" +
+        "戻りは件数と、当たった先頭と末尾の短い引用。本文全体は返さない。同じ応答で他の書式ツールとまとめて呼ぶ。",
       parameters: {
         type: "object",
         required: ["select", "format"],
@@ -1019,6 +1032,34 @@ function findInDocumentTool(): ToolDefinition {
   };
 }
 
+function deleteMatchingTool(): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_DELETE_MATCHING,
+      description:
+        "条件に合う本文の段落を一度に削除する。修正履歴に残る。" +
+        "select は apply_format と同じ AND。条件が無い呼び出しは何も消さない。" +
+        "text は部分一致。その文字だけの行は、段落全体に合う正規表現にする。" +
+        "empty を true にすると空の段落を消す。本文が空の項番号も入る。" +
+        "tableCell を省くと表の外だけ消す。セルを消すときは tableCell を true にする。" +
+        `一度に消せるのは ${MAX_DELETE_MATCHING} 段落まで。超えたときは消さず件数だけ返す。` +
+        "図形の中は消えない。消した番号はもう使えない。残った段落は、本文が同じなら同じ番号のまま。",
+      parameters: {
+        type: "object",
+        required: ["select"],
+        properties: {
+          select: {
+            type: "object",
+            description: "どれも指定が無い呼び出しは、何も消さずに失敗する。",
+            properties: selectProperties(),
+          },
+        },
+      },
+    },
+  };
+}
+
 function deleteShapeTool(): ToolDefinition {
   return {
     type: "function",
@@ -1050,7 +1091,8 @@ function deleteParagraphsTool(): ToolDefinition {
       name: TOOL_DELETE_PARAGRAPHS,
       description:
         "段落そのものを削除する。修正履歴に残る。空の text での置換では消えないので、段落を消すときはこれを使う。" +
-        "同じ文言が 2 箇所以上あるときは消さず、それぞれの直前の段落を返す。消したい方の直前の番号を follows に渡してやり直す。" +
+        "番号が 1 つの段落に決まっていれば、同じ文言がほかにあってもその段落を消す。" +
+        "番号ではどれか決まらないときだけ、消したい方の直前の番号を follows に渡す。" +
         `一度に消せるのは ${MAX_DELETE_PARAGRAPHS} 段落まで。消した番号はもう使えない。`,
       parameters: {
         type: "object",
@@ -1063,7 +1105,7 @@ function deleteParagraphsTool(): ToolDefinition {
           },
           follows: {
             type: "number",
-            description: "同じ文言が複数あるときだけ。消したい方の直前の段落番号。",
+            description: "番号ではどれか決まらないとき。消したい方の直前の段落番号。",
           },
         },
       },
@@ -1099,6 +1141,7 @@ export function buildTools(options: ToolSetOptions = {}): ToolDefinition[] {
   if (numbered || inserted) {
     tools.push(insertBlankBeforeTool());
     tools.push(deleteParagraphsTool());
+    tools.push(deleteMatchingTool());
   }
   if (options.shapes) {
     tools.push(deleteShapeTool());
@@ -1883,6 +1926,14 @@ function parseDeleteParagraphs(row: Record<string, unknown>): ParsedTool {
   };
 }
 
+function parseDeleteMatching(row: Record<string, unknown>): ParsedTool {
+  const select = parseSelect(row.select);
+  if (isArgError(select)) {
+    return { ok: false, error: select.error };
+  }
+  return { ok: true, call: { name: TOOL_DELETE_MATCHING, args: { select } } };
+}
+
 function parseDeleteShape(row: Record<string, unknown>): ParsedTool {
   const raw = row.shape;
   if (raw === undefined || raw === null || raw === "") {
@@ -2225,6 +2276,8 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
       return parseFindInDocument(row);
     case TOOL_DELETE_PARAGRAPHS:
       return parseDeleteParagraphs(row);
+    case TOOL_DELETE_MATCHING:
+      return parseDeleteMatching(row);
     case TOOL_DELETE_SHAPE:
       return parseDeleteShape(row);
     case TOOL_READ_INDEXED_FILE:
@@ -2456,6 +2509,8 @@ export function describeToolCall(name: string, rawArguments: string): string {
       return call.args.offset
         ? `資料を読む（${call.args.offset} 字目から）`
         : `資料を読む「${shorten(call.args.path, 24)}」`;
+    case TOOL_DELETE_MATCHING:
+      return "条件に合う段落を削除";
     case TOOL_DELETE_PARAGRAPHS: {
       const numbers = call.args.paragraphs;
       const follows = call.args.follows !== undefined ? `（段落 ${call.args.follows} の次）` : "";

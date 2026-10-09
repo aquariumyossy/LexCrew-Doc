@@ -3,6 +3,7 @@ import { foreignCharToolError } from "../../shared/japaneseHan";
 import {
   TOOL_APPLY_FORMAT,
   TOOL_COPY_FORMAT,
+  TOOL_DELETE_MATCHING,
   TOOL_DELETE_PARAGRAPHS,
   TOOL_DELETE_SHAPE,
   TOOL_FIND_IN_DOCUMENT,
@@ -31,6 +32,7 @@ import { Settings } from "../settings";
 import {
   applyFormat,
   copyFormat,
+  deleteMatching,
   deleteParagraphs,
   deleteShape,
   findInDocument,
@@ -356,6 +358,11 @@ export async function executeToolCall(
 
       case TOOL_DELETE_PARAGRAPHS: {
         const note = await deleteParagraphs(invocation.args);
+        return { content: note, ok: true };
+      }
+
+      case TOOL_DELETE_MATCHING: {
+        const note = await deleteMatching(invocation.args);
         return { content: note, ok: true };
       }
 

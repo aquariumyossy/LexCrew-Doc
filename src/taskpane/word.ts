@@ -64,6 +64,8 @@ import {
   pickShapeByText,
   readShapeBlocks,
   renderedShapeBody,
+  shapeLabel,
+  type AnchoredShape,
 } from "../shared/extract/shapeText";
 import { SHAPES_MARKER, TRUNCATION_NOTE } from "../shared/prompts";
 import { formatParagraphRef, isParagraphRef } from "../shared/paragraphRef";
@@ -88,6 +90,7 @@ import {
 import {
   ApplyFormatArgs,
   CopyFormatArgs,
+  DeleteMatchingArgs,
   DeleteParagraphsArgs,
   DeleteShapeArgs,
   FindInDocumentArgs,
@@ -99,6 +102,7 @@ import {
   ReplaceAllArgs,
   TextFormatFields,
   InsertCommentArgs,
+  MAX_DELETE_MATCHING,
   MAX_FIND_CHARS,
   ReadParagraphsArgs,
   ReplaceQuoteArgs,
@@ -550,18 +554,46 @@ type ReadDocumentOptions = {
  * on each attached row stays raw so paragraph numbers still resolve through
  * `search`.
  */
-function shapeReadWithin(documentXml: string, maxChars: number): ShapeRead {
-  const overhead = `\n\n${SHAPES_MARKER}\n`.length;
-  const room = Math.max(0, maxChars - overhead);
-  const fitted = fitShapeText(readShapeBlocks(documentXml), room, TRUNCATION_NOTE);
-  attachedShapes = fitted.shown;
-  spentShapes = new Set();
-  return {
-    text: fitted.text,
-    truncated: fitted.truncated,
-    error: "",
-    count: fitted.shown.length,
-  };
+type BodyKind = "text" | "blank";
+
+function blankMarker(count: number, label: string, shapes: string[] = []): string {
+  const times = count > 1 ? `×${count}` : "";
+  const mark = label ? `・${label}` : "";
+  const linked = shapes.length ? ` ${shapes.join(" ")}` : "";
+  return `（空行${times}${mark}）${linked}`;
+}
+
+function shapeHeading(
+  shapeNumber: number,
+  anchor: number | null,
+  attached: ReadonlySet<number>,
+  kinds: readonly BodyKind[]
+): string {
+  const label = shapeLabel(shapeNumber);
+  if (anchor == null || anchor < 1 || anchor > kinds.length) {
+    return label;
+  }
+  if (kinds[anchor - 1] === "text") {
+    return attached.has(anchor) ? `${label} 段落 [${anchor}] に結び付いている` : label;
+  }
+  let previous = 0;
+  for (let number = anchor - 1; number >= 1; number -= 1) {
+    if (kinds[number - 1] === "text" && attached.has(number)) {
+      previous = number;
+      break;
+    }
+  }
+  return previous ? `${label} 空行（直前は段落 [${previous}]）` : `${label} 空行`;
+}
+
+function shapesOn(number: number, anchors: readonly (number | null)[]): string[] {
+  const labels: string[] = [];
+  anchors.forEach((anchor, index) => {
+    if (anchor === number) {
+      labels.push(shapeLabel(index + 1));
+    }
+  });
+  return labels;
 }
 
 export async function readDocumentText(
@@ -634,9 +666,48 @@ export async function readDocumentText(
       }
     }
 
-    const shapes = shapeError
+    const shapeRoom = Math.max(0, maxChars - `\n\n${SHAPES_MARKER}\n`.length);
+    const placement = shapeError ? { blocks: [], bodyParagraphs: 0 } : readShapeBlocks(documentXml);
+    const anchorsOk = !shapeError && placement.bodyParagraphs === paragraphs.items.length;
+    const shapeBlocks: AnchoredShape[] = anchorsOk
+      ? placement.blocks
+      : placement.blocks.map((block) => ({ lines: block.lines, anchor: null }));
+    const kinds: BodyKind[] = [];
+    const blankLabels: string[] = [];
+    for (let index = 0; index < paragraphs.items.length; index += 1) {
+      const paragraph = paragraphs.items[index];
+      const raw = paragraphText(paragraph);
+      const reviewedText =
+        !attachmentReviewedFallback && reviewed[index]
+          ? paragraphText({ text: reviewed[index].value || "" })
+          : raw;
+      const display = inlineMarked
+        ? inlineMarked[index] ?? reviewedText
+        : neutralizeLiteralMarkup(reviewedText);
+      if (display.trim()) {
+        kinds.push("text");
+        blankLabels.push("");
+      } else {
+        kinds.push("blank");
+        const mark = listMarkOf(paragraph);
+        blankLabels.push(mark.isListItem ? wrapListMark(mark) : "");
+      }
+    }
+    const fitted = shapeError
+      ? { text: "", truncated: false, shown: [] as string[], anchors: [] as (number | null)[] }
+      : fitShapeText(shapeBlocks, shapeRoom, TRUNCATION_NOTE);
+    if (!shapeError) {
+      attachedShapes = fitted.shown;
+      spentShapes = new Set();
+    }
+    let shapes: ShapeRead = shapeError
       ? { text: "", truncated: false, error: shapeError }
-      : shapeReadWithin(documentXml, maxChars);
+      : {
+          text: fitted.text,
+          truncated: fitted.truncated,
+          error: "",
+          count: fitted.shown.length,
+        };
     const shapeBody = renderedShapeBody(shapes);
     const shapeReserve = shapeBody ? `\n\n${SHAPES_MARKER}\n`.length + shapeBody.length : 0;
     const bodyBudget = Math.max(0, maxChars - shapeReserve);
@@ -647,31 +718,61 @@ export async function readDocumentText(
     let used = 0;
     let truncated = false;
     let listMarks = false;
-    let number = 0;
+    let numberedCount = 0;
+    let run: { count: number; label: string; shapes: string[] } | null = null;
+    const flushRun = (): boolean => {
+      if (!run) {
+        return true;
+      }
+      const marker = blankMarker(run.count, run.label, run.shapes);
+      if (used + marker.length + 1 > bodyBudget) {
+        return false;
+      }
+      lines.push(marker);
+      used += marker.length + 1;
+      run = null;
+      return true;
+    };
     for (let index = 0; index < paragraphs.items.length; index += 1) {
       const paragraph = paragraphs.items[index];
-      number += 1;
+      const number = index + 1;
       const raw = paragraphText(paragraph);
       allParagraphRawTexts.set(number, raw);
       const reviewedText =
         !attachmentReviewedFallback && reviewed[index]
           ? paragraphText({ text: reviewed[index].value || "" })
           : raw;
-
-      let display = inlineMarked ? inlineMarked[index] ?? reviewedText : neutralizeLiteralMarkup(reviewedText);
-      if (!display.trim() && !raw.trim() && !reviewedText.trim()) {
+      const display = inlineMarked
+        ? inlineMarked[index] ?? reviewedText
+        : neutralizeLiteralMarkup(reviewedText);
+      if (!display.trim()) {
+        const label = blankLabels[index];
+        if (run && run.label !== label) {
+          if (!flushRun()) {
+            truncated = true;
+            break;
+          }
+        }
+        if (!run) {
+          run = { count: 0, label, shapes: [] };
+        }
+        run.count += 1;
+        run.shapes.push(...shapesOn(number, fitted.anchors));
         continue;
       }
-      if (!display.trim()) {
-        continue;
+      if (!flushRun()) {
+        truncated = true;
+        break;
       }
       const mark = listMarkOf(paragraph);
-      const numbered = formatAttachedLine(number, display, mark);
+      const suffix = shapesOn(number, fitted.anchors).join(" ");
+      const numbered = `${formatAttachedLine(number, display, mark)}${suffix ? ` ${suffix}` : ""}`;
       if (used + numbered.length + 1 > bodyBudget) {
         truncated = true;
         break;
       }
       lines.push(numbered);
+      numberedCount += 1;
       attached.set(number, {
         text: raw,
         shown: display,
@@ -683,12 +784,32 @@ export async function readDocumentText(
       }
       used += numbered.length + 1;
     }
+    if (!truncated && !flushRun()) {
+      truncated = true;
+    }
 
     if (inlineMarked && attachmentUsesInlineMarkup) {
       const legend = `${MARKUP_LEGEND}\n\n`;
       if (used + legend.length <= bodyBudget) {
         lines.unshift(legend.trimEnd());
         used += legend.length;
+      }
+    }
+
+    if (!shapeError && fitted.shown.length) {
+      const attachedNumbers = new Set(attached.keys());
+      const again = fitShapeText(
+        fitted.shown.map((chunk, index) => ({
+          lines: chunk.split("\n"),
+          anchor: fitted.anchors[index],
+        })),
+        shapeRoom,
+        TRUNCATION_NOTE,
+        (shapeNumber, anchor) => shapeHeading(shapeNumber, anchor, attachedNumbers, kinds)
+      );
+      const growth = again.text.length - fitted.text.length;
+      if (again.shown.length === fitted.shown.length && growth <= bodyBudget - used) {
+        shapes = { ...shapes, text: again.text, truncated: shapes.truncated || again.truncated };
       }
     }
 
@@ -701,7 +822,7 @@ export async function readDocumentText(
       lastInlineAppendixComments = appendixComments;
     }
 
-    return { text: lines.join("\n"), paragraphs: lines.length, truncated, listMarks, shapes };
+    return { text: lines.join("\n"), paragraphs: numberedCount, truncated, listMarks, shapes };
   });
 }
 
@@ -2299,6 +2420,16 @@ function withCountNote(note: string, extra: string): string {
   return extra ? `${note} ${extra}` : note;
 }
 
+function applyFormatNote(targets: Word.Paragraph[]): string {
+  const count = `${targets.length} 段落に書式を当てました（変更履歴に書式変更として記録）。`;
+  const lead = clipNote(paragraphText(targets[0]), 24) || "空";
+  if (targets.length === 1) {
+    return `${count}「${lead}」`;
+  }
+  const tail = clipNote(paragraphText(targets[targets.length - 1]), 24) || "空";
+  return `${count}先頭は「${lead}」、末尾は「${tail}」。`;
+}
+
 async function applyParagraphFormat(
   context: Word.RequestContext,
   targets: Word.Paragraph[],
@@ -2468,14 +2599,25 @@ export async function applyFormat(args: ApplyFormatArgs): Promise<string> {
     }
     const facts = items.map((paragraph) => paragraphFact(paragraph));
     const match = compileParagraphMatcher(args.select);
-    const targets = items.filter((_, index) => match(facts[index]));
+    const targets = items.filter((_, index) => {
+      const fact = facts[index];
+      if (!match(fact)) {
+        return false;
+      }
+      // A blank stays out unless the caller asked for empty paragraphs.
+      // A list number with no body is still blank.
+      if (args.select.empty === true) {
+        return true;
+      }
+      return Boolean(fact.text.trim());
+    });
     if (!targets.length) {
       return "条件に合う段落はありませんでした。";
     }
     for (const paragraph of targets) {
       paintFont(paragraph.font, args.format);
     }
-    const note = `${targets.length} 段落に書式を当てました（変更履歴に書式変更として記録）。`;
+    const note = applyFormatNote(targets);
     return applyParagraphFormat(context, targets, args.format, note);
   });
 }
@@ -3981,20 +4123,77 @@ function commentsOn(live: LiveParagraph, hits: CommentHit[]): string {
   return matched.map((hit) => `${hit.author} ${hit.content}`.trim()).join(" / ");
 }
 
-function fullBlock(row: NumberedLive, comments: string): string {
+function fullBlock(row: NumberedLive, comments: string, shapes: string): string {
   const style = `スタイル:${row.live.styleName || "標準"}`;
   const heading = outlineNote(row.live);
   const head = [`[${row.number}] ${markLabel(row.live.mark)}`, style, heading].filter(Boolean).join(" ");
-  return `${head}\n${row.live.reviewed}\nコメント: ${comments}`;
+  const body = shapes ? `${row.live.reviewed} ${shapes}` : row.live.reviewed;
+  return `${head}\n${body}\nコメント: ${comments}`;
 }
 
-function marksLine(row: NumberedLive): string {
+function marksLine(row: NumberedLive, shapes: string): string {
   const extras = [
     isBuiltinHeadingStyle(row.live.styleBuiltIn) ? `スタイル:${row.live.styleName || row.live.styleBuiltIn}` : "",
     outlineNote(row.live),
   ].filter(Boolean);
   const head = `[${row.number}] ${markLabel(row.live.mark)}`;
-  return extras.length ? `${head} ${extras.join(" ")}` : head;
+  const base = extras.length ? `${head} ${extras.join(" ")}` : head;
+  return shapes ? `${base} ${shapes}` : base;
+}
+
+function blankLines(lives: LiveParagraph[], shapeMarks: Map<number, string[]>): string {
+  const lines: string[] = [];
+  let run: { count: number; label: string; shapes: string[] } | null = null;
+  const flush = () => {
+    if (!run) {
+      return;
+    }
+    lines.push(blankMarker(run.count, run.label, run.shapes));
+    run = null;
+  };
+  for (const live of lives) {
+    if (isPresent(live)) {
+      continue;
+    }
+    const label = live.mark.isListItem ? wrapListMark(live.mark) : "";
+    if (run && run.label !== label) {
+      flush();
+    }
+    if (!run) {
+      run = { count: 0, label, shapes: [] };
+    }
+    run.count += 1;
+    run.shapes.push(...(shapeMarks.get(live.index + 1) || []));
+  }
+  flush();
+  return lines.join("\n");
+}
+
+async function shapeMarksFor(
+  context: Word.RequestContext,
+  liveCount: number
+): Promise<Map<number, string[]>> {
+  const marks = new Map<number, string[]>();
+  try {
+    const pkg = context.document.body.getOoxml();
+    await context.sync();
+    const placed = readShapeBlocks(documentXmlFromPackage(pkg.value || ""));
+    if (placed.bodyParagraphs !== liveCount) {
+      return marks;
+    }
+    const nonempty = placed.blocks.filter((block) => block.lines.join("\n").length > 0);
+    nonempty.forEach((block, index) => {
+      if (block.anchor == null) {
+        return;
+      }
+      const list = marks.get(block.anchor) || [];
+      list.push(shapeLabel(index + 1));
+      marks.set(block.anchor, list);
+    });
+  } catch {
+    // The paragraphs are still readable without the shape link.
+  }
+  return marks;
 }
 
 function assertFindQuery(q: string): void {
@@ -4033,7 +4232,9 @@ export async function readParagraphs(args: ReadParagraphsArgs): Promise<Paragrap
       selected = rows.filter((row) => row.number >= args.from! && row.number <= end);
     }
     if (!rows.length) {
-      return { text: "本文に段落がありません。", numbered: false };
+      const shapeMarks = await shapeMarksFor(context, lives.length);
+      const blanks = blankLines(lives, shapeMarks);
+      return { text: blanks || "本文に段落がありません。", numbered: false };
     }
     if (!selected.length) {
       throw new Error(
@@ -4043,21 +4244,80 @@ export async function readParagraphs(args: ReadParagraphsArgs): Promise<Paragrap
 
     const charCap = view === "marks" ? MARKS_READ_CHARS : FULL_READ_CHARS;
     const paraCap = view === "marks" ? Number.POSITIVE_INFINITY : FULL_READ_PARAGRAPHS;
+    const shapeMarks = await shapeMarksFor(context, lives.length);
+    const selectedLives = new Set(selected.map((row) => row.live));
+    const firstPresent = lives.find((live) => isPresent(live));
+    const includeLeading = Boolean(
+      selected[0] && firstPresent && selected[0].live === firstPresent
+    );
     const blocks: string[] = [];
     let used = 0;
-    for (const row of selected) {
-      if (blocks.length >= paraCap) {
+    let emitted = 0;
+    let started = false;
+    let run: { count: number; label: string; shapes: string[] } | null = null;
+    const flushRun = (): boolean => {
+      if (!run) {
+        return true;
+      }
+      const marker = blankMarker(run.count, run.label, run.shapes);
+      if (used + marker.length + 1 > charCap) {
+        return false;
+      }
+      blocks.push(marker);
+      used += marker.length + 1;
+      run = null;
+      return true;
+    };
+    for (const live of lives) {
+      if (!isPresent(live)) {
+        if (!started && !includeLeading) {
+          continue;
+        }
+        const label = live.mark.isListItem ? wrapListMark(live.mark) : "";
+        if (run && run.label !== label) {
+          if (!flushRun()) {
+            break;
+          }
+        }
+        if (!run) {
+          run = { count: 0, label, shapes: [] };
+        }
+        run.count += 1;
+        run.shapes.push(...(shapeMarks.get(live.index + 1) || []));
+        continue;
+      }
+      if (!selectedLives.has(live)) {
+        if (started) {
+          run = null;
+          break;
+        }
+        continue;
+      }
+      if (!flushRun()) {
         break;
       }
+      started = true;
+      if (emitted >= paraCap) {
+        break;
+      }
+      const row = selected.find((candidate) => candidate.live === live);
+      if (!row) {
+        break;
+      }
+      const shapes = (shapeMarks.get(live.index + 1) || []).join(" ");
       const block =
-        view === "marks" ? marksLine(row) : fullBlock(row, commentsOn(row.live, comments.hits));
+        view === "marks" ? marksLine(row, shapes) : fullBlock(row, commentsOn(row.live, comments.hits), shapes);
       if (blocks.length > 0 && used + block.length + 1 > charCap) {
         break;
       }
       blocks.push(block);
       used += block.length + 1;
+      emitted += 1;
     }
-    const next = selected[blocks.length];
+    if (started) {
+      flushRun();
+    }
+    const next = selected[emitted];
     const tail = next ? `\n…（続きは from を ${next.number} にしてください）` : "";
     const failed = comments.error ? `コメントは読めませんでした（${comments.error}）。無いとは限りません。\n` : "";
     const body = view === "marks" ? blocks.join("\n") : blocks.join("\n\n");
@@ -4160,9 +4420,79 @@ function alreadyDeleted(number: number, lives: LiveParagraph[]): boolean {
 }
 
 /**
- * Delete whole paragraphs under tracked changes. Identical text is refused
- * until `follows` names the paragraph just before the copy to remove.
+ * Delete whole paragraphs under tracked changes. A number that resolves to
+ * one paragraph deletes that paragraph, even when the same wording appears
+ * again. `follows` names the paragraph just before the copy only when the
+ * number itself is not one of those copies.
  */
+function deleteMatchNote(targets: LiveParagraph[]): string {
+  const count = `${targets.length} 段落を削除しました（変更履歴に記録）。`;
+  const lead = clipNote(targets[0].reviewed, 24) || "空";
+  if (targets.length === 1) {
+    return `${count}「${lead}」この番号はもう使えません。`;
+  }
+  const tail = clipNote(targets[targets.length - 1].reviewed, 24) || "空";
+  return `${count}先頭は「${lead}」、末尾は「${tail}」。この番号はもう使えません。`;
+}
+
+export async function deleteMatching(args: DeleteMatchingArgs): Promise<string> {
+  if (!isWordHost()) {
+    throw new Error("Word で開いてください。");
+  }
+  return Word.run(async (context) => {
+    const lives = await loadLiveParagraphs(context);
+    for (const live of lives) {
+      live.paragraph.load("tableNestingLevel");
+    }
+    const listDetail = args.select.list === "bullet" || args.select.list === "numbered";
+    if (listDetail) {
+      await loadListMembership(
+        context,
+        lives.map((live) => live.paragraph)
+      );
+    }
+    await context.sync();
+    const match = compileParagraphMatcher(args.select);
+    const outsideTable = args.select.tableCell !== true;
+    const targets = lives.filter((live) => {
+      const fact = paragraphFact(live.paragraph);
+      if (!match(fact)) {
+        return false;
+      }
+      if (outsideTable && fact.inTable) {
+        return false;
+      }
+      return true;
+    });
+    if (!targets.length) {
+      return "条件に合う段落はありませんでした。";
+    }
+    if (targets.length > MAX_DELETE_MATCHING) {
+      return (
+        `${targets.length} 段落が条件に合いました。` +
+        `一度に消せるのは ${MAX_DELETE_MATCHING} 段落までなので、消していません。`
+      );
+    }
+
+    const { rows } = claimNumbers(lives);
+    const doomed = new Set(targets.map((target) => target.paragraph));
+    for (const row of rows) {
+      if (doomed.has(row.live.paragraph)) {
+        attachedParagraphs.delete(row.number);
+      }
+    }
+    const ordered = [...targets].sort((a, b) => b.index - a.index);
+    startTracking(context);
+    for (const target of ordered) {
+      target.paragraph.delete();
+    }
+    await context.sync();
+    attachedParagraphCount = lives.length + 1;
+    retireUnclaimed(rows.filter((row) => attachedParagraphs.has(row.number)));
+    return deleteMatchNote(targets);
+  });
+}
+
 export async function deleteParagraphs(args: DeleteParagraphsArgs): Promise<string> {
   if (!isWordHost()) {
     throw new Error("Word で開いてください。");
@@ -4188,7 +4518,7 @@ export async function deleteParagraphs(args: DeleteParagraphsArgs): Promise<stri
       }
       const key = compact(row.live.reviewed);
       const twins = rows.filter((candidate) => compact(candidate.live.reviewed) === key);
-      if (twins.length > 1) {
+      if (twins.length > 1 && !twins.some((twin) => twin.number === number)) {
         if (args.follows === undefined) {
           const lines = twins.map((twin) => {
             const at = rows.indexOf(twin);
@@ -4208,7 +4538,8 @@ export async function deleteParagraphs(args: DeleteParagraphsArgs): Promise<stri
           throw new Error(`段落 ${args.follows} が見つかりません。`);
         }
         const after = rows.find(
-          (candidate) => candidate.live.index > prev.live.index && compact(candidate.live.reviewed) === key
+          (candidate) =>
+            candidate.live.index > prev.live.index && compact(candidate.live.reviewed) === key
         );
         if (!after) {
           throw new Error(`段落 ${args.follows} の後ろに、その文言はありません。`);

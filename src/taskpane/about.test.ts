@@ -32,6 +32,9 @@ describe("aboutCopy", () => {
       "履歴",
     ]);
     expect(aboutCopy.features[0]?.body).toContain("表、罫線、ページ余白は変えられません。");
+    expect(aboutCopy.features[0]?.body).toContain(
+      "行グリッド、段落前後、インデント、見本の行間を段落の OOXML で直すあいだだけ、履歴を切ります。"
+    );
     expect(aboutCopy.features[1]?.body).toContain("コメントへの返信、変更の受入れ・却下はできません。");
   });
 

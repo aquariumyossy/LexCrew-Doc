@@ -18,6 +18,7 @@ import {
   insertDraftParagraphs,
   readAttachment,
   setOutlineLevel,
+  deleteMatching,
   deleteParagraphs,
   deleteShape,
   findInDocument,
@@ -1195,8 +1196,69 @@ describe("readDocumentText", () => {
   it("leaves blank paragraphs out but still counts them, so numbers stay addresses", async () => {
     installWord({ selection: "", body: "", paragraphs: ["売買契約書", "", "  ", "第1条（目的）"] });
     const read = await readDocumentText(1_000);
-    expect(read.text).toBe("[1] 売買契約書\n[4] 第1条（目的）");
+    expect(read.text).toBe("[1] 売買契約書\n（空行×2）\n[4] 第1条（目的）");
     expect(read.paragraphs).toBe(2);
+  });
+
+  it("keeps a list label on a blank item and does not give that item a number", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "", "後文"],
+      listStrings: [null, "－", null],
+    });
+    const read = await readDocumentText(1_000);
+    expect(read.text).toBe("[1] 前文\n（空行・〔－〕）\n[3] 後文");
+    expect(read.paragraphs).toBe(2);
+  });
+
+  it("links a text box to the body paragraph that owns it", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["－", "後文"],
+      ooxml:
+        `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>` +
+        `<w:p><w:r><w:t>－</w:t></w:r><w:r><w:txbxContent><w:p><w:r><w:t>当事者目録</w:t></w:r></w:p></w:txbxContent></w:r></w:p>` +
+        `<w:p><w:r><w:t>後文</w:t></w:r></w:p>` +
+        `</w:body></w:document>`,
+    });
+    const read = await readDocumentText(10_000);
+    expect(read.text).toContain("[1] － [図1]");
+    expect(read.text).not.toContain("当事者目録");
+    expect(read.shapes.text).toContain("[図1] 段落 [1] に結び付いている");
+    expect(read.shapes.text).toContain("当事者目録");
+  });
+
+  it("names the previous visible paragraph when the box sits on a blank line", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", ""],
+      ooxml:
+        `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>` +
+        `<w:p><w:r><w:t>前文</w:t></w:r></w:p>` +
+        `<w:p><w:r><w:txbxContent><w:p><w:r><w:t>当事者目録</w:t></w:r></w:p></w:txbxContent></w:r></w:p>` +
+        `</w:body></w:document>`,
+    });
+    const read = await readDocumentText(10_000);
+    expect(read.text).toContain("[1] 前文");
+    expect(read.text).toContain("（空行） [図1]");
+    expect(read.text).not.toContain("当事者目録");
+    expect(read.shapes.text).toContain("[図1] 空行（直前は段落 [1]）");
+  });
+
+  it("does not cite a paragraph number when the shape walk does not match the body", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "後文"],
+      ooxml: BOX("当事者目録"),
+    });
+    const read = await readDocumentText(10_000);
+    expect(read.text).not.toContain("[図1]");
+    expect(read.shapes.text).toContain("[図1]");
+    expect(read.shapes.text).not.toContain("結び付いている");
   });
 
   it("stops at a paragraph boundary when the budget runs out", async () => {
@@ -2474,6 +2536,29 @@ describe("insertBlankBefore", () => {
 });
 
 describe("readParagraphs", () => {
+  it("shows a blank line between numbered paragraphs and a shape mark without the box text", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "", "後文"],
+      ooxml:
+        `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>` +
+        `<w:p><w:r><w:t>前文</w:t></w:r></w:p>` +
+        `<w:p><w:r><w:txbxContent><w:p><w:r><w:t>当事者目録</w:t></w:r></w:p></w:txbxContent></w:r></w:p>` +
+        `<w:p><w:r><w:t>後文</w:t></w:r></w:p>` +
+        `</w:body></w:document>`,
+    });
+    await readDocumentText(10_000);
+
+    const read = await readParagraphs({ from: 1, through: 3, view: "full" });
+
+    expect(read.text).toContain("[1]");
+    expect(read.text).toContain("（空行） [図1]");
+    expect(read.text).toContain("[3]");
+    expect(read.text).not.toContain("[2]");
+    expect(read.text).not.toContain("当事者目録");
+  });
+
   it("returns the live list mark, style, and comment for a range", async () => {
     const word = installWord({
       selection: "",
@@ -2543,7 +2628,7 @@ describe("readParagraphs", () => {
     await readDocumentText(0);
     const read = await readParagraphs({ view: "marks" });
     expect(read.numbered).toBe(true);
-    expect(read.text).toBe("[1] 番号なし\n[3] 番号なし");
+    expect(read.text).toBe("[1] 番号なし\n（空行）\n[3] 番号なし");
   });
 });
 
@@ -2581,12 +2666,110 @@ describe("findInDocument", () => {
   });
 });
 
+describe("deleteMatching", () => {
+  function reviewed(paragraph: object): string {
+    return (paragraph as { getReviewedText: () => { value: string } }).getReviewedText().value;
+  }
+
+  function watchDeletes(paragraphs: Array<{ delete: () => void }>): boolean[] {
+    const deleted = paragraphs.map(() => false);
+    paragraphs.forEach((paragraph, index) => {
+      const original = paragraph.delete.bind(paragraph);
+      paragraph.delete = () => {
+        deleted[index] = true;
+        original();
+      };
+    });
+    return deleted;
+  }
+
+  it("deletes every partial dash, and a whole-line pattern deletes only that line", async () => {
+    const partial = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["－", "甲は－を見る。"],
+    });
+    await readDocumentText(10_000);
+    const wide = await deleteMatching({ select: { text: "－" } });
+    expect(wide).toContain("2 段落を削除しました");
+    expect(wide).toContain("先頭は「－」");
+    expect(wide).toContain("末尾は「甲は－を見る。」");
+    expect(reviewed(partial.paragraphs[0])).toBe("");
+    expect(reviewed(partial.paragraphs[1])).toBe("");
+
+    const exact = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["－", "甲は－を見る。"],
+    });
+    await readDocumentText(10_000);
+    const narrow = await deleteMatching({ select: { text: "^－$", regex: true } });
+    expect(narrow).toContain("1 段落を削除しました");
+    expect(narrow).toContain("「－」");
+    expect(reviewed(exact.paragraphs[0])).toBe("");
+    expect(reviewed(exact.paragraphs[1])).toContain("甲は－を見る。");
+  });
+
+  it("deletes an empty body line and leaves an empty table cell unless asked", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "", ""],
+    });
+    word.paragraphs[2].tableNestingLevel = 1;
+    await readDocumentText(10_000);
+    const deleted = watchDeletes(word.paragraphs);
+    const note = await deleteMatching({ select: { empty: true } });
+    expect(note).toContain("1 段落を削除しました");
+    expect(note).toContain("「空」");
+    expect(deleted).toEqual([false, true, false]);
+
+    const cells = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "", ""],
+    });
+    cells.paragraphs[2].tableNestingLevel = 1;
+    await readDocumentText(10_000);
+    const cellDeleted = watchDeletes(cells.paragraphs);
+    await deleteMatching({ select: { empty: true, tableCell: true } });
+    expect(cellDeleted).toEqual([false, false, true]);
+  });
+
+  it("deletes nothing when more than 200 paragraphs match", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: Array.from({ length: 201 }, () => ""),
+    });
+    await readDocumentText(10_000);
+    const note = await deleteMatching({ select: { empty: true } });
+    expect(note).toContain("201 段落が条件に合いました");
+    expect(note).toContain("消していません");
+    expect(word.getTracking()).toBe("");
+  });
+
+  it("retires the deleted number so a later format does not land on a neighbor", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "－", "後文"],
+    });
+    await readDocumentText(10_000);
+    await deleteMatching({ select: { text: "^－$", regex: true } });
+    await expect(formatParagraph({ quote: "", paragraph: 2, bold: true })).rejects.toThrow(
+      /見つかりません/
+    );
+    expect(word.paragraphs[2].font.bold).toBe(false);
+  });
+});
+
 describe("deleteParagraphs", () => {
   function reviewed(paragraph: object): string {
     return (paragraph as { getReviewedText: () => { value: string } }).getReviewedText().value;
   }
 
-  it("refuses two copies of the same sentence and deletes neither", async () => {
+  it("deletes the numbered copy when the same sentence appears twice", async () => {
     const word = installWord({
       selection: "",
       body: "",
@@ -2594,10 +2777,44 @@ describe("deleteParagraphs", () => {
     });
     await readDocumentText(10_000);
 
-    await expect(deleteParagraphs({ paragraphs: [2] })).rejects.toThrow(/同じ文言が 2 箇所/);
-    expect(reviewed(word.paragraphs[1])).toContain("甲は売る");
+    const note = await deleteParagraphs({ paragraphs: [2] });
+
+    expect(note).toContain("段落 2");
+    expect(note).toContain("変更履歴に記録");
+    expect(reviewed(word.paragraphs[1])).toBe("");
     expect(reviewed(word.paragraphs[2])).toContain("甲は売る");
-    expect(word.getTracking()).toBe("");
+    expect(word.getTracking()).toBe("trackAll");
+  });
+
+  it("deletes every numbered copy of the same sentence in one call", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "甲は売る", "甲は売る"],
+    });
+    await readDocumentText(10_000);
+
+    const note = await deleteParagraphs({ paragraphs: [2, 3] });
+
+    expect(note).toContain("段落 2");
+    expect(note).toContain("段落 3");
+    expect(reviewed(word.paragraphs[1])).toBe("");
+    expect(reviewed(word.paragraphs[2])).toBe("");
+  });
+
+  it("deletes the numbered paragraph when follows names a different copy", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "甲は売る", "甲は売る"],
+    });
+    await readDocumentText(10_000);
+
+    const note = await deleteParagraphs({ paragraphs: [2], follows: 2 });
+
+    expect(note).toContain("段落 2");
+    expect(reviewed(word.paragraphs[1])).toBe("");
+    expect(reviewed(word.paragraphs[2])).toContain("甲は売る");
   });
 
   it("deletes the copy after follows, and the other number still reads", async () => {
@@ -2751,9 +2968,39 @@ describe("bulk formatting", () => {
       format: { bold: true },
     });
     expect(note).toContain("2 段落に書式を当てました");
+    expect(note).toContain("先頭は「請求の趣旨」");
+    expect(note).toContain("末尾は「請求の原因」");
     expect(paragraphs[0].font.bold).toBe(true);
     expect(paragraphs[1].font.bold).toBe(false);
     expect(paragraphs[2].font.bold).toBe(true);
+  });
+
+  it("skips a numbered blank unless empty is requested, and names a single hit", async () => {
+    const { paragraphs } = await openParagraphs(
+      ["写真の注記", "", "別の注記"],
+      ["（1）", "（2）", "（3）"]
+    );
+    const note = await applyFormat({
+      select: { list: "numbered" },
+      format: { bold: true },
+    });
+    expect(note).toContain("2 段落に書式を当てました");
+    expect(note).toContain("先頭は「写真の注記」");
+    expect(note).toContain("末尾は「別の注記」");
+    expect(paragraphs[0].font.bold).toBe(true);
+    expect(paragraphs[1].font.bold).toBe(false);
+    expect(paragraphs[2].font.bold).toBe(true);
+
+    const blanks = await applyFormat({
+      select: { list: "numbered", empty: true },
+      format: { italic: true },
+    });
+    expect(blanks).toContain("1 段落に書式を当てました");
+    expect(blanks).toContain("「空」");
+    expect(blanks).not.toContain("先頭は");
+    expect(paragraphs[0].font.italic).toBe(false);
+    expect(paragraphs[1].font.italic).toBe(true);
+    expect(paragraphs[2].font.italic).toBe(false);
   });
 
   it("replaces every hit, including a regex, and can require a whole word", async () => {

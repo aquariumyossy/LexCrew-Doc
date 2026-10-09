@@ -130,6 +130,7 @@ type FakeParagraph = {
   restyleOnOutline: boolean;
   ignoreOutline: boolean;
   alignment: string;
+  tableNestingLevel: number;
   font: {
     bold: boolean;
     italic: boolean;
@@ -2757,10 +2758,10 @@ describe("deleteMatching", () => {
     });
     await readDocumentText(10_000);
     await deleteMatching({ select: { text: "^－$", regex: true } });
-    await expect(formatParagraph({ quote: "", paragraph: 2, bold: true })).rejects.toThrow(
+    await expect(formatParagraph({ quote: "", paragraph: 2, alignment: "center" })).rejects.toThrow(
       /見つかりません/
     );
-    expect(word.paragraphs[2].font.bold).toBe(false);
+    expect(word.paragraphs[2].alignment).toBe("");
   });
 });
 

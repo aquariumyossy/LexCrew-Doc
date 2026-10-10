@@ -1,7 +1,15 @@
 import { DEFAULT_BODY_PT, DEFAULT_FONT_NAME, DEFAULT_LINE_SPACING_CHARS, DEFAULT_TITLE_PT, lineSpacingPt } from "./constants";
 import { BlockFormat } from "./typography";
 
-export type BlockType = "title" | "heading" | "body" | "clause" | "item" | "center" | "right";
+export type BlockType =
+  | "title"
+  | "heading"
+  | "body"
+  | "clause"
+  | "item"
+  | "center"
+  | "right"
+  | "outline";
 
 export const BLOCK_TYPES: BlockType[] = [
   "title",
@@ -11,12 +19,71 @@ export const BLOCK_TYPES: BlockType[] = [
   "item",
   "center",
   "right",
+  "outline",
 ];
+
+/** 第１, １．, （１）, other marks, and the text under them. */
+export const OUTLINE_LEVEL_COUNT = 5;
+
+/**
+ * One outline level, in characters of the body size. `indentChars` is where the
+ * first line starts. With `hangingChars` the wrapped lines start that much
+ * further right. Without it, `firstLineChars` indents the first line instead.
+ */
+export type OutlineLevelFormat = {
+  bold: boolean;
+  indentChars: number;
+  hangingChars: number;
+  firstLineChars: number;
+};
+
+export type OutlineLayout = OutlineLevelFormat[];
+
+export const DEFAULT_OUTLINE_LAYOUT: OutlineLayout = [
+  { bold: true, indentChars: 0, hangingChars: 0, firstLineChars: 0 },
+  { bold: true, indentChars: 1, hangingChars: 2, firstLineChars: 0 },
+  { bold: false, indentChars: 2, hangingChars: 2, firstLineChars: 0 },
+  { bold: false, indentChars: 3, hangingChars: 0, firstLineChars: 0 },
+  { bold: false, indentChars: 3, hangingChars: 0, firstLineChars: 1 },
+];
+
+function charsOf(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 20
+    ? value
+    : fallback;
+}
+
+export function normalizeOutlineLayout(value: unknown): OutlineLayout {
+  const rows = Array.isArray(value) ? value : [];
+  return DEFAULT_OUTLINE_LAYOUT.map((fallback, index) => {
+    const row = rows[index];
+    if (!row || typeof row !== "object") {
+      return { ...fallback };
+    }
+    const record = row as Record<string, unknown>;
+    return {
+      bold: typeof record.bold === "boolean" ? record.bold : fallback.bold,
+      indentChars: charsOf(record.indentChars, fallback.indentChars),
+      hangingChars: charsOf(record.hangingChars, fallback.hangingChars),
+      firstLineChars: charsOf(record.firstLineChars, fallback.firstLineChars),
+    };
+  });
+}
+
+/** Word's left indent (wrapped lines) and first-line offset, in characters. */
+export function outlineIndentChars(format: OutlineLevelFormat): { left: number; firstLine: number } {
+  if (format.hangingChars > 0) {
+    return { left: format.indentChars + format.hangingChars, firstLine: -format.hangingChars };
+  }
+  return { left: format.indentChars, firstLine: format.firstLineChars };
+}
 
 export type DraftBlock = {
   type: BlockType;
   text: string;
   label?: string;
+  /** Outline depth, 0 to OUTLINE_LEVEL_COUNT - 1. Only for `outline`. */
+  level?: number;
 };
 
 export type TextRun = {
@@ -44,6 +111,8 @@ export type ParagraphSpec = {
   applySize?: boolean;
   /** Omitted means write the point indents. */
   applyIndent?: boolean;
+  /** Outline indents, rescaled to the painted body size. */
+  indentChars?: { left: number; firstLine: number };
   /**
    * Omitted means exact `lineSpacingPt`. `keep` writes nothing.
    * `copy` writes `spacingCopy` and turns snap-to-grid off.
@@ -58,6 +127,7 @@ export type FontOptions = {
   bodyPt?: number;
   titlePt?: number;
   lineSpacingChars?: number;
+  outlineLayout?: OutlineLayout;
 };
 
 export type Severity = "high" | "medium" | "low";
@@ -70,13 +140,21 @@ export function normalizeBlock(block: {
   type?: unknown;
   text?: unknown;
   label?: unknown;
+  level?: unknown;
 }): DraftBlock | null {
   if (typeof block.text !== "string") {
     return null;
   }
   const type: BlockType = isBlockType(block.type) ? block.type : "body";
   const label = typeof block.label === "string" && block.label.trim() ? block.label : undefined;
-  return { type, text: block.text, label };
+  if (type !== "outline") {
+    return { type, text: block.text, label };
+  }
+  const raw = typeof block.level === "number" ? block.level : Number(block.level);
+  const level = Number.isInteger(raw)
+    ? Math.min(OUTLINE_LEVEL_COUNT - 1, Math.max(0, raw))
+    : OUTLINE_LEVEL_COUNT - 1;
+  return { type, text: block.text, level };
 }
 
 function clauseRuns(block: DraftBlock): TextRun[] {
@@ -190,6 +268,23 @@ export function mapBlockToParagraph(block: DraftBlock, options: FontOptions = {}
         leftIndentPt: 0,
         runs: [{ text: block.text, bold: false }],
       });
+    case "outline": {
+      const layout = options.outlineLayout || DEFAULT_OUTLINE_LAYOUT;
+      const level = block.level ?? OUTLINE_LEVEL_COUNT - 1;
+      const format = layout[level] || DEFAULT_OUTLINE_LAYOUT[level];
+      const indentChars = outlineIndentChars(format);
+      return finish({
+        type: "outline",
+        alignment: "left",
+        fontName,
+        fontSize: bodyPt,
+        bold: format.bold,
+        firstLineIndentPt: indentChars.firstLine * em,
+        leftIndentPt: indentChars.left * em,
+        indentChars,
+        runs: [{ text: block.text, bold: format.bold }],
+      });
+    }
     default:
       return finish({
         type: "body",
@@ -227,7 +322,11 @@ export function paintParagraph(spec: ParagraphSpec, format: BlockFormat): Paragr
   } else {
     next.applySize = false;
   }
-  if (format.applyIndent) {
+  if (spec.indentChars) {
+    next.applyIndent = true;
+    next.firstLineIndentPt = spec.indentChars.firstLine * format.indentEm;
+    next.leftIndentPt = spec.indentChars.left * format.indentEm;
+  } else if (format.applyIndent) {
     next.applyIndent = true;
     if (spec.type === "body") {
       next.firstLineIndentPt = format.indentEm;
@@ -335,18 +434,53 @@ export function summarizeInsertedBlocks(
   parts.push(
     '意図と違う場所なら、続けずに報告してください。続きは at を "continue" にして足します（変更履歴に記録）'
   );
-  const summary = `${parts.join("。")}。`;
-  if (!landing.numbers?.length) {
-    return summary;
+  return `${parts.join("。")}。${numberedTail(landing.numbers)}`;
+}
+
+function numberedTail(numbers: InsertedParagraph[] | undefined): string {
+  if (!numbers?.length) {
+    return "";
   }
   // Kept as written (full-width spaces included): the model may quote from it.
-  const lines = landing.numbers.map((row) => {
+  const lines = numbers.map((row) => {
     const text = row.text.trim();
     const clipped = text.length > NUMBERED_LINE_CHARS ? `${text.slice(0, NUMBERED_LINE_CHARS)}…` : text;
     return `[${row.number}] ${clipped}`;
   });
   return (
-    `${summary}\n入れた段落の番号は次のとおりです。このターンでこれらの段落を指すときは、` +
+    `\n入れた段落の番号は次のとおりです。このターンでこれらの段落を指すときは、` +
     `quote ではなくこの番号を paragraph / through に渡してください。\n${lines.join("\n")}`
   );
+}
+
+/** What `replace_paragraphs` removed, so a range that reached too far is visible. */
+export type ReplacedSpan = {
+  from: number;
+  through: number;
+  firstText: string;
+  lastText: string;
+  /** Paragraphs removed, blank ones included. */
+  removed: number;
+  /** `[図]` numbers removed with the span. */
+  shapes: number[];
+  /** `[図]` numbers in the span that could not be matched to a box. */
+  unmatchedShapes: number[];
+  numbers?: InsertedParagraph[];
+};
+
+export function summarizeReplacedParagraphs(blocks: DraftBlock[], span: ReplacedSpan): string {
+  const parts = [
+    `段落 ${span.from}「${shorten(span.firstText, 16)}」から段落 ${span.through}「${shorten(span.lastText, 16)}」まで` +
+      `の ${span.removed} 段落を消し、その位置に ${blocks.length} 段落を入れました（変更履歴に記録）`,
+  ];
+  if (span.shapes.length) {
+    parts.push(`範囲に結び付いたテキストボックス ${span.shapes.map((n) => `図${n}`).join("、")} も消しました`);
+  }
+  if (span.unmatchedShapes.length) {
+    parts.push(
+      `${span.unmatchedShapes.map((n) => `図${n}`).join("、")} は箱を特定できず、段落と一緒に消えたかは確かめていません`
+    );
+  }
+  parts.push("消した段落の番号はもう使えません。範囲が意図と違っていたら、続けずに報告してください");
+  return `${parts.join("。")}。${numberedTail(span.numbers)}`;
 }

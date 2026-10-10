@@ -305,6 +305,38 @@ export function pickShapeByText<T extends ShapeTextNode>(
   return { ok: false, reason: "missing" };
 }
 
+/**
+ * The `[図]` numbers a replaced span takes with it: boxes anchored on its
+ * paragraphs, and on the blank paragraphs after `through` up to the next
+ * numbered one. `lastAnchor` is the furthest paragraph holding one of them.
+ * With no numbered paragraph after the span, the blanks past it are not
+ * taken: the attachment may have been cut short there.
+ */
+export function shapesInSpan(
+  anchors: readonly (number | null)[],
+  from: number,
+  through: number,
+  numbered: Iterable<number>
+): { shapes: number[]; lastAnchor: number } {
+  let next = Infinity;
+  for (const number of numbered) {
+    if (number > through && number < next) {
+      next = number;
+    }
+  }
+  const end = Number.isFinite(next) ? next - 1 : through;
+  const shapes: number[] = [];
+  let lastAnchor = through;
+  anchors.forEach((anchor, index) => {
+    if (anchor == null || anchor < from || anchor > end) {
+      return;
+    }
+    shapes.push(index + 1);
+    lastAnchor = Math.max(lastAnchor, anchor);
+  });
+  return { shapes, lastAnchor };
+}
+
 /** The body under `--- 図形 ---`. Empty when this turn has nothing to say. */
 export function renderedShapeBody(shapes: { text: string; truncated: boolean; error: string }): string {
   if (shapes.error) {

@@ -17,6 +17,7 @@ import {
   TOOL_INSERT_COMMENT,
   TOOL_READ_INDEXED_FILE,
   TOOL_READ_PARAGRAPHS,
+  TOOL_REPLACE_PARAGRAPHS,
   TOOL_REPLACE_QUOTE,
   TOOL_SEARCH,
   TOOL_SEARCH_INDEX,
@@ -137,6 +138,9 @@ describe("buildTools", () => {
     expect(names({ numbered: true })).toContain(TOOL_INSERT_BLANK_BEFORE);
     expect(names({ numbered: true })).toContain(TOOL_DELETE_PARAGRAPHS);
     expect(names({ numbered: true })).toContain(TOOL_DELETE_MATCHING);
+    expect(names({})).not.toContain(TOOL_REPLACE_PARAGRAPHS);
+    expect(names({ numbered: true })).toContain(TOOL_REPLACE_PARAGRAPHS);
+    expect(names({ insertedNumbers: true })).toContain(TOOL_REPLACE_PARAGRAPHS);
     expect(names({})).not.toContain(TOOL_DELETE_SHAPE);
     expect(buildTools({ shapes: true }).map((tool) => tool.function.name)).toContain(TOOL_DELETE_SHAPE);
     expect(names({ insertedNumbers: true })).toContain(TOOL_INSERT_BLANK_BEFORE);
@@ -632,7 +636,16 @@ describe("describeToolCall", () => {
       "段落 14 を削除"
     );
     expect(describeToolCall(TOOL_DELETE_SHAPE, '{"shape":2}')).toBe("図2 を削除");
+    expect(describeToolCall(TOOL_DELETE_SHAPE, '{"shapes":[2,5,2]}')).toBe("図2、図5 を削除");
     expect(parseToolArguments(TOOL_DELETE_SHAPE, '{"shape":0}').ok).toBe(false);
+    expect(parseToolArguments(TOOL_DELETE_SHAPE, '{"shapes":[]}').ok).toBe(false);
+    expect(parseToolArguments(TOOL_DELETE_SHAPE, '{"shapes":[1,"x"]}').ok).toBe(false);
+    expect(
+      describeToolCall(
+        TOOL_REPLACE_PARAGRAPHS,
+        '{"paragraph":3,"through":122,"blocks":[{"type":"outline","level":0,"text":"第１　調査物件"}]}'
+      )
+    ).toBe("段落 3〜122 を 1 段落に置き換え");
     expect(
       describeToolCall(TOOL_READ_INDEXED_FILE, '{"path":"C:\\\\案件\\\\委託基本契約書.docx"}')
     ).toBe("資料を読む「C:\\案件\\委託基本契約書.docx」");
@@ -796,5 +809,59 @@ describe("normalizeToolCalls", () => {
 
   it("returns an empty list when the field is missing", () => {
     expect(normalizeToolCalls(undefined)).toEqual([]);
+  });
+});
+
+describe("replace_paragraphs arguments", () => {
+  const parse = (args: object) => parseToolArguments(TOOL_REPLACE_PARAGRAPHS, JSON.stringify(args));
+
+  it("reads the span and outline blocks, clamping the level", () => {
+    expect(
+      parse({
+        paragraph: 3,
+        through: 122,
+        blocks: [
+          { type: "outline", level: 0, text: "第１　調査物件" },
+          { type: "outline", level: 9, text: "東京都足立区" },
+          { type: "body", text: "以上" },
+        ],
+      })
+    ).toEqual({
+      ok: true,
+      call: {
+        name: TOOL_REPLACE_PARAGRAPHS,
+        args: {
+          paragraph: 3,
+          through: 122,
+          blocks: [
+            { type: "outline", level: 0, text: "第１　調査物件" },
+            { type: "outline", level: 4, text: "東京都足立区" },
+            { type: "body", text: "以上", label: undefined },
+          ],
+        },
+      },
+    });
+  });
+
+  it("refuses a span that runs backwards or is not given", () => {
+    const blocks = [{ type: "body", text: "本文" }];
+    expect(parse({ paragraph: 5, through: 4, blocks })).toEqual({
+      ok: false,
+      error: "through は paragraph 以上の段落番号にしてください。",
+    });
+    expect(parse({ paragraph: 5, blocks })).toEqual({
+      ok: false,
+      error: "paragraph と through に、消す範囲の最初と最後の段落番号を入れてください。",
+    });
+  });
+
+  it("refuses empty blocks, the same as insert_blocks", () => {
+    expect(parse({ paragraph: 1, through: 2, blocks: [] })).toEqual({
+      ok: false,
+      error: "blocks に有効な段落がありません。type と text を入れてください。",
+    });
+    expect(parse({ paragraph: 1, through: 2, blocks: [{ type: "outline", level: 1, text: " " }] }).ok).toBe(
+      false
+    );
   });
 });

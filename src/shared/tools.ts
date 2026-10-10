@@ -1,4 +1,4 @@
-import { BLOCK_TYPES, DraftBlock, Severity, normalizeBlock } from "./blocks";
+import { BLOCK_TYPES, DraftBlock, OUTLINE_LEVEL_COUNT, Severity, normalizeBlock } from "./blocks";
 import { FormatSelect, isListFilter, listFilterEnum, replacePatternError } from "./bulkFormat";
 import { LINE_SPACING_CHARS, LineSpacingChars } from "./constants";
 import { ListStyle, isListStyle, listStyleEnum, listStyleToolDescription } from "./listStyles";
@@ -40,6 +40,7 @@ export const TOOL_FIND_IN_DOCUMENT = "find_in_document";
 export const TOOL_DELETE_PARAGRAPHS = "delete_paragraphs";
 export const TOOL_DELETE_MATCHING = "delete_matching";
 export const TOOL_DELETE_SHAPE = "delete_shape";
+export const TOOL_REPLACE_PARAGRAPHS = "replace_paragraphs";
 export const TOOL_READ_INDEXED_FILE = "read_indexed_file";
 
 /** Word's search string cannot exceed this, and cannot span paragraphs. */
@@ -48,6 +49,8 @@ export const MAX_FIND_CHARS = 255;
 export const MAX_DELETE_PARAGRAPHS = 8;
 /** One conditional delete. More than this is refused whole, not cut short. */
 export const MAX_DELETE_MATCHING = 200;
+/** One replaced span, blank paragraphs included. */
+export const MAX_REPLACE_PARAGRAPHS = 400;
 
 /**
  * Shown on the next turn instead of a document read. The body is stale by then.
@@ -260,8 +263,14 @@ export type DeleteMatchingArgs = {
 };
 
 export type DeleteShapeArgs = {
-  /** The `[図1]` number from this turn's shape section. */
-  shape: number;
+  /** `[図1]` numbers from this turn's shape section, in the order given. */
+  shapes: number[];
+};
+
+export type ReplaceParagraphsArgs = {
+  paragraph: number;
+  through: number;
+  blocks: DraftBlock[];
 };
 
 export type ReadIndexedFileArgs = {
@@ -291,6 +300,7 @@ export type ToolInvocation =
   | { name: typeof TOOL_DELETE_PARAGRAPHS; args: DeleteParagraphsArgs }
   | { name: typeof TOOL_DELETE_MATCHING; args: DeleteMatchingArgs }
   | { name: typeof TOOL_DELETE_SHAPE; args: DeleteShapeArgs }
+  | { name: typeof TOOL_REPLACE_PARAGRAPHS; args: ReplaceParagraphsArgs }
   | { name: typeof TOOL_READ_INDEXED_FILE; args: ReadIndexedFileArgs };
 
 export type ParsedTool = { ok: true; call: ToolInvocation } | { ok: false; error: string };
@@ -436,6 +446,65 @@ function replaceQuoteTool(target: TargetHints, numbered: boolean): ToolDefinitio
   };
 }
 
+const OUTLINE_BLOCK_HINT =
+  "outline は「第１」「１．」「（１）」のように、番号を本文に書いて階層を作る段落。番号は text の先頭に書く（自動番号ではない）。" +
+  "level は階層の深さで、0 が第１、1 が１．、2 が（１）、3 が①・ア・「・」などそのほかの印、4 は階層の下の本文。" +
+  "字下げ・ぶら下げ・太字は設定の階層レイアウトで付くので、全角空白で位置を合わせない。";
+
+function blocksParam(): Record<string, unknown> {
+  return {
+    type: "array",
+    description: "挿入する段落の並び（文書上の出現順）",
+    items: {
+      type: "object",
+      properties: {
+        type: { type: "string", enum: BLOCK_TYPES, description: "段落の種類" },
+        text: stringParam("段落の本文"),
+        label: stringParam("clause のときの「第○条」など（任意）"),
+        level: {
+          type: "number",
+          description: `outline のときの階層。0 から ${OUTLINE_LEVEL_COUNT - 1}。`,
+        },
+      },
+      required: ["type", "text"],
+    },
+  };
+}
+
+function replaceParagraphsTool(): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_REPLACE_PARAGRAPHS,
+      description:
+        "段落 paragraph から through までを消し、その位置に blocks を入れる。修正履歴に残る。" +
+        "間の空行と、範囲の段落に結び付いた図形節の [図1] のテキストボックスも一緒に消える。" +
+        "through の直後の空行に結び付いたテキストボックスは、その空行ごと消える。範囲の外の段落と画像は変えない。" +
+        "節や様式の本文をまとめて書き直すとき、テキストボックスの中身を本文に起こすときは、" +
+        "insert_blocks・delete_paragraphs・delete_shape を繰り返さず、これを 1 回呼ぶ。" +
+        `一度に消せるのは ${MAX_REPLACE_PARAGRAPHS} 段落まで。` +
+        "blocks の書き方は insert_blocks と同じ。" +
+        OUTLINE_BLOCK_HINT +
+        "結果に、消した範囲の先頭と末尾、入れた段落の番号 [12] が返る。",
+      parameters: {
+        type: "object",
+        required: ["paragraph", "through", "blocks"],
+        properties: {
+          paragraph: {
+            type: "number",
+            description: "消す範囲の最初の段落番号。添付された本文の行頭の [12]。",
+          },
+          through: {
+            type: "number",
+            description: "消す範囲の最後の段落番号（この段落も消える）。",
+          },
+          blocks: blocksParam(),
+        },
+      },
+    },
+  };
+}
+
 function insertBlocksTool(numbered: boolean): ToolDefinition {
   return {
     type: "function",
@@ -456,25 +525,14 @@ function insertBlocksTool(numbered: boolean): ToolDefinition {
         "body は本文（先頭字下げはアドインが付けるので全角空白を足さない）、clause は条（label に「第○条」）、" +
         "item は項・号（直前がリストなら番号を継ぐ。番号そのものは本文に書かない）、" +
         "center は日付など、right は当事者名など。表・罫線・余白は出さない。" +
+        OUTLINE_BLOCK_HINT +
         "番号の付け外しと 1 からの振り直しは format_list。" +
         "結果に、入れた段落の番号 [12] が返る。同じターンでその段落を指すときは、quote ではなくその番号を paragraph / through に渡す。" +
         "fontName、bodyPt、titlePt、lineSpacingChars は、利用者がその項目をチャットで指定したときだけ入れる。空欄は設定で埋める指示ではない。行間の pt 指定は format_paragraph に残す。",
       parameters: {
         type: "object",
         properties: {
-          blocks: {
-            type: "array",
-            description: "挿入する段落の並び（文書上の出現順）",
-            items: {
-              type: "object",
-              properties: {
-                type: { type: "string", enum: BLOCK_TYPES, description: "段落の種類" },
-                text: stringParam("段落の本文"),
-                label: stringParam("clause のときの「第○条」など（任意）"),
-              },
-              required: ["type", "text"],
-            },
-          },
+          blocks: blocksParam(),
           ...(numbered
             ? {
                 paragraph: {
@@ -1067,15 +1125,17 @@ function deleteShapeTool(): ToolDefinition {
       name: TOOL_DELETE_SHAPE,
       description:
         "図形節の [図1] のテキストボックスを削除する。修正履歴に残る。" +
-        "shape には [図1] の数字を渡す。段落番号ではない。" +
+        "shapes には [図1] の数字を並べる。段落番号ではない。消す箱が複数あれば 1 回の呼び出しにまとめる。" +
         "同じ文言が複数あるときは、図形節での出現順のその番号の箱を消す。" +
-        "消した番号はもう使えない。中の文字の置換、コメント、挿入はできない。",
+        "消した番号はもう使えない。中の文字の置換、コメント、挿入はできない。" +
+        "箱の中身を本文に起こすなら、replace_paragraphs で本文の書き直しと一緒に消す。",
       parameters: {
         type: "object",
-        required: ["shape"],
+        required: ["shapes"],
         properties: {
-          shape: {
-            type: "number",
+          shapes: {
+            type: "array",
+            items: { type: "number" },
             description: "消すテキストボックスの番号。図形節の [図1] の数字。",
           },
         },
@@ -1139,6 +1199,7 @@ export function buildTools(options: ToolSetOptions = {}): ToolDefinition[] {
   tools.push(replaceAllTool());
   tools.push(insertBlocksTool(numbered || inserted));
   if (numbered || inserted) {
+    tools.push(replaceParagraphsTool());
     tools.push(insertBlankBeforeTool());
     tools.push(deleteParagraphsTool());
     tools.push(deleteMatchingTool());
@@ -1934,16 +1995,76 @@ function parseDeleteMatching(row: Record<string, unknown>): ParsedTool {
   return { ok: true, call: { name: TOOL_DELETE_MATCHING, args: { select } } };
 }
 
+function blocksOf(raw: unknown): DraftBlock[] | { error: string } {
+  if (!Array.isArray(raw)) {
+    return { error: "blocks が配列ではありません。" };
+  }
+  const blocks: DraftBlock[] = [];
+  for (const item of raw) {
+    const record = asRecord(item);
+    if (!record) {
+      continue;
+    }
+    const block = normalizeBlock(record);
+    if (!block) {
+      continue;
+    }
+    if (!block.text.trim()) {
+      return {
+        error:
+          "blocks の text が空です。空行は insert_blank_before に、その段落の番号を渡してください。",
+      };
+    }
+    blocks.push(block);
+  }
+  if (!blocks.length) {
+    return { error: "blocks に有効な段落がありません。type と text を入れてください。" };
+  }
+  return blocks;
+}
+
+function parseReplaceParagraphs(row: Record<string, unknown>): ParsedTool {
+  const paragraph = paragraphOf(row);
+  if (isArgError(paragraph)) {
+    return { ok: false, error: paragraph.error };
+  }
+  const through = throughOf(row);
+  if (isArgError(through)) {
+    return { ok: false, error: through.error };
+  }
+  if (paragraph === undefined || through === undefined) {
+    return {
+      ok: false,
+      error: "paragraph と through に、消す範囲の最初と最後の段落番号を入れてください。",
+    };
+  }
+  if (through < paragraph) {
+    return { ok: false, error: "through は paragraph 以上の段落番号にしてください。" };
+  }
+  const blocks = blocksOf(row.blocks);
+  if (isArgError(blocks)) {
+    return { ok: false, error: blocks.error };
+  }
+  return { ok: true, call: { name: TOOL_REPLACE_PARAGRAPHS, args: { paragraph, through, blocks } } };
+}
+
 function parseDeleteShape(row: Record<string, unknown>): ParsedTool {
-  const raw = row.shape;
-  if (raw === undefined || raw === null || raw === "") {
-    return { ok: false, error: "shape に、図形節の [図1] の数字を入れてください。" };
+  // A lone `shape` is the older single-box form, still sent from history.
+  const raw = row.shapes ?? (row.shape === undefined || row.shape === "" ? undefined : [row.shape]);
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { ok: false, error: "shapes に、図形節の [図1] の数字を 1 つ以上入れてください。" };
   }
-  const shape = paragraphNumber(raw);
-  if (shape === undefined) {
-    return { ok: false, error: "shape は図形節の [図1] の数字（1 以上の整数）にしてください。" };
+  const shapes: number[] = [];
+  for (const item of raw) {
+    const shape = paragraphNumber(item);
+    if (shape === undefined) {
+      return { ok: false, error: "shapes は図形節の [図1] の数字（1 以上の整数）の配列にしてください。" };
+    }
+    if (!shapes.includes(shape)) {
+      shapes.push(shape);
+    }
   }
-  return { ok: true, call: { name: TOOL_DELETE_SHAPE, args: { shape } } };
+  return { ok: true, call: { name: TOOL_DELETE_SHAPE, args: { shapes } } };
 }
 
 export function parseToolArguments(name: string, rawArguments: string): ParsedTool {
@@ -2014,10 +2135,6 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
       };
     }
     case TOOL_INSERT_BLOCKS: {
-      const rawBlocks = row.blocks;
-      if (!Array.isArray(rawBlocks)) {
-        return { ok: false, error: "blocks が配列ではありません。" };
-      }
       const at = insertAtOf(row);
       if (typeof at === "object") {
         return { ok: false, error: at.error };
@@ -2027,30 +2144,9 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
         return { ok: false, error: paragraph.error };
       }
       const quote = text(row, "quote").trim();
-      const blocks: DraftBlock[] = [];
-      for (const item of rawBlocks) {
-        const record = asRecord(item);
-        if (!record) {
-          continue;
-        }
-        const block = normalizeBlock(record);
-        if (!block) {
-          continue;
-        }
-        if (!block.text.trim()) {
-          return {
-            ok: false,
-            error:
-              "blocks の text が空です。空行は insert_blank_before に、その段落の番号を渡してください。",
-          };
-        }
-        blocks.push(block);
-      }
-      if (!blocks.length) {
-        return {
-          ok: false,
-          error: "blocks に有効な段落がありません。type と text を入れてください。",
-        };
+      const blocks = blocksOf(row.blocks);
+      if (isArgError(blocks)) {
+        return { ok: false, error: blocks.error };
       }
       const fontName = optionalString(row, "fontName")?.trim();
       const bodyPt = optionalPositive(row, "bodyPt");
@@ -2280,6 +2376,8 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
       return parseDeleteMatching(row);
     case TOOL_DELETE_SHAPE:
       return parseDeleteShape(row);
+    case TOOL_REPLACE_PARAGRAPHS:
+      return parseReplaceParagraphs(row);
     case TOOL_READ_INDEXED_FILE:
       return parseReadIndexedFile(row);
     default:
@@ -2520,7 +2618,9 @@ export function describeToolCall(name: string, rawArguments: string): string {
       return `${numbers.length} 段落を削除${follows}`;
     }
     case TOOL_DELETE_SHAPE:
-      return `図${call.args.shape} を削除`;
+      return `${call.args.shapes.map((shape) => `図${shape}`).join("、")} を削除`;
+    case TOOL_REPLACE_PARAGRAPHS:
+      return `段落 ${call.args.paragraph}〜${call.args.through} を ${call.args.blocks.length} 段落に置き換え`;
     default:
       return name;
   }

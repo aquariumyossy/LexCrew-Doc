@@ -113,6 +113,7 @@ import ArgosScopePicker from "./ArgosScopePicker";
 import { FileAttachButton, FileBadges } from "./FileAttachBar";
 import ContextMeter from "./ContextMeter";
 import HistoryDialog from "./HistoryDialog";
+import OutlineLayoutField from "./OutlineLayoutField";
 import { CompactDialogClose, useCompactDialogStyles } from "./compactDialog";
 
 const useStyles = makeStyles({
@@ -1479,6 +1480,10 @@ const App: React.FC = () => {
                     />
                   </Field>
                 </div>
+                <OutlineLayoutField
+                  layout={settings.outlineLayout}
+                  onChange={(outlineLayout) => patch({ outlineLayout })}
+                />
               </div>
             </DialogContent>
           </DialogBody>

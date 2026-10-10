@@ -1,4 +1,9 @@
-import { mapBlocks, summarizeInsertedBlocks } from "../../shared/blocks";
+import {
+  FontOptions,
+  mapBlocks,
+  summarizeInsertedBlocks,
+  summarizeReplacedParagraphs,
+} from "../../shared/blocks";
 import { foreignCharToolError } from "../../shared/japaneseHan";
 import {
   TOOL_APPLY_FORMAT,
@@ -18,6 +23,7 @@ import {
   TOOL_INSERT_COMMENT,
   TOOL_READ_INDEXED_FILE,
   TOOL_READ_PARAGRAPHS,
+  TOOL_REPLACE_PARAGRAPHS,
   TOOL_REPLACE_QUOTE,
   TOOL_REPLACE_SELECTION,
   TOOL_SEARCH,
@@ -47,6 +53,7 @@ import {
   insertBlankBefore,
   insertComment,
   insertDraftParagraphs,
+  replaceParagraphs,
   replaceQuote,
   replaceSelection,
   setOutlineLevel,
@@ -86,6 +93,16 @@ export type ExecuteOptions = {
 
 function failed(message: string): ToolOutcome {
   return { content: `エラー: ${message}`, ok: false };
+}
+
+function blockOptions(settings: Settings): FontOptions {
+  return {
+    fontName: settings.fontName,
+    bodyPt: settings.bodyPt,
+    titlePt: settings.titlePt,
+    lineSpacingChars: settings.lineSpacingChars,
+    outlineLayout: settings.outlineLayout,
+  };
 }
 
 /**
@@ -241,12 +258,7 @@ export async function executeToolCall(
       }
 
       case TOOL_INSERT_BLOCKS: {
-        const specs = mapBlocks(invocation.args.blocks, {
-          fontName: settings.fontName,
-          bodyPt: settings.bodyPt,
-          titlePt: settings.titlePt,
-          lineSpacingChars: settings.lineSpacingChars,
-        });
+        const specs = mapBlocks(invocation.args.blocks, blockOptions(settings));
         const at = invocation.args.at ?? (insertBlocksInTurn > 0 ? "continue" : "cursor");
         insertBlocksInTurn += 1;
         const landing = await insertDraftParagraphs(
@@ -275,6 +287,30 @@ export async function executeToolCall(
           ok: true,
           // The new paragraphs now have numbers; the next round's tools must offer them.
           numbered: Boolean(landing?.numbers?.length),
+        };
+      }
+
+      case TOOL_REPLACE_PARAGRAPHS: {
+        const { paragraph, through, blocks } = invocation.args;
+        const span = await replaceParagraphs(
+          paragraph,
+          through,
+          mapBlocks(blocks, blockOptions(settings)),
+          {
+            hasBody: extras.hasBody === true,
+            user: {},
+            settings: {
+              fontName: settings.fontName,
+              bodyPt: settings.bodyPt,
+              titlePt: settings.titlePt,
+              lineSpacingChars: settings.lineSpacingChars,
+            },
+          }
+        );
+        return {
+          content: summarizeReplacedParagraphs(blocks, span),
+          ok: true,
+          numbered: Boolean(span.numbers?.length),
         };
       }
 

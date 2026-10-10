@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { AnchoredShape, fitShapeText, pickShapeByText, readShapeBlocks, SHAPE_NOTE } from "./shapeText";
+import {
+  AnchoredShape,
+  fitShapeText,
+  pickShapeByText,
+  readShapeBlocks,
+  SHAPE_NOTE,
+  shapesInSpan,
+} from "./shapeText";
 
 const BOX = `<?xml version="1.0"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
@@ -112,5 +119,25 @@ describe("pickShapeByText", () => {
 
   it("reports a word-art string the shape collection does not carry", () => {
     expect(pickShapeByText(["アート"], [{ text: "" }], 1)).toEqual({ ok: false, reason: "missing" });
+  });
+});
+
+describe("shapesInSpan", () => {
+  // Paragraphs 2, 4, 6 and 9 are numbered; boxes sit on 1, 3, 5, 7 and 8.
+  const anchors = [1, 3, 5, 7, 8, null];
+  const numbered = [2, 4, 6, 9];
+
+  it("takes boxes in the span and on the blanks up to the next numbered paragraph", () => {
+    expect(shapesInSpan(anchors, 2, 4, numbered)).toEqual({ shapes: [2, 3], lastAnchor: 5 });
+    expect(shapesInSpan(anchors, 6, 6, numbered)).toEqual({ shapes: [4, 5], lastAnchor: 8 });
+  });
+
+  it("leaves the blanks before the span alone", () => {
+    expect(shapesInSpan(anchors, 2, 2, numbered)).toEqual({ shapes: [2], lastAnchor: 3 });
+  });
+
+  it("does not reach past the span when nothing numbered follows it", () => {
+    expect(shapesInSpan(anchors, 9, 9, numbered)).toEqual({ shapes: [], lastAnchor: 9 });
+    expect(shapesInSpan([3, 10], 2, 3, [2, 3])).toEqual({ shapes: [1], lastAnchor: 3 });
   });
 });

@@ -90,7 +90,7 @@ export function systemPrompt(options: PromptOptions): string {
       ? [
           "「" +
             SHAPES_MARKER +
-            "」はテキストボックスや図形の中の文字です。ここは読めます。行頭の [図1] は段落番号ではありません。本文と read_paragraphs の行末にある [図1] は、図形節の同じ番号です。箱の中の文字は read_paragraphs には出ません。消すときは delete_shape にその数字を渡します。置換、コメント、挿入の対象にしません。引用とチャットの返事には [図1] を書きません。",
+            "」はテキストボックスや図形の中の文字です。ここは読めます。行頭の [図1] は段落番号ではありません。本文と read_paragraphs の行末にある [図1] は、図形節の同じ番号です。箱の中の文字は read_paragraphs には出ません。消すときは delete_shape にその数字を渡します。箱の中身を本文に起こすときは、replace_paragraphs で本文の書き直しと一緒に消します。置換、コメント、挿入の対象にしません。引用とチャットの返事には [図1] を書きません。",
         ]
       : options.shapes
         ? [

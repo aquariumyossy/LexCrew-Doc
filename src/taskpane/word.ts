@@ -24,6 +24,7 @@ import {
   InsertPlacement,
   InsertedParagraph,
   ParagraphSpec,
+  ReplacedSpan,
   Severity,
   paintParagraph,
   specPlainText,
@@ -65,6 +66,7 @@ import {
   readShapeBlocks,
   renderedShapeBody,
   shapeLabel,
+  shapesInSpan,
   type AnchoredShape,
 } from "../shared/extract/shapeText";
 import { SHAPES_MARKER, TRUNCATION_NOTE } from "../shared/prompts";
@@ -104,6 +106,7 @@ import {
   InsertCommentArgs,
   MAX_DELETE_MATCHING,
   MAX_FIND_CHARS,
+  MAX_REPLACE_PARAGRAPHS,
   ReadParagraphsArgs,
   ReplaceQuoteArgs,
   SetOutlineArgs,
@@ -483,6 +486,8 @@ let attachedParagraphCount = 0;
  * so a later duplicate still means the same occurrence.
  */
 let attachedShapes: string[] = [];
+/** The paragraph number each `[図]` is anchored on, null when unknown. */
+let attachedShapeAnchors: (number | null)[] = [];
 /** `[図]` numbers already deleted this turn. */
 let spentShapes = new Set<number>();
 /** Shape ids already deleted. Tracked changes may leave them in the collection. */
@@ -492,6 +497,7 @@ function forgetParagraphNumbers(): void {
   attachedParagraphs = new Map();
   attachedParagraphCount = 0;
   attachedShapes = [];
+  attachedShapeAnchors = [];
   spentShapes = new Set();
   deletedShapeIds = new Set();
   allParagraphRawTexts = new Map();
@@ -698,6 +704,7 @@ export async function readDocumentText(
       : fitShapeText(shapeBlocks, shapeRoom, TRUNCATION_NOTE);
     if (!shapeError) {
       attachedShapes = fitted.shown;
+      attachedShapeAnchors = fitted.anchors;
       spentShapes = new Set();
     }
     let shapes: ShapeRead = shapeError
@@ -4670,7 +4677,47 @@ async function loadShapeLeaves(
 }
 
 /**
- * Delete the text box numbered in this turn's shape section. Tracking stays
+ * Queue deletes for the numbered boxes in the caller's tracked run. The
+ * numbers are spent only once the caller's sync goes through.
+ */
+async function queueShapeDeletes(
+  context: Word.RequestContext,
+  numbers: number[]
+): Promise<{ deleted: number[]; missing: number[]; commit: () => void }> {
+  const host = context.document.body as unknown as { shapes: HostShapeCollection };
+  host.shapes.load("items");
+  await context.sync();
+  let leaves = (await loadShapeLeaves(context, host.shapes.items)).filter(
+    (leaf) => !deletedShapeIds.has(leaf.id)
+  );
+  const spent = new Set(spentShapes);
+  const ids: number[] = [];
+  const deleted: number[] = [];
+  const missing: number[] = [];
+  for (const number of numbers) {
+    const pick = pickShapeByText(attachedShapes, leaves, number, spent);
+    if (!pick.ok) {
+      missing.push(number);
+      continue;
+    }
+    pick.shape.delete();
+    spent.add(number);
+    ids.push(pick.shape.id);
+    deleted.push(number);
+    leaves = leaves.filter((leaf) => leaf.id !== pick.shape.id);
+  }
+  return {
+    deleted,
+    missing,
+    commit: () => {
+      deleted.forEach((number) => spentShapes.add(number));
+      ids.forEach((id) => deletedShapeIds.add(id));
+    },
+  };
+}
+
+/**
+ * Delete the text boxes numbered in this turn's shape section. Tracking stays
  * on, the same as every other edit. Older Word is told why, and the paragraph
  * is left alone.
  */
@@ -4678,36 +4725,163 @@ export async function deleteShape(args: DeleteShapeArgs): Promise<string> {
   if (!isWordHost()) {
     throw new Error("Word で開いてください。");
   }
-  const number = args.shape;
-  if (!Number.isInteger(number) || number < 1 || number > attachedShapes.length) {
-    throw new Error(`図${number} はこのターンの図形節にありません。`);
-  }
-  if (spentShapes.has(number)) {
-    throw new Error(`図${number} は削除済みです。この番号はもう使えません。`);
+  for (const number of args.shapes) {
+    if (!Number.isInteger(number) || number < 1 || number > attachedShapes.length) {
+      throw new Error(`図${number} はこのターンの図形節にありません。どれも消していません。`);
+    }
+    if (spentShapes.has(number)) {
+      throw new Error(`図${number} は削除済みです。この番号はもう使えません。どれも消していません。`);
+    }
   }
   if (!canDeleteShapes()) {
     throw new Error("この Word ではテキストボックスを削除できません。");
   }
   return Word.run(async (context) => {
-    const host = context.document.body as unknown as { shapes: HostShapeCollection };
-    host.shapes.load("items");
-    await context.sync();
-    const leaves = (await loadShapeLeaves(context, host.shapes.items)).filter(
-      (leaf) => !deletedShapeIds.has(leaf.id)
-    );
-    const pick = pickShapeByText(attachedShapes, leaves, number, spentShapes);
-    if (!pick.ok) {
+    startTracking(context);
+    const queued = await queueShapeDeletes(context, args.shapes);
+    if (!queued.deleted.length) {
       throw new Error(
-        `図${number} に一致するテキストボックスが見つかりません。ワードアートのように図形の本文を持たないものは削除できません。`
+        `${args.shapes.map((n) => `図${n}`).join("、")} に一致するテキストボックスが見つかりません。` +
+          "ワードアートのように図形の本文を持たないものは削除できません。"
       );
     }
-    startTracking(context);
-    pick.shape.delete();
     await context.sync();
-    spentShapes.add(number);
-    deletedShapeIds.add(pick.shape.id);
-    const first = attachedShapes[number - 1].split("\n")[0] || "";
-    return `図${number}「${clipNote(first, 24)}」を削除しました（変更履歴に記録）。この番号はもう使えません。`;
+    queued.commit();
+    const labels = queued.deleted.map((number) => {
+      const first = attachedShapes[number - 1].split("\n")[0] || "";
+      return `図${number}「${clipNote(first, 24)}」`;
+    });
+    const missing = queued.missing.length
+      ? `${queued.missing.map((n) => `図${n}`).join("、")} は一致する箱が見つからず、消していません。`
+      : "";
+    return `${labels.join("、")}を削除しました（変更履歴に記録）。この番号はもう使えません。${missing}`;
+  });
+}
+
+/**
+ * Locate a numbered span in the live body. The span is the paragraphs from
+ * `from` to `through`, blank ones between them included.
+ */
+function locateSpan(
+  items: Word.Paragraph[],
+  from: number,
+  through: number
+): { first: number; last: number; firstText: string; lastText: string } {
+  const first = locateParagraph(items, from);
+  const last = locateParagraph(items, through);
+  if (last.index < first.index) {
+    throw new Error(`段落 ${through} が段落 ${from} より前で見つかりました。範囲を指し直してください。`);
+  }
+  return { first: first.index, last: last.index, firstText: first.text, lastText: last.text };
+}
+
+/**
+ * Replace a numbered span with new paragraphs. The new text goes in first,
+ * right after `through`, so a failed delete leaves both versions rather than
+ * neither. Boxes anchored in the span go through the shape API, which is the
+ * delete that is known to work, before their paragraphs are removed.
+ */
+export async function replaceParagraphs(
+  from: number,
+  through: number,
+  specs: ParagraphSpec[],
+  format: InsertFormatContext
+): Promise<ReplacedSpan> {
+  if (!isWordHost()) {
+    throw new Error("Word で開いてください。");
+  }
+  const span = shapesInSpan(attachedShapeAnchors, from, through, attachedParagraphs.keys());
+  const shapes = span.shapes.filter((number) => !spentShapes.has(number));
+  if (shapes.length && !canDeleteShapes()) {
+    throw new Error(
+      "この Word ではテキストボックスを削除できません。範囲には手を付けていません。insert_blocks と delete_paragraphs で書き直してください。"
+    );
+  }
+  await Word.run(async (context) => {
+    const paragraphs = context.document.body.paragraphs;
+    paragraphs.load("items/text");
+    await context.sync();
+    const found = locateSpan(paragraphs.items, from, through);
+    const count = found.last - found.first + 1 + (span.lastAnchor - through);
+    if (count > MAX_REPLACE_PARAGRAPHS) {
+      throw new Error(
+        `範囲が ${count} 段落あり、一度に置き換えられる ${MAX_REPLACE_PARAGRAPHS} 段落を超えています。何も変えていません。範囲を分けてください。`
+      );
+    }
+  });
+
+  const landing = await insertDraftParagraphs(specs, "cursor", "", through, format);
+
+  try {
+    return await removeReplacedSpan(from, through, specs, shapes, span.lastAnchor, landing);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "Word の操作に失敗しました。";
+    throw new Error(
+      `新しい ${specs.length} 段落は段落 ${through} の後ろに入れましたが、元の段落 ${from}〜${through} は消せていません（${reason}）。` +
+        "read_paragraphs で読み直し、残った元の段落を delete_paragraphs で消してください。"
+    );
+  }
+}
+
+async function removeReplacedSpan(
+  from: number,
+  through: number,
+  specs: ParagraphSpec[],
+  shapes: number[],
+  lastAnchor: number,
+  landing: InsertLanding
+): Promise<ReplacedSpan> {
+  return Word.run(async (context) => {
+    startTracking(context);
+    const queued = shapes.length
+      ? await queueShapeDeletes(context, shapes)
+      : { deleted: [], missing: [], commit: () => undefined };
+    const paragraphs = context.document.body.paragraphs;
+    paragraphs.load("items/text");
+    await context.sync();
+    const items = paragraphs.items;
+    const found = locateSpan(items, from, through);
+
+    // The blanks that held the span's boxes sit past the new paragraphs now.
+    const created = specs.map((spec) => compact(specPlainText(spec)));
+    const landedRight = created.every(
+      (text, offset) => compact(paragraphText(items[found.last + 1 + offset] || { text: "" })) === text
+    );
+    const doomed: Word.Paragraph[] = [];
+    if (landedRight) {
+      for (let step = 1; step <= lastAnchor - through; step += 1) {
+        const blank = items[found.last + created.length + step];
+        if (!blank || paragraphText(blank).trim()) {
+          break;
+        }
+        doomed.push(blank);
+      }
+    }
+    for (let index = found.last; index >= found.first; index -= 1) {
+      doomed.push(items[index]);
+    }
+    for (const paragraph of doomed) {
+      paragraph.delete();
+    }
+    await context.sync();
+    queued.commit();
+
+    for (const number of [...attachedParagraphs.keys()]) {
+      if (number >= from && number <= through) {
+        attachedParagraphs.delete(number);
+      }
+    }
+    attachedParagraphCount = items.length + 1;
+    return {
+      from,
+      through,
+      firstText: found.firstText,
+      lastText: found.lastText,
+      removed: doomed.length,
+      shapes: queued.deleted,
+      unmatchedShapes: queued.missing,
+      numbers: landing.numbers,
+    };
   });
 }
 

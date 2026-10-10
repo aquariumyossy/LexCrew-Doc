@@ -7,21 +7,22 @@ import {
   userMessageWithAttachment,
 } from "../../shared/prompts";
 import { joinArgosScopes } from "../../shared/argos";
+import { CHARS_PER_TOKEN } from "../../shared/constants";
 import { Usage } from "../../shared/stripThinking";
 import {
   looksLikeFormatInstruction,
+  normalizeThinkingBudget,
   resolveFormatThinking,
 } from "../../shared/thinking";
 import {
   UNLIMITED_TOOL_ROUNDS,
   buildTools,
-  isFormattingTool,
   isToolsUnsupportedError,
   toolRoundLimitNotice,
 } from "../../shared/tools";
 import { logInfo } from "../../sidecar/logger";
 import { ChatMessage } from "../../sidecar/types";
-import { chatStream } from "../api";
+import { ChatBody, chatStream } from "../api";
 import { Settings } from "../settings";
 import { documentHasVisibleText, isWordHost } from "../word";
 import { fitContext, indexedReadCharLimit, messagesTokens, toChatMessages } from "./context";
@@ -143,9 +144,13 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   let tools = toolsFor();
   let toolsSupported = true;
   let lastUsage: Usage | null = null;
-  // Lower thinking only after the user opts in. The first call uses the hint;
-  // later calls follow it once a formatting tool has actually run.
-  let formatWork = looksLikeFormatInstruction(options.instruction);
+  // One level for the whole turn: the chat template puts the low and xhigh
+  // instructions at the head of the prompt, so switching mid-turn throws away
+  // the server's prefix cache.
+  const turnThinking = looksLikeFormatInstruction(options.instruction)
+    ? resolveFormatThinking(settings.formatThinkingLevel, settings.thinkingLevel)
+    : settings.thinkingLevel;
+  const thinkingCapChars = normalizeThinkingBudget(settings.thinkingBudget) * CHARS_PER_TOKEN;
   const started = Date.now();
   const meter = {
     toolRounds: 0,
@@ -155,11 +160,6 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     totalTokens: 0,
   };
   beginToolTurn();
-
-  const thinkingFor = () =>
-    formatWork
-      ? resolveFormatThinking(settings.formatThinkingLevel, settings.thinkingLevel)
-      : settings.thinkingLevel;
 
   const noteUsage = (usage: Usage | null) => {
     if (!usage) {
@@ -184,21 +184,55 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     return { usage, nextRequestTokens: messagesTokens(fitContext(messages, limit)) };
   };
 
+  /**
+   * MTPLX does not read a thinking budget, so the pane enforces it: once the
+   * streamed reasoning passes the cap, that call is dropped and sent again with
+   * thinking off. The next round goes back to the turn's level.
+   */
+  const stream = async (body: ChatBody) => {
+    if (body.thinkingLevel === "off") {
+      return chatStream(body, { signal, onDelta: options.onDelta });
+    }
+    const cut = new AbortController();
+    const forward = () => cut.abort(signal.reason);
+    signal.addEventListener("abort", forward, { once: true });
+    let thought = 0;
+    const onDelta = (snapshot: { content: string; reasoningContent: string }) => {
+      options.onDelta?.(snapshot);
+      thought = snapshot.reasoningContent.length;
+      if (!cut.signal.aborted && thought > thinkingCapChars) {
+        cut.abort();
+      }
+    };
+    try {
+      return await chatStream(body, { signal: cut.signal, onDelta });
+    } catch (error) {
+      if (signal.aborted || !cut.signal.aborted) {
+        throw error;
+      }
+      logInfo("thinking cut", { level: body.thinkingLevel, reasoningChars: thought });
+      meter.llmCalls += 1;
+      options.onDelta?.({ content: "", reasoningContent: "" });
+      return chatStream({ ...body, thinkingLevel: "off" }, { signal, onDelta: options.onDelta });
+    } finally {
+      signal.removeEventListener("abort", forward);
+    }
+  };
+
   const send = async (withTools: boolean) => {
     meter.llmCalls += 1;
-    const body = {
+    const body: ChatBody = {
       llmBaseUrl: settings.llmBaseUrl,
       llmApiKey: settings.llmApiKey,
       model: settings.llmModel,
       messages: fitContext(messages, limit),
       tools: withTools && toolsSupported ? tools : undefined,
-      thinkingLevel: thinkingFor(),
-      thinkingBudget: settings.thinkingBudget,
+      thinkingLevel: turnThinking,
       timeoutMs: settings.timeoutMs,
     };
     options.onDelta?.({ content: "", reasoningContent: "" });
     try {
-      return await chatStream(body, { signal, onDelta: options.onDelta });
+      return await stream(body);
     } catch (error) {
       const message = error instanceof Error ? error.message : "";
       if (!withTools || !toolsSupported || !isToolsUnsupportedError(message)) {
@@ -206,7 +240,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       }
       toolsSupported = false;
       meter.llmCalls += 1;
-      return chatStream({ ...body, tools: undefined }, { signal, onDelta: options.onDelta });
+      return stream({ ...body, tools: undefined });
     }
   };
 
@@ -260,9 +294,6 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       if (outcome.numbered && !numbersHandedOut) {
         numbersHandedOut = true;
         tools = toolsFor();
-      }
-      if (isFormattingTool(call.function.name)) {
-        formatWork = true;
       }
     }
     round += 1;

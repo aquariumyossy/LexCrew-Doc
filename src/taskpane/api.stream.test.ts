@@ -7,7 +7,6 @@ const body: ChatBody = {
   model: "qwen3.8-flash-next",
   messages: [{ role: "user", content: "点検して" }],
   thinkingLevel: "medium",
-  thinkingBudget: 2048,
   timeoutMs: 180000,
 };
 

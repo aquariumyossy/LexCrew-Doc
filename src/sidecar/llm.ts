@@ -222,7 +222,6 @@ export type ChatCallOptions = {
   messages: (ChatMessage | VisionMessage)[];
   tools?: ToolDefinition[];
   thinkingLevel?: ThinkingLevel;
-  thinkingBudget?: number;
   timeoutMs?: number;
   signal?: AbortSignal;
   stream?: boolean;
@@ -241,10 +240,7 @@ function buildPayload(options: ChatCallOptions, withThinking: boolean): Record<s
     payload.stream = true;
   }
   if (withThinking) {
-    Object.assign(
-      payload,
-      thinkingFields(normalizeThinkingLevel(options.thinkingLevel), options.thinkingBudget ?? 0)
-    );
+    Object.assign(payload, thinkingFields(normalizeThinkingLevel(options.thinkingLevel)));
   }
   return payload;
 }
@@ -347,7 +343,6 @@ export async function readImageText(options: {
     model: options.model,
     messages: [message],
     thinkingLevel: "off",
-    thinkingBudget: 0,
     timeoutMs: options.timeoutMs,
     signal: options.signal,
   });

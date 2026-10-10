@@ -1381,7 +1381,7 @@ const App: React.FC = () => {
                     size="small"
                     label="思考トークン予算"
                     style={{ flex: 1 }}
-                    hint="長考を抑えます。"
+                    hint="超えた思考は打ち切り、思考なしで送り直します。"
                   >
                     <Input
                       size="small"

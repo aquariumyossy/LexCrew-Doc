@@ -146,7 +146,6 @@ export type ChatBody = {
   messages: ChatMessage[];
   tools?: ToolDefinition[];
   thinkingLevel: ThinkingLevel;
-  thinkingBudget: number;
   timeoutMs: number;
 };
 

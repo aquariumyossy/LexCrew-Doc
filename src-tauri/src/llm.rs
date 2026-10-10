@@ -315,7 +315,6 @@ pub struct ChatOptions<'a> {
     pub messages: &'a [Value],
     pub tools: &'a [Value],
     pub thinking_level: &'a str,
-    pub thinking_budget: u32,
     pub timeout_ms: u64,
 }
 
@@ -337,7 +336,7 @@ fn build_payload(options: &ChatOptions<'_>, include_thinking: bool, stream: bool
         payload["stream"] = json!(true);
     }
     if include_thinking {
-        payload = with_thinking(&payload, options.thinking_level, options.thinking_budget);
+        payload = with_thinking(&payload, options.thinking_level);
     }
     payload
 }

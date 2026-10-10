@@ -461,6 +461,10 @@ export type ReplacedSpan = {
   lastText: string;
   /** Paragraphs removed, blank ones included. */
   removed: number;
+  /** Paragraphs in the span holding a picture, left in place. */
+  keptPictures: number;
+  /** The span as the model gave it, when an end on a blank line was pulled in. */
+  asked?: { from: number; through: number };
   /** `[図]` numbers removed with the span. */
   shapes: number[];
   /** `[図]` numbers in the span that could not be matched to a box. */
@@ -469,10 +473,21 @@ export type ReplacedSpan = {
 };
 
 export function summarizeReplacedParagraphs(blocks: DraftBlock[], span: ReplacedSpan): string {
-  const parts = [
+  const parts: string[] = [];
+  if (span.asked) {
+    parts.push(
+      `段落 ${span.asked.from}〜${span.asked.through} の端が空行だったので、番号のある段落 ${span.from}〜${span.through} に寄せました`
+    );
+  }
+  parts.push(
     `段落 ${span.from}「${shorten(span.firstText, 16)}」から段落 ${span.through}「${shorten(span.lastText, 16)}」まで` +
       `の ${span.removed} 段落を消し、その位置に ${blocks.length} 段落を入れました（変更履歴に記録）`,
-  ];
+    "入れた段落には設定どおりの階層の書式を当て済みです",
+    "元の段落は変更履歴の削除として残るだけで、本文の読みには出ません"
+  );
+  if (span.keptPictures) {
+    parts.push(`範囲にあった画像の ${span.keptPictures} 段落は消さずに残しました`);
+  }
   if (span.shapes.length) {
     parts.push(`範囲に結び付いたテキストボックス ${span.shapes.map((n) => `図${n}`).join("、")} も消しました`);
   }

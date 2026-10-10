@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AnchoredShape,
+  BodyParagraphFact,
   fitShapeText,
   pickShapeByText,
   readShapeBlocks,
@@ -45,11 +46,16 @@ function shape(lines: string[], anchor: number | null = null): AnchoredShape {
   return { lines, anchor };
 }
 
+function fact(text: string, extra: Partial<BodyParagraphFact> = {}): BodyParagraphFact {
+  return { text, hasDrawing: false, markDeleted: false, ...extra };
+}
+
 describe("readShapeBlocks", () => {
   it("reads a text box once, keeping tabs, breaks and table cells", () => {
     expect(readShapeBlocks(BOX)).toEqual({
       bodyParagraphs: 3,
       blocks: [shape(["箱\t甲", "乙\n丙", "残す", "セル"], 1)],
+      paragraphs: [fact("前文"), fact("枠"), fact("後文")],
     });
   });
 
@@ -58,7 +64,38 @@ describe("readShapeBlocks", () => {
     expect(readShapeBlocks(xml)).toEqual({
       bodyParagraphs: 1,
       blocks: [shape(["アート"], 1)],
+      paragraphs: [fact("")],
     });
+  });
+});
+
+describe("body paragraph facts", () => {
+  const facts = (body: string) => readShapeBlocks(`<w:document><w:body>${body}</w:body></w:document>`).paragraphs;
+
+  it("leaves a text box anchor without text of its own and without a drawing", () => {
+    const anchor = `<w:p><w:r><mc:AlternateContent><mc:Choice><w:drawing><wps:txbx><w:txbxContent><w:p><w:r><w:t>箱</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice><mc:Fallback><w:pict><v:textbox><w:txbxContent><w:p><w:r><w:t>箱</w:t></w:r></w:p></w:txbxContent></v:textbox></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>`;
+    expect(facts(anchor)).toEqual([fact("")]);
+  });
+
+  it("marks a picture paragraph, inline or legacy", () => {
+    const inline = `<w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData><pic:pic/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>`;
+    const legacy = `<w:p><w:r><w:pict><v:shape><v:imagedata r:id="rId4"/></v:shape></w:pict></w:r></w:p>`;
+    expect(facts(inline + legacy)).toEqual([fact("", { hasDrawing: true }), fact("", { hasDrawing: true })]);
+  });
+
+  it("does not count a picture that is itself a tracked deletion", () => {
+    const xml = `<w:p><w:del><w:r><w:drawing><pic:pic/></w:drawing></w:r></w:del></w:p>`;
+    expect(facts(xml)).toEqual([fact("")]);
+  });
+
+  it("marks a paragraph whose mark is deleted and keeps only the text that stays", () => {
+    const xml = `<w:p><w:pPr><w:rPr><w:del w:id="1" w:author="甲"/></w:rPr></w:pPr><w:del><w:r><w:delText>消えた</w:delText></w:r></w:del><w:ins><w:r><w:t>足した</w:t></w:r></w:ins></w:p><w:p/>`;
+    expect(facts(xml)).toEqual([fact("足した", { markDeleted: true }), fact("")]);
+  });
+
+  it("does not read a run's own deletion as the paragraph mark", () => {
+    const xml = `<w:p><w:r><w:rPr><w:del/></w:rPr><w:t>本文</w:t></w:r></w:p>`;
+    expect(facts(xml)).toEqual([fact("本文")]);
   });
 });
 

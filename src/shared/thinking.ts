@@ -26,12 +26,10 @@ export const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
 
 export type ChatTemplateKwargs = {
   enable_thinking: boolean;
-  thinking_budget?: number;
 };
 
 export type ThinkingFields = {
   reasoning_effort?: "low" | "medium" | "xhigh";
-  thinking_budget?: number;
   chat_template_kwargs?: ChatTemplateKwargs;
 };
 
@@ -75,19 +73,16 @@ export function normalizeThinkingBudget(value: unknown): number {
 
 /**
  * MTPLX keeps thinking on by default and honours `reasoning_effort` plus Qwen's
- * `chat_template_kwargs`. Long deliberation is bounded by the budget, not by
- * turning thinking off: with reasoning disabled, Qwen 3.8 has been seen to emit
- * stray tool calls and cut the turn short.
+ * `chat_template_kwargs.enable_thinking`. It does not read a token budget, so
+ * none is sent; the pane cuts a call short when its thinking runs too long.
  */
-export function thinkingFields(level: ThinkingLevel, budget: number): ThinkingFields {
+export function thinkingFields(level: ThinkingLevel): ThinkingFields {
   if (level === "off") {
     return { chat_template_kwargs: { enable_thinking: false } };
   }
-  const n = normalizeThinkingBudget(budget);
   const effort = level === "high" ? "xhigh" : level;
   return {
     reasoning_effort: effort,
-    thinking_budget: n,
-    chat_template_kwargs: { enable_thinking: true, thinking_budget: n },
+    chat_template_kwargs: { enable_thinking: true },
   };
 }

@@ -92,8 +92,8 @@ type WordOptions = {
   pageIndex?: number;
   /** Per-paragraph tracked changes for resolveTarget deletion checks. */
   paragraphChanges?: FakeChange[][];
-  /** `body.getOoxml()` payload. Raw document XML is enough. */
-  ooxml?: string;
+  /** `body.getOoxml()` payload. Raw document XML is enough; a function follows the live body. */
+  ooxml?: string | (() => string);
   /** `body.getOoxml()` throws, so shape text could not be read. */
   ooxmlFail?: boolean;
   /** False stands for a Word without Shape.delete (WordApiDesktop 1.2). */
@@ -744,7 +744,7 @@ function installWord(options: WordOptions): {
       if (options.ooxmlFail) {
         throw new Error("OOXMLを読めません");
       }
-      return { value: options.ooxml || "" };
+      return { value: typeof options.ooxml === "function" ? options.ooxml() : options.ooxml || "" };
     },
     paragraphs: {
       load: () => undefined,
@@ -878,6 +878,41 @@ function installWord(options: WordOptions): {
     deletedShapes,
   };
 }
+
+const W_NS = `xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"`;
+
+/**
+ * Word with a body whose OOXML follows inserts: each starting paragraph keeps
+ * its own XML, and a paragraph added later is plain text. `rows` pairs Word's
+ * text for a paragraph with its `w:p`.
+ */
+function installBody(
+  rows: Array<[string, string]>,
+  options: Omit<WordOptions, "selection" | "body" | "paragraphs" | "ooxml"> = {}
+): ReturnType<typeof installWord> {
+  const xml = new Map<object, string>();
+  const word: ReturnType<typeof installWord> = installWord({
+    ...options,
+    selection: "",
+    body: "",
+    paragraphs: rows.map(([text]) => text),
+    ooxml: () =>
+      `<w:document ${W_NS}><w:body>` +
+      word.paragraphs
+        .map((p) => xml.get(p) ?? `<w:p><w:r><w:t>${p.text.replace(/\r$/, "")}</w:t></w:r></w:p>`)
+        .join("") +
+      `</w:body></w:document>`,
+  });
+  word.paragraphs.forEach((p, index) => xml.set(p, rows[index][1]));
+  return word;
+}
+
+const P_TEXT = (value: string) => `<w:p><w:r><w:t>${value}</w:t></w:r></w:p>`;
+const P_BLANK = "<w:p/>";
+const P_BOX = (value: string) =>
+  `<w:p><w:r><w:txbxContent><w:p><w:r><w:t>${value}</w:t></w:r></w:p></w:txbxContent></w:r></w:p>`;
+const P_PICTURE = "<w:p><w:r><w:drawing><pic:pic/></w:drawing></w:r></w:p>";
+const P_GONE = "<w:p><w:pPr><w:rPr><w:del/></w:rPr></w:pPr></w:p>";
 
 afterEach(() => {
   delete (globalThis as unknown as { Word?: unknown }).Word;
@@ -1159,7 +1194,7 @@ describe("paragraph targeting", () => {
     paragraphs[2] = "第1条（目的）本件は贈与である。";
     await expect(
       replaceQuote({ paragraph: 2, quote: "", text: "第1条（目的）本件は交換である。" })
-    ).rejects.toThrow(/段落の数が変わった/);
+    ).rejects.toThrow(/段落 2「第1条（目的）本件は売買である。」は本文にもうありません.*いま使える番号は \[1\]/);
     expect(word.replacements).toEqual([]);
   });
 
@@ -1482,22 +1517,18 @@ describe("replaceParagraphs", () => {
     const boxA = { text: "住所：東京都\r" };
     const boxB = { text: "日時：令和8年\r" };
     const photoBox = { text: "写真の説明\r" };
-    const word = installWord({
-      selection: "",
-      body: "",
-      paragraphs: ["報告書", "調査物件の住所", "", "調査日時", "", "写真", ""],
-      ooxml:
-        `<w:document ${W}><w:body>` +
-        text("報告書") +
-        text("調査物件の住所") +
-        boxed("住所：東京都") +
-        text("調査日時") +
-        boxed("日時：令和8年") +
-        text("写真") +
-        boxed("写真の説明") +
-        `</w:body></w:document>`,
-      shapes: [boxA, boxB, photoBox],
-    });
+    const word = installBody(
+      [
+        ["報告書", text("報告書")],
+        ["調査物件の住所", text("調査物件の住所")],
+        ["", boxed("住所：東京都")],
+        ["調査日時", text("調査日時")],
+        ["", boxed("日時：令和8年")],
+        ["写真", text("写真")],
+        ["", boxed("写真の説明")],
+      ],
+      { shapes: [boxA, boxB, photoBox] }
+    );
     const deleted: string[] = [];
     for (const paragraph of word.paragraphs) {
       const original = paragraph.delete;
@@ -1542,6 +1573,7 @@ describe("replaceParagraphs", () => {
       firstText: "調査物件の住所",
       lastText: "調査日時",
       removed: 4,
+      keptPictures: 0,
       shapes: [1, 2],
       unmatchedShapes: [],
       numbers: [
@@ -1551,6 +1583,76 @@ describe("replaceParagraphs", () => {
         { number: 11, text: "令和8年" },
       ],
     });
+  });
+
+  function watchDeleted(word: ReturnType<typeof installWord>): number[] {
+    const deleted: number[] = [];
+    word.paragraphs.forEach((paragraph, index) => {
+      const original = paragraph.delete;
+      paragraph.delete = () => {
+        deleted.push(index);
+        original();
+      };
+    });
+    return deleted;
+  }
+
+  it("leaves a picture inside the span and says so", async () => {
+    const word = installBody([
+      ["見出し", text("見出し")],
+      ["本文A", text("本文A")],
+      ["", P_PICTURE],
+      ["本文B", text("本文B")],
+      ["後文", text("後文")],
+    ]);
+    const deleted = watchDeleted(word);
+    await readDocumentText(10_000);
+
+    const span = await replaceParagraphs(2, 4, outline([4, "新しい本文"]), format);
+
+    expect(deleted.sort()).toEqual([1, 3]);
+    expect(span.keptPictures).toBe(1);
+    expect(span.removed).toBe(2);
+  });
+
+  it("does not take a picture from the blanks after the span", async () => {
+    const word = installBody(
+      [
+        ["本文A", text("本文A")],
+        ["", P_PICTURE],
+        ["", P_BOX("説明")],
+        ["後文", text("後文")],
+      ],
+      { shapes: [{ text: "説明\r" }] }
+    );
+    const deleted = watchDeleted(word);
+    await readDocumentText(10_000);
+
+    const span = await replaceParagraphs(1, 1, outline([4, "新しい本文"]), format);
+
+    expect(deleted).toEqual([0]);
+    expect(span.shapes).toEqual([1]);
+  });
+
+  it("pulls an end on a blank line in to the numbered paragraph before it", async () => {
+    const word = installBody(
+      [
+        ["始め", text("始め")],
+        ["中", text("中")],
+        ["", P_BOX("箱")],
+        ["後", text("後")],
+      ],
+      { shapes: [{ text: "箱\r" }] }
+    );
+    const deleted = watchDeleted(word);
+    await readDocumentText(10_000);
+
+    const span = await replaceParagraphs(1, 3, outline([4, "新しい本文"]), format);
+
+    expect(span.through).toBe(2);
+    expect(span.asked).toEqual({ from: 1, through: 3 });
+    expect(span.shapes).toEqual([1]);
+    expect(deleted.sort()).toEqual([0, 1, 2]);
   });
 
   it("lays the new paragraphs out by outline level", async () => {
@@ -2801,6 +2903,37 @@ describe("readParagraphs", () => {
     expect(read.numbered).toBe(true);
   });
 
+  it("reads a box anchor as a blank, shows a picture, and hides a deleted paragraph", async () => {
+    installBody([
+      ["前文", P_TEXT("前文")],
+      ["当事者目録", P_BOX("当事者目録")],
+      ["", P_PICTURE],
+      ["", P_GONE],
+      ["後文", P_TEXT("後文")],
+    ]);
+    const attached = await readDocumentText(10_000);
+    expect(attached.text).toContain("[1] 前文\n（空行） [図1]\n（画像）\n[5] 後文");
+
+    const read = await readParagraphs({ from: 1, through: 5, view: "marks" });
+
+    expect(read.text).toBe("[1] 番号なし\n（空行） [図1]\n（画像）\n[5] 番号なし");
+    expect(read.numbered).toBe(false);
+  });
+
+  it("names the numbers in hand when a range holds none", async () => {
+    installBody([
+      ["前文", P_TEXT("前文")],
+      ["", P_BLANK],
+      ["", P_PICTURE],
+      ["後文", P_TEXT("後文")],
+    ]);
+    await readDocumentText(10_000);
+
+    await expect(readParagraphs({ from: 2, through: 3, view: "marks" })).rejects.toThrow(
+      /いま読める番号は \[1\]/
+    );
+  });
+
   it("numbers a document that was not attached, from the body position", async () => {
     installWord({
       selection: "",
@@ -2918,6 +3051,25 @@ describe("deleteMatching", () => {
     expect(cellDeleted).toEqual([false, false, true]);
   });
 
+  it("leaves pictures, box anchors and deleted paragraphs out of an empty-line delete", async () => {
+    const word = installBody([
+      ["前文", P_TEXT("前文")],
+      ["", P_BLANK],
+      ["", P_PICTURE],
+      ["当事者目録", P_BOX("当事者目録")],
+      ["", P_GONE],
+      ["後文", P_TEXT("後文")],
+    ]);
+    await readDocumentText(10_000);
+    const deleted = watchDeletes(word.paragraphs);
+
+    const note = await deleteMatching({ select: { empty: true } });
+
+    expect(deleted).toEqual([false, true, false, false, false, false]);
+    expect(note).toContain("1 段落を削除しました");
+    expect(note).toContain("画像や図形を持つ 2 段落は条件に合いましたが、残しています。");
+  });
+
   it("deletes nothing when more than 200 paragraphs match", async () => {
     const word = installWord({
       selection: "",
@@ -2940,7 +3092,7 @@ describe("deleteMatching", () => {
     await readDocumentText(10_000);
     await deleteMatching({ select: { text: "^－$", regex: true } });
     await expect(formatParagraph({ quote: "", paragraph: 2, alignment: "center" })).rejects.toThrow(
-      /見つかりません/
+      "段落 2 はいま使える番号ではありません（空行か、消した段落です）。前後の番号は 1 と 3 です。"
     );
     expect(word.paragraphs[2].alignment).toBe("");
   });

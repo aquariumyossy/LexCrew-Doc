@@ -195,6 +195,7 @@ describe("summarizeReplacedParagraphs", () => {
         firstText: "調査物件の住所",
         lastText: "その他連絡事項（被告から原告への連絡・入金、退去などの情報）",
         removed: 120,
+        keptPictures: 0,
         shapes: [1, 2],
         unmatchedShapes: [19],
         numbers: [
@@ -205,12 +206,30 @@ describe("summarizeReplacedParagraphs", () => {
     );
     expect(summary).toBe(
       "段落 3「調査物件の住所」から段落 122「その他連絡事項（被告から原告への…」までの 120 段落を消し、" +
-        "その位置に 2 段落を入れました（変更履歴に記録）。範囲に結び付いたテキストボックス 図1、図2 も消しました。" +
+        "その位置に 2 段落を入れました（変更履歴に記録）。入れた段落には設定どおりの階層の書式を当て済みです。" +
+        "元の段落は変更履歴の削除として残るだけで、本文の読みには出ません。" +
+        "範囲に結び付いたテキストボックス 図1、図2 も消しました。" +
         "図19 は箱を特定できず、段落と一緒に消えたかは確かめていません。" +
         "消した段落の番号はもう使えません。範囲が意図と違っていたら、続けずに報告してください。" +
         "\n入れた段落の番号は次のとおりです。このターンでこれらの段落を指すときは、" +
         "quote ではなくこの番号を paragraph / through に渡してください。\n[200] 第１　調査物件\n[201] 東京都"
     );
+  });
+
+  it("says when an end on a blank was pulled in and pictures were kept", () => {
+    const summary = summarizeReplacedParagraphs([{ type: "outline", text: "第１", level: 0 }], {
+      from: 3,
+      through: 126,
+      asked: { from: 3, through: 127 },
+      firstText: "a",
+      lastText: "b",
+      removed: 10,
+      keptPictures: 2,
+      shapes: [],
+      unmatchedShapes: [],
+    });
+    expect(summary).toContain("段落 3〜127 の端が空行だったので、番号のある段落 3〜126 に寄せました。");
+    expect(summary).toContain("範囲にあった画像の 2 段落は消さずに残しました。");
   });
 });
 

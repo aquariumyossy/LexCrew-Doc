@@ -36,7 +36,6 @@ export type ChatRequestBody = {
   messages?: ChatMessage[];
   tools?: ToolDefinition[];
   thinkingLevel?: ThinkingLevel;
-  thinkingBudget?: number;
   timeoutMs?: number;
   stream?: boolean;
 };

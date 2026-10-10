@@ -53,11 +53,24 @@ export type AnchoredShape = {
   anchor: number | null;
 };
 
+/** What one body paragraph holds, in the same order as `body.paragraphs`. */
+export type BodyParagraphFact = {
+  /** Body text without the text box story and without deleted or moved-away runs. */
+  text: string;
+  /** A picture, chart or embedded object outside any text box. A text box anchor is not one. */
+  hasDrawing: boolean;
+  /** The paragraph mark is a tracked deletion, so the paragraph goes away on accept. */
+  markDeleted: boolean;
+};
+
 export type ShapePlacement = {
   blocks: AnchoredShape[];
   /** Body `w:p` elements, excluding paragraphs inside a text box. */
   bodyParagraphs: number;
+  paragraphs: BodyParagraphFact[];
 };
+
+const DRAWING_TAGS = new Set(["pic:pic", "v:imagedata", "w:object", "c:chart", "dgm:relIds"]);
 
 export const SHAPE_NOTE =
   "行頭の [図1] は段落番号ではありません。read_paragraphs には出ません。消すときは delete_shape にその数字を渡します。置換、コメント、挿入の対象にしません。";
@@ -90,18 +103,21 @@ function inRemovedRun(stack: string[]): boolean {
 /**
  * Paragraphs that live in text boxes and shapes. `body.paragraphs` does not
  * include them. A frame (`w:framePr`) stays in the body story, so it is not
- * collected here.
+ * collected here. The same walk records what each body paragraph holds.
  */
 export function readShapeBlocks(xml: string): ShapePlacement {
   const story = new ShapeStory();
   const stack: string[] = [];
   const blocks: AnchoredShape[] = [];
+  const paragraphs: BodyParagraphFact[] = [];
   let block: AnchoredShape | null = null;
   let line: string[] = [];
   let bodyParagraphs = 0;
   let inBodyParagraph = false;
 
   const anchorNow = (): number | null => (inBodyParagraph ? bodyParagraphs : null);
+  const inBodyStory = () => inBodyParagraph && !story.inShape() && !story.inFallback();
+  const fact = () => paragraphs[paragraphs.length - 1];
 
   const finishLine = () => {
     const text = line.join("").trim();
@@ -113,8 +129,12 @@ export function readShapeBlocks(xml: string): ShapePlacement {
 
   for (const event of scanXml(xml)) {
     if (event.kind === "text") {
-      if (story.inShape() && stack[stack.length - 1] === "w:t" && !inRemovedRun(stack)) {
-        line.push(event.text);
+      if (stack[stack.length - 1] === "w:t" && !inRemovedRun(stack)) {
+        if (story.inShape()) {
+          line.push(event.text);
+        } else if (inBodyStory()) {
+          fact().text += event.text;
+        }
       }
       continue;
     }
@@ -145,6 +165,23 @@ export function readShapeBlocks(xml: string): ShapePlacement {
     if (event.name === "w:p" && !story.inShape() && !story.inFallback()) {
       bodyParagraphs += 1;
       inBodyParagraph = true;
+      paragraphs.push({ text: "", hasDrawing: false, markDeleted: false });
+    }
+
+    if (inBodyStory() && !inRemovedRun(stack)) {
+      if (DRAWING_TAGS.has(event.name)) {
+        fact().hasDrawing = true;
+      } else if (event.name === "w:sym") {
+        fact().text += "□";
+      }
+    }
+    if (
+      inBodyStory() &&
+      (event.name === "w:del" || event.name === "w:moveFrom") &&
+      stack[stack.length - 1] === "w:rPr" &&
+      stack[stack.length - 2] === "w:pPr"
+    ) {
+      fact().markDeleted = true;
     }
 
     if (event.name === "v:textpath" && !story.inFallback() && !story.inShape()) {
@@ -177,7 +214,7 @@ export function readShapeBlocks(xml: string): ShapePlacement {
     }
   }
 
-  return { blocks, bodyParagraphs };
+  return { blocks, bodyParagraphs, paragraphs };
 }
 
 export function fitShapeText(

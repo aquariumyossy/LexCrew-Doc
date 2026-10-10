@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { AnchoredShape, fitShapeText, pickShapeByText, readShapeBlocks, SHAPE_NOTE } from "./shapeText";
+import {
+  AnchoredShape,
+  BodyParagraphFact,
+  alignBodyFacts,
+  factCounts,
+  fitShapeText,
+  pickShapeByText,
+  readShapeBlocks,
+  SHAPE_NOTE,
+  shapesInSpan,
+} from "./shapeText";
 
 const BOX = `<?xml version="1.0"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
@@ -38,11 +48,24 @@ function shape(lines: string[], anchor: number | null = null): AnchoredShape {
   return { lines, anchor };
 }
 
+function fact(text: string, extra: Partial<BodyParagraphFact> = {}): BodyParagraphFact {
+  return {
+    text,
+    hasDrawing: false,
+    hasAnchor: false,
+    pageBreak: false,
+    markDeleted: false,
+    selfClosing: false,
+    ...extra,
+  };
+}
+
 describe("readShapeBlocks", () => {
   it("reads a text box once, keeping tabs, breaks and table cells", () => {
     expect(readShapeBlocks(BOX)).toEqual({
       bodyParagraphs: 3,
       blocks: [shape(["箱\t甲", "乙\n丙", "残す", "セル"], 1)],
+      paragraphs: [fact("前文"), fact("枠"), fact("後文")],
     });
   });
 
@@ -51,7 +74,132 @@ describe("readShapeBlocks", () => {
     expect(readShapeBlocks(xml)).toEqual({
       bodyParagraphs: 1,
       blocks: [shape(["アート"], 1)],
+      paragraphs: [fact("", { hasAnchor: true })],
     });
+  });
+});
+
+describe("body paragraph facts", () => {
+  const facts = (body: string) => readShapeBlocks(`<w:document><w:body>${body}</w:body></w:document>`).paragraphs;
+
+  it("leaves a text box anchor without text of its own and without a drawing", () => {
+    const anchor = `<w:p><w:r><mc:AlternateContent><mc:Choice><w:drawing><wps:txbx><w:txbxContent><w:p><w:r><w:t>箱</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice><mc:Fallback><w:pict><v:textbox><w:txbxContent><w:p><w:r><w:t>箱</w:t></w:r></w:p></w:txbxContent></v:textbox></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>`;
+    expect(facts(anchor)).toEqual([fact("")]);
+  });
+
+  it("marks a picture paragraph, inline or legacy", () => {
+    const inline = `<w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData><pic:pic/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>`;
+    const legacy = `<w:p><w:r><w:pict><v:shape><v:imagedata r:id="rId4"/></v:shape></w:pict></w:r></w:p>`;
+    expect(facts(inline + legacy)).toEqual([
+      fact("", { hasDrawing: true }),
+      fact("", { hasDrawing: true, hasAnchor: true }),
+    ]);
+  });
+
+  it("marks the anchor of an empty text box, which has no block of its own", () => {
+    const xml = `<w:document><w:body><w:p><w:r><mc:AlternateContent><mc:Choice><w:drawing><wp:anchor><a:graphic><a:graphicData><wps:wsp><wps:txbx><w:txbxContent><w:p/></w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent><w:p/></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p></w:body></w:document>`;
+    expect(readShapeBlocks(xml)).toEqual({
+      bodyParagraphs: 1,
+      blocks: [],
+      paragraphs: [fact("", { hasAnchor: true })],
+    });
+  });
+
+  it("marks a page break, a section break and a page break before", () => {
+    const xml =
+      `<w:p><w:r><w:br w:type="page"/></w:r></w:p>` +
+      `<w:p><w:pPr><w:sectPr/></w:pPr></w:p>` +
+      `<w:p><w:pPr><w:pageBreakBefore/></w:pPr></w:p>` +
+      `<w:p><w:pPr><w:pageBreakBefore w:val="0"/></w:pPr></w:p>` +
+      `<w:p><w:r><w:br/></w:r></w:p>`;
+    expect(facts(xml)).toEqual([
+      fact("", { pageBreak: true }),
+      fact("", { pageBreak: true }),
+      fact("", { pageBreak: true }),
+      fact(""),
+      fact(""),
+    ]);
+  });
+
+  it("does not count a picture that is itself a tracked deletion", () => {
+    const xml = `<w:p><w:del><w:r><w:drawing><pic:pic/></w:drawing></w:r></w:del></w:p>`;
+    expect(facts(xml)).toEqual([fact("")]);
+  });
+
+  it("marks a paragraph whose mark is deleted and keeps only the text that stays", () => {
+    const xml = `<w:p><w:pPr><w:rPr><w:del w:id="1" w:author="甲"/></w:rPr></w:pPr><w:del><w:r><w:delText>消えた</w:delText></w:r></w:del><w:ins><w:r><w:t>足した</w:t></w:r></w:ins></w:p><w:p/>`;
+    expect(facts(xml)).toEqual([fact("足した", { markDeleted: true }), fact("", { selfClosing: true })]);
+  });
+
+  it("does not read a run's own deletion as the paragraph mark", () => {
+    const xml = `<w:p><w:r><w:rPr><w:del/></w:rPr><w:t>本文</w:t></w:r></w:p>`;
+    expect(facts(xml)).toEqual([fact("本文")]);
+  });
+});
+
+describe("alignBodyFacts", () => {
+  const placement = (paragraphs: BodyParagraphFact[], blocks: AnchoredShape[] = []) => ({
+    blocks,
+    bodyParagraphs: paragraphs.length,
+    paragraphs,
+  });
+
+  it("takes equal counts as they are", () => {
+    const aligned = alignBodyFacts(placement([fact("甲"), fact("乙")]), ["別", "物"]);
+    expect(aligned?.how).toBe("exact");
+    expect(aligned?.place(2)).toBe(2);
+  });
+
+  it("drops empty paragraphs the OOXML has past Word's last one", () => {
+    const aligned = alignBodyFacts(
+      placement([fact("前文"), fact("", { hasAnchor: true }), fact("後文"), fact("", { selfClosing: true })]),
+      ["前文", "/", "後文"]
+    );
+    expect(aligned?.how).toBe("ooxmlTail");
+    expect(aligned?.facts).toHaveLength(3);
+    expect(aligned?.place(2)).toBe(2);
+    expect(aligned?.place(4)).toBeNull();
+  });
+
+  it("adds blanks for empty paragraphs Word has past the OOXML's last one", () => {
+    const aligned = alignBodyFacts(placement([fact("前文"), fact("", { hasDrawing: true })]), ["前文", "", ""]);
+    expect(aligned?.how).toBe("wordTail");
+    expect(aligned?.facts.map((one) => one.hasDrawing)).toEqual([false, true, false]);
+  });
+
+  it("skips self-closing paragraphs when that is what makes the text agree", () => {
+    const aligned = alignBodyFacts(
+      placement([fact("前文"), fact("", { selfClosing: true }), fact("", { hasDrawing: true }), fact("後文")]),
+      ["前文", "", "後文"]
+    );
+    expect(aligned?.how).toBe("selfClosing");
+    expect(aligned?.facts.map((one) => one.hasDrawing)).toEqual([false, true, false]);
+    expect(aligned?.place(3)).toBe(2);
+    expect(aligned?.place(2)).toBeNull();
+  });
+
+  it("gives up when no candidate makes the text agree", () => {
+    const facts = [fact("前文"), fact("中"), fact("後文"), fact("")];
+    expect(alignBodyFacts(placement(facts), ["前文", "後文", ""])).toBeNull();
+  });
+
+  it("reads a symbol and deleted text in Word's version as agreeing", () => {
+    const aligned = alignBodyFacts(placement([fact("□ 同意する"), fact("")]), ["☑ 同意する（旧）"]);
+    expect(aligned?.how).toBe("ooxmlTail");
+  });
+});
+
+describe("factCounts", () => {
+  it("counts without any text and finds the first paragraph that disagrees", () => {
+    const counts = factCounts(
+      {
+        blocks: [],
+        bodyParagraphs: 4,
+        paragraphs: [fact("前文"), fact("中"), fact("後文"), fact("", { selfClosing: true })],
+      },
+      ["前文", "後文", ""]
+    );
+    expect(counts).toEqual({ word: 3, ooxml: 4, selfClosing: 1, ooxmlTailEmpty: 1, wordTailEmpty: 1, firstDiff: 2 });
   });
 });
 
@@ -112,5 +260,25 @@ describe("pickShapeByText", () => {
 
   it("reports a word-art string the shape collection does not carry", () => {
     expect(pickShapeByText(["アート"], [{ text: "" }], 1)).toEqual({ ok: false, reason: "missing" });
+  });
+});
+
+describe("shapesInSpan", () => {
+  // Paragraphs 2, 4, 6 and 9 are numbered; boxes sit on 1, 3, 5, 7 and 8.
+  const anchors = [1, 3, 5, 7, 8, null];
+  const numbered = [2, 4, 6, 9];
+
+  it("takes boxes in the span and on the blanks up to the next numbered paragraph", () => {
+    expect(shapesInSpan(anchors, 2, 4, numbered)).toEqual({ shapes: [2, 3], lastAnchor: 5, end: 5 });
+    expect(shapesInSpan(anchors, 6, 6, numbered)).toEqual({ shapes: [4, 5], lastAnchor: 8, end: 8 });
+  });
+
+  it("leaves the blanks before the span alone", () => {
+    expect(shapesInSpan(anchors, 2, 2, numbered)).toEqual({ shapes: [2], lastAnchor: 3, end: 3 });
+  });
+
+  it("does not reach past the span when nothing numbered follows it", () => {
+    expect(shapesInSpan(anchors, 9, 9, numbered)).toEqual({ shapes: [], lastAnchor: 9, end: 9 });
+    expect(shapesInSpan([3, 10], 2, 3, [2, 3])).toEqual({ shapes: [1], lastAnchor: 3, end: 3 });
   });
 });

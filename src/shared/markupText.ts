@@ -328,6 +328,26 @@ export function readMarkupBody(
     hasInlineMarkup = true;
   };
 
+  const finishParagraph = () => {
+    paragraphCount += 1;
+    const plain = plainParts.join("").trim();
+    const markedText = builder ? builder.finish() : plain;
+    markedParagraphs.push(markedText);
+    markupOverhead += Math.max(0, markedText.length - plain.length);
+    if (plain || markedText) {
+      paragraphs.push(plain || markedText);
+      if (builder?.hasMarkup) {
+        hasInlineMarkup = true;
+      }
+    }
+    for (const note of pending) {
+      keepChange({ ...note, where: formatParagraphRef(paragraphCount) });
+    }
+    pending = [];
+    plainParts = [];
+    builder = null;
+  };
+
   for (const event of scanXml(documentXml)) {
     if (event.kind === "text") {
       if (hidden()) {
@@ -372,23 +392,7 @@ export function readMarkupBody(
         del.pop();
       }
       if (!inShape && event.name === "w:p") {
-        paragraphCount += 1;
-        const plain = plainParts.join("").trim();
-        const markedText = builder ? builder.finish() : plain;
-        markedParagraphs.push(markedText);
-        markupOverhead += Math.max(0, markedText.length - plain.length);
-        if (plain || markedText) {
-          paragraphs.push(plain || markedText);
-          if (builder?.hasMarkup) {
-            hasInlineMarkup = true;
-          }
-        }
-        for (const note of pending) {
-          keepChange({ ...note, where: formatParagraphRef(paragraphCount) });
-        }
-        pending = [];
-        plainParts = [];
-        builder = null;
+        finishParagraph();
       }
       if (!inShape) {
         const kind = markKind(event.name);
@@ -430,7 +434,9 @@ export function readMarkupBody(
 
     switch (event.name) {
       case "w:p":
-        if (!event.empty) {
+        if (event.empty) {
+          finishParagraph();
+        } else {
           builder = new ParaBuilder();
           stack.push(event.name);
         }

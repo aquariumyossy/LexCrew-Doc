@@ -180,15 +180,18 @@ describe("sidecar", () => {
         messages: [{ role: "user", content: "SECRET_PROMPT 本文そのもの" }],
         tools: [{ type: "function", function: { name: "search", parameters: { type: "object" } } }],
         thinkingLevel: "medium",
-        thinkingBudget: 2048,
       });
 
     expect(res.status).toBe(200);
     expect(seen).toMatchObject({
       tool_choice: "auto",
       reasoning_effort: "medium",
-      chat_template_kwargs: { enable_thinking: true, thinking_budget: 2048 },
+      chat_template_kwargs: { enable_thinking: true },
     });
+    expect(seen).not.toHaveProperty("thinking_budget");
+    expect((seen as { chat_template_kwargs: object }).chat_template_kwargs).not.toHaveProperty(
+      "thinking_budget"
+    );
     expect(res.body.finishReason).toBe("tool_calls");
     expect(res.body.toolCalls[0].function.name).toBe("search");
     expect(res.body.reasoningContent).toBe("どの条文か確かめる");

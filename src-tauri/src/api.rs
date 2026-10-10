@@ -49,8 +49,6 @@ pub struct ChatRequest {
     pub tools: Vec<Value>,
     #[serde(default, rename = "thinkingLevel")]
     pub thinking_level: Option<String>,
-    #[serde(default, rename = "thinkingBudget")]
-    pub thinking_budget: Option<u32>,
     #[serde(default, rename = "timeoutMs")]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
@@ -245,7 +243,6 @@ async fn post_chat(State(state): State<AppState>, Json(body): Json<ChatRequest>)
         messages: &body.messages,
         tools: &body.tools,
         thinking_level: &thinking_level,
-        thinking_budget: body.thinking_budget.unwrap_or(0),
         timeout_ms: body.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
     };
 
@@ -461,7 +458,6 @@ async fn post_ocr(State(state): State<AppState>, Json(body): Json<OcrRequest>) -
         messages: &messages,
         tools: &[],
         thinking_level: "off",
-        thinking_budget: 0,
         timeout_ms: body.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
     };
     match llm::chat_completions(options).await {
@@ -906,7 +902,7 @@ mod tests {
             assert_eq!(body["tool_choice"], "auto");
             assert_eq!(body["reasoning_effort"], "medium");
             assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
-            assert_eq!(body["chat_template_kwargs"]["thinking_budget"], 2048);
+            assert!(body.get("thinking_budget").is_none());
             ResponseTemplate::new(200).set_body_json(json!({
                 "choices": [{
                     "finish_reason": "tool_calls",

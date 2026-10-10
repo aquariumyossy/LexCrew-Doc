@@ -24,6 +24,7 @@ import {
   InsertPlacement,
   InsertedParagraph,
   ParagraphSpec,
+  ReplacedSpan,
   Severity,
   paintParagraph,
   specPlainText,
@@ -60,12 +61,18 @@ import {
   stripInlineMarkup,
 } from "../shared/markupText";
 import {
+  alignBodyFacts,
+  factCounts,
   fitShapeText,
   pickShapeByText,
   readShapeBlocks,
   renderedShapeBody,
   shapeLabel,
+  shapesInSpan,
+  type AlignedFacts,
   type AnchoredShape,
+  type BodyParagraphFact,
+  type ShapePlacement,
 } from "../shared/extract/shapeText";
 import { SHAPES_MARKER, TRUNCATION_NOTE } from "../shared/prompts";
 import { formatParagraphRef, isParagraphRef } from "../shared/paragraphRef";
@@ -104,10 +111,12 @@ import {
   InsertCommentArgs,
   MAX_DELETE_MATCHING,
   MAX_FIND_CHARS,
+  MAX_REPLACE_PARAGRAPHS,
   ReadParagraphsArgs,
   ReplaceQuoteArgs,
   SetOutlineArgs,
 } from "../shared/tools";
+import { logInfo } from "../sidecar/logger";
 import { SearchHit } from "../sidecar/types";
 
 /* global Office, Word */
@@ -483,6 +492,8 @@ let attachedParagraphCount = 0;
  * so a later duplicate still means the same occurrence.
  */
 let attachedShapes: string[] = [];
+/** The paragraph number each `[図]` is anchored on, null when unknown. */
+let attachedShapeAnchors: (number | null)[] = [];
 /** `[図]` numbers already deleted this turn. */
 let spentShapes = new Set<number>();
 /** Shape ids already deleted. Tracked changes may leave them in the collection. */
@@ -492,6 +503,7 @@ function forgetParagraphNumbers(): void {
   attachedParagraphs = new Map();
   attachedParagraphCount = 0;
   attachedShapes = [];
+  attachedShapeAnchors = [];
   spentShapes = new Set();
   deletedShapeIds = new Set();
   allParagraphRawTexts = new Map();
@@ -549,18 +561,18 @@ type ReadDocumentOptions = {
   markupBudget?: number;
 };
 
-/**
- * The body handed to the model. `shown` is reviewed (or marked) text; `text`
- * on each attached row stays raw so paragraph numbers still resolve through
- * `search`.
- */
-type BodyKind = "text" | "blank";
+/** Consecutive paragraphs without text, shown as one line. A picture paragraph is its own run. */
+type BlankRun = { count: number; label: string; image: boolean; shapes: string[] };
 
-function blankMarker(count: number, label: string, shapes: string[] = []): string {
-  const times = count > 1 ? `×${count}` : "";
-  const mark = label ? `・${label}` : "";
-  const linked = shapes.length ? ` ${shapes.join(" ")}` : "";
-  return `（空行${times}${mark}）${linked}`;
+function blankMarker(run: BlankRun): string {
+  const times = run.count > 1 ? `×${run.count}` : "";
+  const mark = run.label ? `・${run.label}` : "";
+  const linked = run.shapes.length ? ` ${run.shapes.join(" ")}` : "";
+  return `（${run.image ? "画像" : "空行"}${times}${mark}）${linked}`;
+}
+
+function sameRun(run: BlankRun | null, label: string, image: boolean): boolean {
+  return Boolean(run && run.label === label && run.image === image);
 }
 
 function shapeHeading(
@@ -646,9 +658,11 @@ export async function readDocumentText(
     let inlineChanges: ChangeNote[] = [];
     let inlineChangesTruncated = false;
     let appendixComments: CommentNote[] = [];
+    let markupParagraphs = -1;
     if (options.markup && !attachmentReviewedFallback && !shapeError) {
       try {
         const parsed = readMarkupBody(documentXml, commentsXml, { skipShapeParagraphs: true });
+        markupParagraphs = parsed.paragraphCount;
         if (parsed.paragraphCount === paragraphs.items.length) {
           const overhead = parsed.markupOverhead;
           const budget = options.markupBudget ?? maxChars;
@@ -667,11 +681,16 @@ export async function readDocumentText(
     }
 
     const shapeRoom = Math.max(0, maxChars - `\n\n${SHAPES_MARKER}\n`.length);
-    const placement = shapeError ? { blocks: [], bodyParagraphs: 0 } : readShapeBlocks(documentXml);
-    const anchorsOk = !shapeError && placement.bodyParagraphs === paragraphs.items.length;
-    const shapeBlocks: AnchoredShape[] = anchorsOk
-      ? placement.blocks
-      : placement.blocks.map((block) => ({ lines: block.lines, anchor: null }));
+    const placement = shapeError ? { blocks: [], bodyParagraphs: 0, paragraphs: [] } : readShapeBlocks(documentXml);
+    const aligned = shapeError
+      ? null
+      : alignFacts(placement, paragraphs.items.map(paragraphText), "attachment", markupParagraphs);
+    const shapeBlocks: AnchoredShape[] = placement.blocks.map((block) => ({
+      lines: block.lines,
+      anchor: aligned ? aligned.place(block.anchor) : null,
+    }));
+    const facts: BodyParagraphFact[] | null = aligned?.facts ?? null;
+    const displays: string[] = [];
     const kinds: BodyKind[] = [];
     const blankLabels: string[] = [];
     for (let index = 0; index < paragraphs.items.length; index += 1) {
@@ -684,11 +703,12 @@ export async function readDocumentText(
       const display = inlineMarked
         ? inlineMarked[index] ?? reviewedText
         : neutralizeLiteralMarkup(reviewedText);
-      if (display.trim()) {
-        kinds.push("text");
+      const kind = bodyKind(display, facts?.[index]);
+      displays.push(display);
+      kinds.push(kind);
+      if (kind === "text") {
         blankLabels.push("");
       } else {
-        kinds.push("blank");
         const mark = listMarkOf(paragraph);
         blankLabels.push(mark.isListItem ? wrapListMark(mark) : "");
       }
@@ -698,6 +718,7 @@ export async function readDocumentText(
       : fitShapeText(shapeBlocks, shapeRoom, TRUNCATION_NOTE);
     if (!shapeError) {
       attachedShapes = fitted.shown;
+      attachedShapeAnchors = fitted.anchors;
       spentShapes = new Set();
     }
     let shapes: ShapeRead = shapeError
@@ -719,12 +740,12 @@ export async function readDocumentText(
     let truncated = false;
     let listMarks = false;
     let numberedCount = 0;
-    let run: { count: number; label: string; shapes: string[] } | null = null;
+    let run: BlankRun | null = null;
     const flushRun = (): boolean => {
       if (!run) {
         return true;
       }
-      const marker = blankMarker(run.count, run.label, run.shapes);
+      const marker = blankMarker(run);
       if (used + marker.length + 1 > bodyBudget) {
         return false;
       }
@@ -738,23 +759,21 @@ export async function readDocumentText(
       const number = index + 1;
       const raw = paragraphText(paragraph);
       allParagraphRawTexts.set(number, raw);
-      const reviewedText =
-        !attachmentReviewedFallback && reviewed[index]
-          ? paragraphText({ text: reviewed[index].value || "" })
-          : raw;
-      const display = inlineMarked
-        ? inlineMarked[index] ?? reviewedText
-        : neutralizeLiteralMarkup(reviewedText);
-      if (!display.trim()) {
+      const display = displays[index];
+      if (kinds[index] === "gone") {
+        continue;
+      }
+      if (kinds[index] === "blank") {
         const label = blankLabels[index];
-        if (run && run.label !== label) {
+        const image = Boolean(facts?.[index]?.hasDrawing);
+        if (run && !sameRun(run, label, image)) {
           if (!flushRun()) {
             truncated = true;
             break;
           }
         }
         if (!run) {
-          run = { count: 0, label, shapes: [] };
+          run = { count: 0, label, image, shapes: [] };
         }
         run.count += 1;
         run.shapes.push(...shapesOn(number, fitted.anchors));
@@ -1439,11 +1458,7 @@ function locateParagraph(
   }
 
   if (attachedParagraphCount && items.length !== attachedParagraphCount) {
-    throw new Error(
-      `段落 ${number} が、添付したときと同じ文言で見つかりません。このターンで段落の数が変わったため、` +
-        `番号だけでは位置を特定できません。quote に本文どおりの引用を渡して指し直すか、` +
-        `どこを直すつもりだったかを利用者に伝えてください。`
-    );
+    throw new Error(missingNumberNote(number, wanted));
   }
   const index = number - 1;
   if (index < 0 || index >= items.length) {
@@ -1453,6 +1468,25 @@ function locateParagraph(
     );
   }
   return { paragraph: items[index], text: texts[index], index };
+}
+
+function missingNumberNote(number: number, wanted: AttachedParagraph | undefined): string {
+  if (wanted) {
+    return (
+      `段落 ${number}「${clipNote(wanted.text, 16)}」は本文にもうありません（このターンで消したか書き換えたようです）。` +
+      `いま使える番号は ${numberSpans([...attachedParagraphs.keys()])} です。`
+    );
+  }
+  const numbers = [...attachedParagraphs.keys()].sort((a, b) => a - b);
+  const before = numbers.filter((n) => n < number).pop();
+  const after = numbers.find((n) => n > number);
+  if (before !== undefined && after !== undefined) {
+    return (
+      `段落 ${number} はいま使える番号ではありません（空行か、消した段落です）。` +
+        `前後の番号は ${before} と ${after} です。`
+    );
+  }
+  return `段落 ${number} はありません。いま使える番号は ${numberSpans(numbers)} です。`;
 }
 
 async function paragraphByNumber(
@@ -3867,6 +3901,14 @@ type LiveParagraph = {
   styleName: string;
   styleBuiltIn: string;
   outline: number | null;
+  /** Has text of its own, by the same rule as the attachment. Only these take numbers. */
+  present: boolean;
+  /** A picture, chart or object sits in it. */
+  drawing: boolean;
+  /** An empty paragraph whose mark is a tracked deletion: it is not shown as a blank line. */
+  gone: boolean;
+  /** `[図n]` labels anchored on it. */
+  shapes: string[];
 };
 
 type NumberedLive = { number: number; live: LiveParagraph };
@@ -3874,7 +3916,71 @@ type NumberedLive = { number: number; live: LiveParagraph };
 export type ParagraphRead = { text: string; numbered: boolean };
 
 function isPresent(live: LiveParagraph): boolean {
-  return Boolean(live.reviewed.trim());
+  return live.present;
+}
+
+type BodyKind = "text" | "blank" | "gone";
+
+/**
+ * A paragraph counts as text only when Word and the OOXML both see text in it.
+ * Word's text for a text box anchor can carry the box, while the OOXML body
+ * story leaves it out; the attachment shows that paragraph as a blank line.
+ */
+function bodyKind(text: string, fact: BodyParagraphFact | undefined): BodyKind {
+  if (text.trim() && (!fact || fact.text.trim())) {
+    return "text";
+  }
+  return fact?.markDeleted ? "gone" : "blank";
+}
+
+/** The facts lined up with `body.paragraphs`, logging the counts when they did not match as they are. */
+function alignFacts(
+  placement: ShapePlacement,
+  words: string[],
+  where: string,
+  markup = -1
+): AlignedFacts | null {
+  const aligned = alignBodyFacts(placement, words);
+  if (aligned?.how !== "exact") {
+    logInfo("paragraph facts", {
+      where,
+      aligned: aligned?.how ?? "none",
+      ...factCounts(placement, words),
+      ...(markup >= 0 ? { markup } : {}),
+    });
+  }
+  return aligned;
+}
+
+/** The facts and `[図n]` labels for the body, or null when the OOXML does not line up with it. */
+async function readBodyFacts(
+  context: Word.RequestContext,
+  items: Word.Paragraph[]
+): Promise<{ facts: BodyParagraphFact[]; shapes: Map<number, string[]> } | null> {
+  try {
+    const pkg = context.document.body.getOoxml();
+    await context.sync();
+    const placed = readShapeBlocks(documentXmlFromPackage(pkg.value || ""));
+    const aligned = alignFacts(placed, items.map(paragraphText), "live");
+    if (!aligned) {
+      return null;
+    }
+    const shapes = new Map<number, string[]>();
+    placed.blocks
+      .filter((block) => block.lines.join("\n").length > 0)
+      .forEach((block, index) => {
+        const anchor = aligned.place(block.anchor);
+        if (anchor == null) {
+          return;
+        }
+        const list = shapes.get(anchor) || [];
+        list.push(shapeLabel(index + 1));
+        shapes.set(anchor, list);
+      });
+    return { facts: aligned.facts, shapes };
+  } catch {
+    return null;
+  }
 }
 
 function nextAddress(): number {
@@ -4003,11 +4109,15 @@ async function loadLiveParagraphs(context: Word.RequestContext): Promise<LivePar
     }
   }
 
+  const body = await readBodyFacts(context, collection.items);
+
   return collection.items.map((paragraph, index) => {
     const raw = paragraphText(paragraph);
     const reviewedText = reviewed[index]
       ? paragraphText({ text: reviewed[index].value || "" })
       : raw;
+    const fact = body?.facts[index];
+    const kind = bodyKind(reviewedText, fact);
     let styleName = "";
     let styleBuiltIn = "";
     let outline: number | null = null;
@@ -4029,6 +4139,10 @@ async function loadLiveParagraphs(context: Word.RequestContext): Promise<LivePar
       styleName,
       styleBuiltIn,
       outline,
+      present: kind === "text",
+      drawing: Boolean(fact?.hasDrawing),
+      gone: kind === "gone",
+      shapes: body?.shapes.get(index + 1) || [],
     };
   });
 }
@@ -4141,59 +4255,83 @@ function marksLine(row: NumberedLive, shapes: string): string {
   return shapes ? `${base} ${shapes}` : base;
 }
 
-function blankLines(lives: LiveParagraph[], shapeMarks: Map<number, string[]>): string {
+/** Adds a blank or picture paragraph to the run, or says the run must be flushed first. */
+function joinRun(run: BlankRun | null, live: LiveParagraph): { run: BlankRun; fresh: boolean } {
+  const label = live.mark.isListItem ? wrapListMark(live.mark) : "";
+  if (run && sameRun(run, label, live.drawing)) {
+    run.count += 1;
+    run.shapes.push(...live.shapes);
+    return { run, fresh: false };
+  }
+  return { run: { count: 1, label, image: live.drawing, shapes: [...live.shapes] }, fresh: true };
+}
+
+function blankLines(lives: LiveParagraph[]): string {
   const lines: string[] = [];
-  let run: { count: number; label: string; shapes: string[] } | null = null;
-  const flush = () => {
-    if (!run) {
-      return;
-    }
-    lines.push(blankMarker(run.count, run.label, run.shapes));
-    run = null;
-  };
+  let run: BlankRun | null = null;
   for (const live of lives) {
-    if (isPresent(live)) {
+    if (isPresent(live) || live.gone) {
       continue;
     }
-    const label = live.mark.isListItem ? wrapListMark(live.mark) : "";
-    if (run && run.label !== label) {
-      flush();
+    const joined = joinRun(run, live);
+    if (joined.fresh && run) {
+      lines.push(blankMarker(run));
     }
-    if (!run) {
-      run = { count: 0, label, shapes: [] };
-    }
-    run.count += 1;
-    run.shapes.push(...(shapeMarks.get(live.index + 1) || []));
+    run = joined.run;
   }
-  flush();
+  if (run) {
+    lines.push(blankMarker(run));
+  }
   return lines.join("\n");
 }
 
-async function shapeMarksFor(
-  context: Word.RequestContext,
-  liveCount: number
-): Promise<Map<number, string[]>> {
-  const marks = new Map<number, string[]>();
-  try {
-    const pkg = context.document.body.getOoxml();
-    await context.sync();
-    const placed = readShapeBlocks(documentXmlFromPackage(pkg.value || ""));
-    if (placed.bodyParagraphs !== liveCount) {
-      return marks;
-    }
-    const nonempty = placed.blocks.filter((block) => block.lines.join("\n").length > 0);
-    nonempty.forEach((block, index) => {
-      if (block.anchor == null) {
-        return;
-      }
-      const list = marks.get(block.anchor) || [];
-      list.push(shapeLabel(index + 1));
-      marks.set(block.anchor, list);
-    });
-  } catch {
-    // The paragraphs are still readable without the shape link.
+/**
+ * "[1]〜[126]、[129]〜[186]" for the numbers in hand. Blank lines leave small
+ * gaps between numbers, so only a wide gap starts a new span.
+ */
+function numberSpans(numbers: Iterable<number>): string {
+  const sorted = [...new Set(numbers)].sort((a, b) => a - b);
+  if (!sorted.length) {
+    return "ありません";
   }
-  return marks;
+  const spans: string[] = [];
+  const label = (first: number, last: number) => (first === last ? `[${first}]` : `[${first}]〜[${last}]`);
+  let first = sorted[0];
+  let last = sorted[0];
+  for (const number of sorted.slice(1)) {
+    if (number - last > 8) {
+      spans.push(label(first, last));
+      first = number;
+    }
+    last = number;
+  }
+  spans.push(label(first, last));
+  return spans.length > 8 ? `${spans.slice(0, 8).join("、")} ほか` : spans.join("、");
+}
+
+/**
+ * The rows from `from` to `end` in document order. A paragraph that took a new
+ * number this turn (an insert) sits between old numbers and is read with them.
+ */
+function rowsBetween(rows: NumberedLive[], from: number, end: number): NumberedLive[] {
+  const inRange = (row: NumberedLive) => row.number >= from && row.number <= end;
+  let start = rows.findIndex((row) => row.number === from);
+  if (start < 0) {
+    start = rows.findIndex(inRange);
+  }
+  if (start < 0) {
+    return [];
+  }
+  let stop = end === Number.POSITIVE_INFINITY ? rows.length - 1 : rows.findIndex((row) => row.number === end);
+  if (stop < start) {
+    stop = start;
+    for (let index = start; index < rows.length; index += 1) {
+      if (inRange(rows[index])) {
+        stop = index;
+      }
+    }
+  }
+  return rows.slice(start, stop + 1);
 }
 
 function assertFindQuery(q: string): void {
@@ -4225,26 +4363,22 @@ export async function readParagraphs(args: ReadParagraphsArgs): Promise<Paragrap
       if (args.from === undefined) {
         throw new Error("full で読むときは from に段落番号を渡してください。");
       }
-      const end = args.through ?? args.from;
-      selected = rows.filter((row) => row.number >= args.from! && row.number <= end);
+      selected = rowsBetween(rows, args.from, args.through ?? args.from);
     } else if (args.from !== undefined) {
-      const end = args.through ?? Number.POSITIVE_INFINITY;
-      selected = rows.filter((row) => row.number >= args.from! && row.number <= end);
+      selected = rowsBetween(rows, args.from, args.through ?? Number.POSITIVE_INFINITY);
     }
     if (!rows.length) {
-      const shapeMarks = await shapeMarksFor(context, lives.length);
-      const blanks = blankLines(lives, shapeMarks);
+      const blanks = blankLines(lives);
       return { text: blanks || "本文に段落がありません。", numbered: false };
     }
     if (!selected.length) {
       throw new Error(
-        `段落 ${args.from} から読める段落がありません。read_paragraphs の view を marks にして番号を見てください。`
+        `段落 ${args.from} から読める段落がありません。いま読める番号は ${numberSpans(rows.map((row) => row.number))} です（空行には番号がありません）。`
       );
     }
 
     const charCap = view === "marks" ? MARKS_READ_CHARS : FULL_READ_CHARS;
     const paraCap = view === "marks" ? Number.POSITIVE_INFINITY : FULL_READ_PARAGRAPHS;
-    const shapeMarks = await shapeMarksFor(context, lives.length);
     const selectedLives = new Set(selected.map((row) => row.live));
     const firstPresent = lives.find((live) => isPresent(live));
     const includeLeading = Boolean(
@@ -4254,12 +4388,12 @@ export async function readParagraphs(args: ReadParagraphsArgs): Promise<Paragrap
     let used = 0;
     let emitted = 0;
     let started = false;
-    let run: { count: number; label: string; shapes: string[] } | null = null;
+    let run: BlankRun | null = null;
     const flushRun = (): boolean => {
       if (!run) {
         return true;
       }
-      const marker = blankMarker(run.count, run.label, run.shapes);
+      const marker = blankMarker(run);
       if (used + marker.length + 1 > charCap) {
         return false;
       }
@@ -4269,21 +4403,18 @@ export async function readParagraphs(args: ReadParagraphsArgs): Promise<Paragrap
       return true;
     };
     for (const live of lives) {
+      if (live.gone) {
+        continue;
+      }
       if (!isPresent(live)) {
         if (!started && !includeLeading) {
           continue;
         }
-        const label = live.mark.isListItem ? wrapListMark(live.mark) : "";
-        if (run && run.label !== label) {
-          if (!flushRun()) {
-            break;
-          }
+        const joined = joinRun(run, live);
+        if (joined.fresh && !flushRun()) {
+          break;
         }
-        if (!run) {
-          run = { count: 0, label, shapes: [] };
-        }
-        run.count += 1;
-        run.shapes.push(...(shapeMarks.get(live.index + 1) || []));
+        run = joined.run;
         continue;
       }
       if (!selectedLives.has(live)) {
@@ -4304,7 +4435,7 @@ export async function readParagraphs(args: ReadParagraphsArgs): Promise<Paragrap
       if (!row) {
         break;
       }
-      const shapes = (shapeMarks.get(live.index + 1) || []).join(" ");
+      const shapes = live.shapes.join(" ");
       const block =
         view === "marks" ? marksLine(row, shapes) : fullBlock(row, commentsOn(row.live, comments.hits), shapes);
       if (blocks.length > 0 && used + block.length + 1 > charCap) {
@@ -4454,18 +4585,29 @@ export async function deleteMatching(args: DeleteMatchingArgs): Promise<string> 
     await context.sync();
     const match = compileParagraphMatcher(args.select);
     const outsideTable = args.select.tableCell !== true;
+    let kept = 0;
     const targets = lives.filter((live) => {
-      const fact = paragraphFact(live.paragraph);
+      if (live.gone) {
+        return false;
+      }
+      const fact = { ...paragraphFact(live.paragraph), text: live.present ? live.reviewed : "" };
       if (!match(fact)) {
         return false;
       }
       if (outsideTable && fact.inTable) {
         return false;
       }
+      if (live.drawing || live.shapes.length > 0) {
+        kept += 1;
+        return false;
+      }
       return true;
     });
+    const keptNote = kept
+      ? `画像や図形を持つ ${kept} 段落は条件に合いましたが、残しています。`
+      : "";
     if (!targets.length) {
-      return "条件に合う段落はありませんでした。";
+      return keptNote || "条件に合う段落はありませんでした。";
     }
     if (targets.length > MAX_DELETE_MATCHING) {
       return (
@@ -4489,7 +4631,7 @@ export async function deleteMatching(args: DeleteMatchingArgs): Promise<string> 
     await context.sync();
     attachedParagraphCount = lives.length + 1;
     retireUnclaimed(rows.filter((row) => attachedParagraphs.has(row.number)));
-    return deleteMatchNote(targets);
+    return keptNote ? `${deleteMatchNote(targets)}${keptNote}` : deleteMatchNote(targets);
   });
 }
 
@@ -4670,7 +4812,47 @@ async function loadShapeLeaves(
 }
 
 /**
- * Delete the text box numbered in this turn's shape section. Tracking stays
+ * Queue deletes for the numbered boxes in the caller's tracked run. The
+ * numbers are spent only once the caller's sync goes through.
+ */
+async function queueShapeDeletes(
+  context: Word.RequestContext,
+  numbers: number[]
+): Promise<{ deleted: number[]; missing: number[]; commit: () => void }> {
+  const host = context.document.body as unknown as { shapes: HostShapeCollection };
+  host.shapes.load("items");
+  await context.sync();
+  let leaves = (await loadShapeLeaves(context, host.shapes.items)).filter(
+    (leaf) => !deletedShapeIds.has(leaf.id)
+  );
+  const spent = new Set(spentShapes);
+  const ids: number[] = [];
+  const deleted: number[] = [];
+  const missing: number[] = [];
+  for (const number of numbers) {
+    const pick = pickShapeByText(attachedShapes, leaves, number, spent);
+    if (!pick.ok) {
+      missing.push(number);
+      continue;
+    }
+    pick.shape.delete();
+    spent.add(number);
+    ids.push(pick.shape.id);
+    deleted.push(number);
+    leaves = leaves.filter((leaf) => leaf.id !== pick.shape.id);
+  }
+  return {
+    deleted,
+    missing,
+    commit: () => {
+      deleted.forEach((number) => spentShapes.add(number));
+      ids.forEach((id) => deletedShapeIds.add(id));
+    },
+  };
+}
+
+/**
+ * Delete the text boxes numbered in this turn's shape section. Tracking stays
  * on, the same as every other edit. Older Word is told why, and the paragraph
  * is left alone.
  */
@@ -4678,36 +4860,209 @@ export async function deleteShape(args: DeleteShapeArgs): Promise<string> {
   if (!isWordHost()) {
     throw new Error("Word で開いてください。");
   }
-  const number = args.shape;
-  if (!Number.isInteger(number) || number < 1 || number > attachedShapes.length) {
-    throw new Error(`図${number} はこのターンの図形節にありません。`);
-  }
-  if (spentShapes.has(number)) {
-    throw new Error(`図${number} は削除済みです。この番号はもう使えません。`);
+  for (const number of args.shapes) {
+    if (!Number.isInteger(number) || number < 1 || number > attachedShapes.length) {
+      throw new Error(`図${number} はこのターンの図形節にありません。どれも消していません。`);
+    }
+    if (spentShapes.has(number)) {
+      throw new Error(`図${number} は削除済みです。この番号はもう使えません。どれも消していません。`);
+    }
   }
   if (!canDeleteShapes()) {
     throw new Error("この Word ではテキストボックスを削除できません。");
   }
   return Word.run(async (context) => {
-    const host = context.document.body as unknown as { shapes: HostShapeCollection };
-    host.shapes.load("items");
-    await context.sync();
-    const leaves = (await loadShapeLeaves(context, host.shapes.items)).filter(
-      (leaf) => !deletedShapeIds.has(leaf.id)
-    );
-    const pick = pickShapeByText(attachedShapes, leaves, number, spentShapes);
-    if (!pick.ok) {
+    startTracking(context);
+    const queued = await queueShapeDeletes(context, args.shapes);
+    if (!queued.deleted.length) {
       throw new Error(
-        `図${number} に一致するテキストボックスが見つかりません。ワードアートのように図形の本文を持たないものは削除できません。`
+        `${args.shapes.map((n) => `図${n}`).join("、")} に一致するテキストボックスが見つかりません。` +
+          "ワードアートのように図形の本文を持たないものは削除できません。"
       );
     }
-    startTracking(context);
-    pick.shape.delete();
     await context.sync();
-    spentShapes.add(number);
-    deletedShapeIds.add(pick.shape.id);
-    const first = attachedShapes[number - 1].split("\n")[0] || "";
-    return `図${number}「${clipNote(first, 24)}」を削除しました（変更履歴に記録）。この番号はもう使えません。`;
+    queued.commit();
+    const labels = queued.deleted.map((number) => {
+      const first = attachedShapes[number - 1].split("\n")[0] || "";
+      return `図${number}「${clipNote(first, 24)}」`;
+    });
+    const missing = queued.missing.length
+      ? `${queued.missing.map((n) => `図${n}`).join("、")} は一致する箱が見つからず、消していません。`
+      : "";
+    return `${labels.join("、")}を削除しました（変更履歴に記録）。この番号はもう使えません。${missing}`;
+  });
+}
+
+/**
+ * Locate a numbered span in the live body. The span is the paragraphs from
+ * `from` to `through`, blank ones between them included.
+ */
+function locateSpan(
+  items: Word.Paragraph[],
+  from: number,
+  through: number
+): { first: number; last: number; firstText: string; lastText: string } {
+  const first = locateParagraph(items, from);
+  const last = locateParagraph(items, through);
+  if (last.index < first.index) {
+    throw new Error(`段落 ${through} が段落 ${from} より前で見つかりました。範囲を指し直してください。`);
+  }
+  return { first: first.index, last: last.index, firstText: first.text, lastText: last.text };
+}
+
+/**
+ * Blank lines carry no number, so a span that ends on one is pulled in to the
+ * nearest numbered paragraph inside it. A span with no numbered paragraph is
+ * left alone and fails where it is looked up.
+ */
+function snapSpan(from: number, through: number): { from: number; through: number } {
+  const inside = [...attachedParagraphs.keys()]
+    .filter((number) => number >= from && number <= through)
+    .sort((a, b) => a - b);
+  if (!inside.length) {
+    return { from, through };
+  }
+  return {
+    from: attachedParagraphs.has(from) ? from : inside[0],
+    through: attachedParagraphs.has(through) ? through : inside[inside.length - 1],
+  };
+}
+
+/**
+ * Replace a numbered span with new paragraphs. The new text goes in first,
+ * right after `through`, so a failed delete leaves both versions rather than
+ * neither. Boxes anchored in the span go through the shape API, which is the
+ * delete that is known to work, before their paragraphs are removed.
+ */
+export async function replaceParagraphs(
+  from: number,
+  through: number,
+  specs: ParagraphSpec[],
+  format: InsertFormatContext
+): Promise<ReplacedSpan> {
+  if (!isWordHost()) {
+    throw new Error("Word で開いてください。");
+  }
+  const asked = { from, through };
+  ({ from, through } = snapSpan(from, through));
+  const span = shapesInSpan(attachedShapeAnchors, from, through, attachedParagraphs.keys());
+  const shapes = span.shapes.filter((number) => !spentShapes.has(number));
+  if (shapes.length && !canDeleteShapes()) {
+    throw new Error(
+      "この Word ではテキストボックスを削除できません。範囲には手を付けていません。insert_blocks と delete_paragraphs で書き直してください。"
+    );
+  }
+  await Word.run(async (context) => {
+    const paragraphs = context.document.body.paragraphs;
+    paragraphs.load("items/text");
+    await context.sync();
+    const found = locateSpan(paragraphs.items, from, through);
+    const count = found.last - found.first + 1 + (span.lastAnchor - through);
+    if (count > MAX_REPLACE_PARAGRAPHS) {
+      throw new Error(
+        `範囲が ${count} 段落あり、一度に置き換えられる ${MAX_REPLACE_PARAGRAPHS} 段落を超えています。何も変えていません。範囲を分けてください。`
+      );
+    }
+  });
+
+  const landing = await insertDraftParagraphs(specs, "cursor", "", through, format);
+
+  try {
+    const replaced = await removeReplacedSpan(from, through, specs, shapes, span, landing);
+    const moved = asked.from !== from || asked.through !== through;
+    return moved ? { ...replaced, asked } : replaced;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "Word の操作に失敗しました。";
+    throw new Error(
+      `新しい ${specs.length} 段落は段落 ${through} の後ろに入れましたが、元の段落 ${from}〜${through} は消せていません（${reason}）。` +
+        "read_paragraphs で読み直し、残った元の段落を delete_paragraphs で消してください。"
+    );
+  }
+}
+
+async function removeReplacedSpan(
+  from: number,
+  through: number,
+  specs: ParagraphSpec[],
+  shapes: number[],
+  trail: { lastAnchor: number; end: number },
+  landing: InsertLanding
+): Promise<ReplacedSpan> {
+  return Word.run(async (context) => {
+    startTracking(context);
+    const queued = shapes.length
+      ? await queueShapeDeletes(context, shapes)
+      : { deleted: [], missing: [], commit: () => undefined };
+    const paragraphs = context.document.body.paragraphs;
+    paragraphs.load("items/text");
+    await context.sync();
+    const items = paragraphs.items;
+    const found = locateSpan(items, from, through);
+    const facts = (await readBodyFacts(context, items))?.facts ?? null;
+
+    // The blanks that held the span's boxes sit past the new paragraphs now,
+    // through the last one that still owns a box, an empty box included. A page
+    // break or a picture ends them. Without the facts a picture cannot be told
+    // from a blank, so they stay.
+    const created = specs.map((spec) => compact(specPlainText(spec)));
+    const landedRight = created.every(
+      (text, offset) => compact(paragraphText(items[found.last + 1 + offset] || { text: "" })) === text
+    );
+    const doomed: Word.Paragraph[] = [];
+    if (landedRight && facts) {
+      const blanks: number[] = [];
+      let reach = trail.lastAnchor - through;
+      for (let step = 1; step <= trail.end - through; step += 1) {
+        const at = found.last + created.length + step;
+        const fact = facts[at];
+        if (!items[at] || !fact || fact.text.trim() || fact.hasDrawing || fact.pageBreak) {
+          break;
+        }
+        blanks.push(at);
+        if (fact.hasAnchor) {
+          reach = Math.max(reach, step);
+        }
+      }
+      for (const at of blanks.slice(0, reach)) {
+        if (!facts[at].markDeleted) {
+          doomed.push(items[at]);
+        }
+      }
+    }
+    let keptPictures = 0;
+    for (let index = found.last; index >= found.first; index -= 1) {
+      if (facts?.[index]?.hasDrawing) {
+        keptPictures += 1;
+        continue;
+      }
+      if (facts?.[index]?.markDeleted && !facts[index].text.trim()) {
+        continue;
+      }
+      doomed.push(items[index]);
+    }
+    for (const paragraph of doomed) {
+      paragraph.delete();
+    }
+    await context.sync();
+    queued.commit();
+
+    for (const number of [...attachedParagraphs.keys()]) {
+      if (number >= from && number <= through) {
+        attachedParagraphs.delete(number);
+      }
+    }
+    attachedParagraphCount = items.length + 1;
+    return {
+      from,
+      through,
+      firstText: found.firstText,
+      lastText: found.lastText,
+      removed: doomed.length,
+      keptPictures,
+      shapes: queued.deleted,
+      unmatchedShapes: queued.missing,
+      numbers: landing.numbers,
+    };
   });
 }
 

@@ -31,7 +31,8 @@ describe("systemPrompt", () => {
   it("says the attachment is the document from before tools run", () => {
     const text = systemPrompt({ ...base, search: false, argos: false });
     expect(text).toContain("ツールを動かす前の文書");
-    expect(text).toContain("read_paragraphs");
+    expect(text).toContain("確かめるために read_paragraphs で読み直しません");
+    expect(text).toContain("書く前に read_paragraphs で読み直さず、添付から書きます");
   });
 
   it("describes both search tools when both providers are on", () => {

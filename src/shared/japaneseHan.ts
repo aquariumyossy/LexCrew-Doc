@@ -2,6 +2,7 @@ import { HAN_BMP_A, HAN_BMP_A0, HAN_BMP_B, HAN_BMP_B0, HAN_EXTRA } from "./japan
 import {
   TOOL_INSERT_BLOCKS,
   TOOL_INSERT_COMMENT,
+  TOOL_REPLACE_PARAGRAPHS,
   TOOL_REPLACE_ALL,
   TOOL_REPLACE_QUOTE,
   TOOL_REPLACE_SELECTION,
@@ -131,7 +132,8 @@ export function authoredToolTexts(call: ToolInvocation): string[] {
       return [call.args.text];
     case TOOL_REPLACE_ALL:
       return call.args.replace === undefined ? [] : [call.args.replace];
-    case TOOL_INSERT_BLOCKS: {
+    case TOOL_INSERT_BLOCKS:
+    case TOOL_REPLACE_PARAGRAPHS: {
       const parts: string[] = [];
       for (const block of call.args.blocks) {
         if (block.label) {

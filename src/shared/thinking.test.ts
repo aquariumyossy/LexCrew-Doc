@@ -3,33 +3,52 @@ import { DEFAULT_THINKING_BUDGET, MIN_THINKING_BUDGET } from "./constants";
 import {
   looksLikeFormatInstruction,
   normalizeFormatThinkingLevel,
+  normalizeThinkingBudget,
   normalizeThinkingLevel,
+  normalizeThinkingRetryLevel,
   resolveFormatThinking,
+  thinkingAfterCut,
   thinkingFields,
 } from "./thinking";
 
 describe("thinkingFields", () => {
-  it("sends medium effort with a budget by default", () => {
-    expect(thinkingFields("medium", 2048)).toEqual({
+  it("sends medium effort and no budget, which MTPLX does not read", () => {
+    expect(thinkingFields("medium")).toEqual({
       reasoning_effort: "medium",
-      thinking_budget: 2048,
-      chat_template_kwargs: { enable_thinking: true, thinking_budget: 2048 },
+      chat_template_kwargs: { enable_thinking: true },
     });
   });
 
   it("maps the high level to xhigh", () => {
-    expect(thinkingFields("high", 4096).reasoning_effort).toBe("xhigh");
+    expect(thinkingFields("high").reasoning_effort).toBe("xhigh");
   });
 
   it("disables thinking only when the user picks off", () => {
-    expect(thinkingFields("off", 2048)).toEqual({
+    expect(thinkingFields("off")).toEqual({
       chat_template_kwargs: { enable_thinking: false },
     });
   });
+});
 
+describe("normalizeThinkingBudget", () => {
   it("falls back to the default budget and enforces a floor", () => {
-    expect(thinkingFields("low", 0).thinking_budget).toBe(DEFAULT_THINKING_BUDGET);
-    expect(thinkingFields("low", 8).thinking_budget).toBe(MIN_THINKING_BUDGET);
+    expect(normalizeThinkingBudget(0)).toBe(DEFAULT_THINKING_BUDGET);
+    expect(normalizeThinkingBudget(8)).toBe(MIN_THINKING_BUDGET);
+  });
+});
+
+describe("thinkingAfterCut", () => {
+  it("steps down to the retry level, and to no thinking from low or below it", () => {
+    expect(thinkingAfterCut("high", "low")).toBe("low");
+    expect(thinkingAfterCut("medium", "low")).toBe("low");
+    expect(thinkingAfterCut("low", "low")).toBe("off");
+    expect(thinkingAfterCut("medium", "off")).toBe("off");
+  });
+
+  it("retries at low unless the setting says otherwise", () => {
+    expect(normalizeThinkingRetryLevel(undefined)).toBe("low");
+    expect(normalizeThinkingRetryLevel("medium")).toBe("low");
+    expect(normalizeThinkingRetryLevel("off")).toBe("off");
   });
 });
 

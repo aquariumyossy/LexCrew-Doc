@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_OUTLINE_LAYOUT,
   DraftBlock,
   InsertPlacement,
   mapBlockToParagraph,
   mapBlocks,
   normalizeBlock,
+  normalizeOutlineLayout,
+  paintParagraph,
   specPlainText,
   summarizeInsertedBlocks,
+  summarizeReplacedParagraphs,
 } from "./blocks";
 import {
   DEFAULT_BODY_PT,
@@ -113,6 +117,119 @@ describe("mapBlockToParagraph", () => {
       { fontName: FALLBACK_FONT_NAME }
     );
     expect(spec.fontName).toBe(FALLBACK_FONT_NAME);
+  });
+});
+
+describe("outline blocks", () => {
+  const opts = { fontName: DEFAULT_FONT_NAME, bodyPt: 12 };
+  const laid = (level: number, layout = DEFAULT_OUTLINE_LAYOUT) => {
+    const spec = mapBlockToParagraph(
+      { type: "outline", text: "本文", level },
+      { ...opts, outlineLayout: layout }
+    );
+    return [spec.bold, spec.leftIndentPt, spec.firstLineIndentPt];
+  };
+
+  it("keeps the level and clamps one that is out of range", () => {
+    expect(normalizeBlock({ type: "outline", text: "第１", level: 0 })).toEqual({
+      type: "outline",
+      text: "第１",
+      level: 0,
+    });
+    expect(normalizeBlock({ type: "outline", text: "本文", level: 7 })?.level).toBe(4);
+    expect(normalizeBlock({ type: "outline", text: "本文" })?.level).toBe(4);
+  });
+
+  it("lays out each level from the default layout", () => {
+    expect([0, 1, 2, 3, 4].map((level) => laid(level))).toEqual([
+      [true, 0, 0],
+      [true, 36, -24],
+      [false, 48, -24],
+      [false, 36, 0],
+      [false, 36, 12],
+    ]);
+  });
+
+  it("follows a layout the user changed", () => {
+    const layout = normalizeOutlineLayout([
+      { bold: false, indentChars: 1, hangingChars: 0, firstLineChars: 0 },
+    ]);
+    expect(laid(0, layout)).toEqual([false, 12, 0]);
+    expect(laid(1, layout)).toEqual([true, 36, -24]);
+  });
+
+  it("falls back to the default for a stored layout it cannot read", () => {
+    expect(normalizeOutlineLayout("broken")).toEqual(DEFAULT_OUTLINE_LAYOUT);
+    expect(normalizeOutlineLayout([{ bold: "yes", indentChars: -1 }])[0]).toEqual(
+      DEFAULT_OUTLINE_LAYOUT[0]
+    );
+  });
+
+  it("rescales the indent to the body size it lands in, even beside existing text", () => {
+    const spec = mapBlockToParagraph({ type: "outline", text: "１．住所", level: 1 }, opts);
+    const painted = paintParagraph(spec, {
+      font: { write: false },
+      size: { write: false },
+      spacing: { kind: "keep" },
+      applyIndent: false,
+      indentEm: 10.5,
+    } as Parameters<typeof paintParagraph>[1]);
+    expect([painted.applyIndent, painted.leftIndentPt, painted.firstLineIndentPt]).toEqual([
+      true,
+      31.5,
+      -21,
+    ]);
+  });
+});
+
+describe("summarizeReplacedParagraphs", () => {
+  it("names the span, the boxes it took and the new numbers", () => {
+    const summary = summarizeReplacedParagraphs(
+      [
+        { type: "outline", text: "第１　調査物件", level: 0 },
+        { type: "outline", text: "東京都", level: 4 },
+      ],
+      {
+        from: 3,
+        through: 122,
+        firstText: "調査物件の住所",
+        lastText: "その他連絡事項（被告から原告への連絡・入金、退去などの情報）",
+        removed: 120,
+        keptPictures: 0,
+        shapes: [1, 2],
+        unmatchedShapes: [19],
+        numbers: [
+          { number: 200, text: "第１　調査物件" },
+          { number: 201, text: "東京都" },
+        ],
+      }
+    );
+    expect(summary).toBe(
+      "段落 3「調査物件の住所」から段落 122「その他連絡事項（被告から原告への…」までの 120 段落を消し、" +
+        "その位置に 2 段落を入れました（変更履歴に記録）。入れた段落には設定どおりの階層の書式を当て済みです。" +
+        "元の段落は変更履歴の削除として残るだけで、本文の読みには出ません。" +
+        "範囲に結び付いたテキストボックス 図1、図2 も消しました。" +
+        "図19 は箱を特定できず、段落と一緒に消えたかは確かめていません。" +
+        "消した段落の番号はもう使えません。範囲が意図と違っていたら、続けずに報告してください。" +
+        "\n入れた段落の番号は次のとおりです。このターンでこれらの段落を指すときは、" +
+        "quote ではなくこの番号を paragraph / through に渡してください。\n[200] 第１　調査物件\n[201] 東京都"
+    );
+  });
+
+  it("says when an end on a blank was pulled in and pictures were kept", () => {
+    const summary = summarizeReplacedParagraphs([{ type: "outline", text: "第１", level: 0 }], {
+      from: 3,
+      through: 126,
+      asked: { from: 3, through: 127 },
+      firstText: "a",
+      lastText: "b",
+      removed: 10,
+      keptPictures: 2,
+      shapes: [],
+      unmatchedShapes: [],
+    });
+    expect(summary).toContain("段落 3〜127 の端が空行だったので、番号のある段落 3〜126 に寄せました。");
+    expect(summary).toContain("範囲にあった画像の 2 段落は消さずに残しました。");
   });
 });
 

@@ -111,6 +111,7 @@ import ChatPane, { ChatDraft } from "./ChatPane";
 import { AboutDialog } from "./AboutDialog";
 import ArgosScopePicker from "./ArgosScopePicker";
 import { FileAttachButton, FileBadges } from "./FileAttachBar";
+import { PromptLibrary } from "./PromptLibrary";
 import ContextMeter from "./ContextMeter";
 import HistoryDialog from "./HistoryDialog";
 import { CompactDialogClose, useCompactDialogStyles } from "./compactDialog";
@@ -1137,6 +1138,14 @@ const App: React.FC = () => {
                 onChange={(paths) => void applyArgosScope(paths)}
               />
             ) : null}
+            <PromptLibrary
+              text={input}
+              disabled={busy}
+              onRecall={(body) => {
+                setInput(body);
+                requestAnimationFrame(() => inputRef.current?.focus());
+              }}
+            />
             <FileAttachButton disabled={busy} onPick={addFiles} />
             <Button
               appearance="primary"
@@ -1146,6 +1155,7 @@ const App: React.FC = () => {
               disabled={busy || readingFiles || !input.trim()}
               onClick={() => void send()}
               aria-label="送信"
+              title="送信"
             />
           </div>
         </div>

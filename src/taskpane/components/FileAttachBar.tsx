@@ -394,7 +394,6 @@ export type FileAttachButtonProps = {
   onPick: (files: File[]) => void;
 };
 
-/** The clip, between the Argos scope and send. */
 export const FileAttachButton: React.FC<FileAttachButtonProps> = ({ disabled, onPick }) => {
   const styles = useStyles();
   const input = React.useRef<HTMLInputElement>(null);
@@ -418,6 +417,7 @@ export const FileAttachButton: React.FC<FileAttachButtonProps> = ({ disabled, on
         className={styles.clip}
         icon={<AttachRegular />}
         aria-label="ファイルを添付"
+        title="ファイルを添付"
         disabled={disabled}
         onClick={() => input.current?.click()}
       />

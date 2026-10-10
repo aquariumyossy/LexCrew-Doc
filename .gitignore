@@ -13,7 +13,9 @@ coverage/
 *.local
 agent-tools/
 tmp-*.png
-docs/word-plugin-thinking-history-2026-10-02.md
+docs/*
+!docs/usage.md
+!docs/design-notes.md
 *.pem
 *.key
 *.pfx

@@ -140,7 +140,7 @@ function severityLabel(severity: Severity): string {
 }
 
 function formatComment(comment: string, severity: Severity): string {
-  return `【${severityLabel(severity)}】${comment.trim()}\n\n※ LLM出力のため、判例・条文の引用は未確認です。`;
+  return `【${severityLabel(severity)}】${comment.trim()}`;
 }
 
 function formatCitation(hit: SearchHit): string {

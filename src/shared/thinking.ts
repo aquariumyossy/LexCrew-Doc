@@ -63,6 +63,26 @@ export function looksLikeFormatInstruction(instruction: string): boolean {
   return FORMAT_INSTRUCTION.test(instruction || "");
 }
 
+/** The level a call is sent again at after its thinking ran past the budget. */
+export type ThinkingRetryLevel = "low" | "off";
+
+export const THINKING_RETRY_LEVELS: ThinkingRetryLevel[] = ["low", "off"];
+
+export const DEFAULT_THINKING_RETRY_LEVEL: ThinkingRetryLevel = "low";
+
+export function normalizeThinkingRetryLevel(value: unknown): ThinkingRetryLevel {
+  return THINKING_RETRY_LEVELS.includes(value as ThinkingRetryLevel)
+    ? (value as ThinkingRetryLevel)
+    : DEFAULT_THINKING_RETRY_LEVEL;
+}
+
+const THINKING_RANK: Record<ThinkingLevel, number> = { off: 0, low: 1, medium: 2, high: 3 };
+
+/** Where a cut call goes next: the retry level when it is lower, else no thinking. */
+export function thinkingAfterCut(cut: ThinkingLevel, retry: ThinkingRetryLevel): ThinkingLevel {
+  return THINKING_RANK[retry] < THINKING_RANK[cut] ? retry : "off";
+}
+
 export function normalizeThinkingBudget(value: unknown): number {
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n) || n <= 0) {

@@ -61,14 +61,18 @@ import {
   stripInlineMarkup,
 } from "../shared/markupText";
 import {
+  alignBodyFacts,
+  factCounts,
   fitShapeText,
   pickShapeByText,
   readShapeBlocks,
   renderedShapeBody,
   shapeLabel,
   shapesInSpan,
+  type AlignedFacts,
   type AnchoredShape,
   type BodyParagraphFact,
+  type ShapePlacement,
 } from "../shared/extract/shapeText";
 import { SHAPES_MARKER, TRUNCATION_NOTE } from "../shared/prompts";
 import { formatParagraphRef, isParagraphRef } from "../shared/paragraphRef";
@@ -112,6 +116,7 @@ import {
   ReplaceQuoteArgs,
   SetOutlineArgs,
 } from "../shared/tools";
+import { logInfo } from "../sidecar/logger";
 import { SearchHit } from "../sidecar/types";
 
 /* global Office, Word */
@@ -653,9 +658,11 @@ export async function readDocumentText(
     let inlineChanges: ChangeNote[] = [];
     let inlineChangesTruncated = false;
     let appendixComments: CommentNote[] = [];
+    let markupParagraphs = -1;
     if (options.markup && !attachmentReviewedFallback && !shapeError) {
       try {
         const parsed = readMarkupBody(documentXml, commentsXml, { skipShapeParagraphs: true });
+        markupParagraphs = parsed.paragraphCount;
         if (parsed.paragraphCount === paragraphs.items.length) {
           const overhead = parsed.markupOverhead;
           const budget = options.markupBudget ?? maxChars;
@@ -675,11 +682,14 @@ export async function readDocumentText(
 
     const shapeRoom = Math.max(0, maxChars - `\n\n${SHAPES_MARKER}\n`.length);
     const placement = shapeError ? { blocks: [], bodyParagraphs: 0, paragraphs: [] } : readShapeBlocks(documentXml);
-    const anchorsOk = !shapeError && placement.bodyParagraphs === paragraphs.items.length;
-    const shapeBlocks: AnchoredShape[] = anchorsOk
-      ? placement.blocks
-      : placement.blocks.map((block) => ({ lines: block.lines, anchor: null }));
-    const facts: BodyParagraphFact[] | null = anchorsOk ? placement.paragraphs : null;
+    const aligned = shapeError
+      ? null
+      : alignFacts(placement, paragraphs.items.map(paragraphText), "attachment", markupParagraphs);
+    const shapeBlocks: AnchoredShape[] = placement.blocks.map((block) => ({
+      lines: block.lines,
+      anchor: aligned ? aligned.place(block.anchor) : null,
+    }));
+    const facts: BodyParagraphFact[] | null = aligned?.facts ?? null;
     const displays: string[] = [];
     const kinds: BodyKind[] = [];
     const blankLabels: string[] = [];
@@ -3923,30 +3933,51 @@ function bodyKind(text: string, fact: BodyParagraphFact | undefined): BodyKind {
   return fact?.markDeleted ? "gone" : "blank";
 }
 
+/** The facts lined up with `body.paragraphs`, logging the counts when they did not match as they are. */
+function alignFacts(
+  placement: ShapePlacement,
+  words: string[],
+  where: string,
+  markup = -1
+): AlignedFacts | null {
+  const aligned = alignBodyFacts(placement, words);
+  if (aligned?.how !== "exact") {
+    logInfo("paragraph facts", {
+      where,
+      aligned: aligned?.how ?? "none",
+      ...factCounts(placement, words),
+      ...(markup >= 0 ? { markup } : {}),
+    });
+  }
+  return aligned;
+}
+
 /** The facts and `[図n]` labels for the body, or null when the OOXML does not line up with it. */
 async function readBodyFacts(
   context: Word.RequestContext,
-  count: number
+  items: Word.Paragraph[]
 ): Promise<{ facts: BodyParagraphFact[]; shapes: Map<number, string[]> } | null> {
   try {
     const pkg = context.document.body.getOoxml();
     await context.sync();
     const placed = readShapeBlocks(documentXmlFromPackage(pkg.value || ""));
-    if (placed.bodyParagraphs !== count) {
+    const aligned = alignFacts(placed, items.map(paragraphText), "live");
+    if (!aligned) {
       return null;
     }
     const shapes = new Map<number, string[]>();
     placed.blocks
       .filter((block) => block.lines.join("\n").length > 0)
       .forEach((block, index) => {
-        if (block.anchor == null) {
+        const anchor = aligned.place(block.anchor);
+        if (anchor == null) {
           return;
         }
-        const list = shapes.get(block.anchor) || [];
+        const list = shapes.get(anchor) || [];
         list.push(shapeLabel(index + 1));
-        shapes.set(block.anchor, list);
+        shapes.set(anchor, list);
       });
-    return { facts: placed.paragraphs, shapes };
+    return { facts: aligned.facts, shapes };
   } catch {
     return null;
   }
@@ -4078,7 +4109,7 @@ async function loadLiveParagraphs(context: Word.RequestContext): Promise<LivePar
     }
   }
 
-  const body = await readBodyFacts(context, collection.items.length);
+  const body = await readBodyFacts(context, collection.items);
 
   return collection.items.map((paragraph, index) => {
     const raw = paragraphText(paragraph);
@@ -4937,7 +4968,7 @@ export async function replaceParagraphs(
   const landing = await insertDraftParagraphs(specs, "cursor", "", through, format);
 
   try {
-    const replaced = await removeReplacedSpan(from, through, specs, shapes, span.lastAnchor, landing);
+    const replaced = await removeReplacedSpan(from, through, specs, shapes, span, landing);
     const moved = asked.from !== from || asked.through !== through;
     return moved ? { ...replaced, asked } : replaced;
   } catch (error) {
@@ -4954,7 +4985,7 @@ async function removeReplacedSpan(
   through: number,
   specs: ParagraphSpec[],
   shapes: number[],
-  lastAnchor: number,
+  trail: { lastAnchor: number; end: number },
   landing: InsertLanding
 ): Promise<ReplacedSpan> {
   return Word.run(async (context) => {
@@ -4967,23 +4998,33 @@ async function removeReplacedSpan(
     await context.sync();
     const items = paragraphs.items;
     const found = locateSpan(items, from, through);
-    const facts = (await readBodyFacts(context, items.length))?.facts ?? null;
+    const facts = (await readBodyFacts(context, items))?.facts ?? null;
 
-    // The blanks that held the span's boxes sit past the new paragraphs now.
-    // Without the facts a picture cannot be told from a blank, so they stay.
+    // The blanks that held the span's boxes sit past the new paragraphs now,
+    // through the last one that still owns a box, an empty box included. A page
+    // break or a picture ends them. Without the facts a picture cannot be told
+    // from a blank, so they stay.
     const created = specs.map((spec) => compact(specPlainText(spec)));
     const landedRight = created.every(
       (text, offset) => compact(paragraphText(items[found.last + 1 + offset] || { text: "" })) === text
     );
     const doomed: Word.Paragraph[] = [];
     if (landedRight && facts) {
-      for (let step = 1; step <= lastAnchor - through; step += 1) {
+      const blanks: number[] = [];
+      let reach = trail.lastAnchor - through;
+      for (let step = 1; step <= trail.end - through; step += 1) {
         const at = found.last + created.length + step;
         const fact = facts[at];
-        if (!items[at] || !fact || fact.text.trim() || fact.hasDrawing) {
+        if (!items[at] || !fact || fact.text.trim() || fact.hasDrawing || fact.pageBreak) {
           break;
         }
-        if (!fact.markDeleted) {
+        blanks.push(at);
+        if (fact.hasAnchor) {
+          reach = Math.max(reach, step);
+        }
+      }
+      for (const at of blanks.slice(0, reach)) {
+        if (!facts[at].markDeleted) {
           doomed.push(items[at]);
         }
       }

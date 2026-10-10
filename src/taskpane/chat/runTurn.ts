@@ -13,6 +13,7 @@ import {
   looksLikeFormatInstruction,
   normalizeThinkingBudget,
   resolveFormatThinking,
+  thinkingAfterCut,
 } from "../../shared/thinking";
 import {
   UNLIMITED_TOOL_ROUNDS,
@@ -186,13 +187,15 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
 
   /**
    * MTPLX does not read a thinking budget, so the pane enforces it: once the
-   * streamed reasoning passes the cap, that call is dropped and sent again with
-   * thinking off. The next round goes back to the turn's level.
+   * streamed reasoning passes the cap, that call is dropped and sent again at
+   * the retry level, and with thinking off if that runs over too. The next
+   * round goes back to the turn's level.
    */
-  const stream = async (body: ChatBody) => {
-    if (body.thinkingLevel === "off") {
+  const stream = async (body: ChatBody): ReturnType<typeof chatStream> => {
+    if (!body.thinkingLevel || body.thinkingLevel === "off") {
       return chatStream(body, { signal, onDelta: options.onDelta });
     }
+    const level = body.thinkingLevel;
     const cut = new AbortController();
     const forward = () => cut.abort(signal.reason);
     signal.addEventListener("abort", forward, { once: true });
@@ -210,10 +213,11 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       if (signal.aborted || !cut.signal.aborted) {
         throw error;
       }
-      logInfo("thinking cut", { level: body.thinkingLevel, reasoningChars: thought });
+      const next = thinkingAfterCut(level, settings.thinkingRetryLevel);
+      logInfo("thinking cut", { level, reasoningChars: thought, next });
       meter.llmCalls += 1;
       options.onDelta?.({ content: "", reasoningContent: "" });
-      return chatStream({ ...body, thinkingLevel: "off" }, { signal, onDelta: options.onDelta });
+      return stream({ ...body, thinkingLevel: next });
     } finally {
       signal.removeEventListener("abort", forward);
     }

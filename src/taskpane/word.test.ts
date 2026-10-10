@@ -913,6 +913,9 @@ const P_BOX = (value: string) =>
   `<w:p><w:r><w:txbxContent><w:p><w:r><w:t>${value}</w:t></w:r></w:p></w:txbxContent></w:r></w:p>`;
 const P_PICTURE = "<w:p><w:r><w:drawing><pic:pic/></w:drawing></w:r></w:p>";
 const P_GONE = "<w:p><w:pPr><w:rPr><w:del/></w:rPr></w:pPr></w:p>";
+const P_EMPTY_BOX =
+  "<w:p><w:r><w:drawing><wp:anchor><wps:txbx><w:txbxContent><w:p/></w:txbxContent></wps:txbx></wp:anchor></w:drawing></w:r></w:p>";
+const P_PAGE_BREAK = `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`;
 
 afterEach(() => {
   delete (globalThis as unknown as { Word?: unknown }).Word;
@@ -1653,6 +1656,37 @@ describe("replaceParagraphs", () => {
     expect(span.asked).toEqual({ from: 1, through: 3 });
     expect(span.shapes).toEqual([1]);
     expect(deleted.sort()).toEqual([0, 1, 2]);
+  });
+
+  it("takes an empty box's blank after the span and stops at a page break", async () => {
+    const word = installBody([
+      ["その他", text("その他")],
+      ["", P_EMPTY_BOX],
+      ["", P_PAGE_BREAK],
+      ["写真", text("写真")],
+    ]);
+    const deleted = watchDeleted(word);
+    await readDocumentText(10_000);
+
+    const span = await replaceParagraphs(1, 3, outline([4, "新しい本文"]), format);
+
+    expect(span.through).toBe(1);
+    expect(deleted.sort()).toEqual([0, 1]);
+  });
+
+  it("leaves a spacer blank past the last box's blank", async () => {
+    const word = installBody([
+      ["その他", text("その他")],
+      ["", P_EMPTY_BOX],
+      ["", P_BLANK],
+      ["写真", text("写真")],
+    ]);
+    const deleted = watchDeleted(word);
+    await readDocumentText(10_000);
+
+    await replaceParagraphs(1, 1, outline([4, "新しい本文"]), format);
+
+    expect(deleted.sort()).toEqual([0, 1]);
   });
 
   it("lays the new paragraphs out by outline level", async () => {
@@ -2918,6 +2952,20 @@ describe("readParagraphs", () => {
 
     expect(read.text).toBe("[1] 番号なし\n（空行） [図1]\n（画像）\n[5] 番号なし");
     expect(read.numbered).toBe(false);
+  });
+
+  it("lines the facts up when the OOXML has an extra empty paragraph at the end", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["前文", "/", "", "後文"],
+      ooxml:
+        `<w:document ${W_NS}><w:body>` +
+        `${P_TEXT("前文")}${P_BOX("当事者目録")}${P_PICTURE}${P_TEXT("後文")}${P_BLANK}` +
+        `</w:body></w:document>`,
+    });
+    const attached = await readDocumentText(10_000);
+    expect(attached.text).toContain("[1] 前文\n（空行） [図1]\n（画像）\n[4] 後文");
   });
 
   it("names the numbers in hand when a range holds none", async () => {

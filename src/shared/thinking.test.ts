@@ -5,7 +5,9 @@ import {
   normalizeFormatThinkingLevel,
   normalizeThinkingBudget,
   normalizeThinkingLevel,
+  normalizeThinkingRetryLevel,
   resolveFormatThinking,
+  thinkingAfterCut,
   thinkingFields,
 } from "./thinking";
 
@@ -32,6 +34,21 @@ describe("normalizeThinkingBudget", () => {
   it("falls back to the default budget and enforces a floor", () => {
     expect(normalizeThinkingBudget(0)).toBe(DEFAULT_THINKING_BUDGET);
     expect(normalizeThinkingBudget(8)).toBe(MIN_THINKING_BUDGET);
+  });
+});
+
+describe("thinkingAfterCut", () => {
+  it("steps down to the retry level, and to no thinking from low or below it", () => {
+    expect(thinkingAfterCut("high", "low")).toBe("low");
+    expect(thinkingAfterCut("medium", "low")).toBe("low");
+    expect(thinkingAfterCut("low", "low")).toBe("off");
+    expect(thinkingAfterCut("medium", "off")).toBe("off");
+  });
+
+  it("retries at low unless the setting says otherwise", () => {
+    expect(normalizeThinkingRetryLevel(undefined)).toBe("low");
+    expect(normalizeThinkingRetryLevel("medium")).toBe("low");
+    expect(normalizeThinkingRetryLevel("off")).toBe("off");
   });
 });
 

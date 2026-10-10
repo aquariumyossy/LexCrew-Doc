@@ -65,8 +65,10 @@ import {
   FORMAT_THINKING_LABELS,
   THINKING_LEVELS,
   THINKING_LEVEL_LABELS,
+  THINKING_RETRY_LEVELS,
   ThinkingLevel,
   normalizeFormatThinkingLevel,
+  normalizeThinkingRetryLevel,
 } from "../../shared/thinking";
 import {
   TOOL_ROUND_PRESETS,
@@ -1359,6 +1361,23 @@ const App: React.FC = () => {
                 </Field>
                 <Field
                   size="small"
+                  label="打ち切り後の思考"
+                  hint="思考トークン予算を超えて打ち切った呼び出しを、この思考レベルで送り直します。既定は低。低は送り直しの読み込みに少し時間がかかります。"
+                >
+                  <RadioGroup
+                    layout="horizontal"
+                    value={settings.thinkingRetryLevel}
+                    onChange={(_, d) =>
+                      patch({ thinkingRetryLevel: normalizeThinkingRetryLevel(d.value) })
+                    }
+                  >
+                    {THINKING_RETRY_LEVELS.map((level) => (
+                      <Radio key={level} value={level} label={THINKING_LEVEL_LABELS[level]} />
+                    ))}
+                  </RadioGroup>
+                </Field>
+                <Field
+                  size="small"
                   label="ツール往復の上限"
                   hint="1 回の指示あたり。コメントが多い点検は 32 か制限なし。上限に達するとチャットに知らせます。止まらなければキャンセルしてください。"
                 >
@@ -1381,7 +1400,7 @@ const App: React.FC = () => {
                     size="small"
                     label="思考トークン予算"
                     style={{ flex: 1 }}
-                    hint="超えた思考は打ち切り、思考なしで送り直します。"
+                    hint="超えた思考は打ち切り、「打ち切り後の思考」で送り直します。"
                   >
                     <Input
                       size="small"

@@ -449,6 +449,7 @@ function replaceQuoteTool(target: TargetHints, numbered: boolean): ToolDefinitio
 const OUTLINE_BLOCK_HINT =
   "outline は「第１」「１．」「（１）」のように、番号を本文に書いて階層を作る段落。番号は text の先頭に書く（自動番号ではない）。" +
   "level は階層の深さで、0 が第１、1 が１．、2 が（１）、3 が①・ア・「・」などそのほかの印、4 は階層の下の本文。" +
+  "0 と 1 は短い見出しだけに使う。文で書く内容は、見出しの下に level 4 の本文として置き、「１．」を付けて見出しにしない。" +
   "字下げ・ぶら下げ・太字は設定の階層レイアウトで付くので、全角空白で位置を合わせない。";
 
 function blocksParam(): Record<string, unknown> {

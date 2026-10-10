@@ -50,6 +50,13 @@ describe("readMarkupBody", () => {
     expect(read.markedParagraphs).toEqual(["前文", "後文"]);
   });
 
+  it("counts an empty paragraph written as <w:p/>, which Word lists too", () => {
+    const xml = `<w:document><w:body><w:p><w:r><w:t>前文</w:t></w:r></w:p><w:p/><w:p><w:r><w:t>後文</w:t></w:r></w:p></w:body></w:document>`;
+    const read = readMarkupBody(xml, undefined, { skipShapeParagraphs: true });
+    expect(read.paragraphCount).toBe(3);
+    expect(read.markedParagraphs).toEqual(["前文", "", "後文"]);
+  });
+
   it("keeps text-box paragraphs when a file wants the whole story", () => {
     const read = readMarkupBody(TEXT_BOX);
     expect(read.paragraphCount).toBeGreaterThan(2);

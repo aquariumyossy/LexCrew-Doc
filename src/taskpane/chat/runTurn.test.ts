@@ -9,15 +9,18 @@ import {
 import { CommittedFile } from "../../shared/fileSource";
 import { NewMessage } from "../../shared/history";
 import { ChatMessage } from "../../sidecar/types";
-import { runawayThinkingChars } from "../../shared/thinking";
+import { THINKING_BUDGET_UNSET_NOTICE, runawayThinkingChars } from "../../shared/thinking";
+import { StoredMessage } from "../../shared/history";
+import { forgetThinkingBudget } from "./thinkingBudget";
 import { MAX_TOOL_ROUNDS, UNLIMITED_TOOL_ROUNDS, toolRoundLimitNotice } from "../../shared/tools";
 import { DEFAULT_SETTINGS } from "../settings";
 import { runTurn } from "./runTurn";
 
 const chatStream = vi.hoisted(() => vi.fn());
+const fetchThinkingBudget = vi.hoisted(() => vi.fn());
 const executeToolCall = vi.hoisted(() => vi.fn());
 
-vi.mock("../api", () => ({ chatStream }));
+vi.mock("../api", () => ({ chatStream, fetchThinkingBudget }));
 vi.mock("./execute", () => ({ executeToolCall, beginToolTurn: vi.fn() }));
 
 type ChatBody = { messages: ChatMessage[]; tools?: unknown[] };
@@ -82,6 +85,9 @@ async function run(instruction: string, selection = "") {
 
 beforeEach(() => {
   chatStream.mockReset();
+  fetchThinkingBudget.mockReset();
+  fetchThinkingBudget.mockResolvedValue(undefined);
+  forgetThinkingBudget();
   executeToolCall.mockReset();
   executeToolCall.mockResolvedValue({ content: "完了", ok: true });
   chatStream.mockImplementation(
@@ -294,6 +300,70 @@ describe("runTurn", () => {
     }
     expect(chatStream).toHaveBeenCalledTimes(1);
     expect(sent.some((message) => message.content === "届かない")).toBe(false);
+  });
+
+  it("reads the MTPLX budget after the first call and stops thinking that runs past it", async () => {
+    const limit = runawayThinkingChars(100);
+    fetchThinkingBudget.mockResolvedValue(100);
+    chatStream.mockReset();
+    chatStream
+      .mockResolvedValueOnce(
+        completion({
+          toolCalls: [toolCall("c1", "search", '{"q":"民法"}')],
+          finishReason: "tool_calls",
+          requestId: "chatcmpl-1",
+        })
+      )
+      .mockImplementationOnce(async (_body: unknown, opts: StreamOptions) => {
+        opts.onDelta?.({ content: "", reasoningContent: "考".repeat(limit + 1) });
+        opts.signal.throwIfAborted();
+        return completion({ content: "届かない" });
+      });
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      await expect(run("調べて")).rejects.toThrow(`思考が ${limit + 1} 字に達しても`);
+    } finally {
+      info.mockRestore();
+    }
+    expect(fetchThinkingBudget).toHaveBeenCalledTimes(1);
+    expect(fetchThinkingBudget.mock.calls[0][0]).toEqual({
+      llmBaseUrl: settings.llmBaseUrl,
+      llmApiKey: settings.llmApiKey,
+      requestId: "chatcmpl-1",
+    });
+  });
+
+  it("tells the conversation once that MTPLX has no thinking budget", async () => {
+    fetchThinkingBudget.mockResolvedValue(null);
+    chatStream.mockResolvedValue(completion({ content: "答えました。", requestId: "chatcmpl-1" }));
+    const { sent } = await run("調べて");
+    expect(sent.map((message) => message.content).slice(-2)).toEqual([
+      "答えました。",
+      THINKING_BUDGET_UNSET_NOTICE,
+    ]);
+
+    const told: StoredMessage = {
+      id: 1,
+      role: "assistant",
+      content: THINKING_BUDGET_UNSET_NOTICE,
+      reasoningContent: "",
+      toolCalls: [],
+      toolCallId: "",
+      usage: null,
+      createdAt: "",
+    };
+    const again: NewMessage[] = [];
+    await runTurn({
+      settings,
+      instruction: "続けて",
+      attachment: attach(""),
+      history: [told],
+      signal: new AbortController().signal,
+      onMessage: (message) => {
+        again.push(message);
+      },
+    });
+    expect(again.at(-1)).toMatchObject({ role: "assistant", content: "答えました。" });
   });
 
   it("says so when the model ends with neither text nor a tool call", async () => {

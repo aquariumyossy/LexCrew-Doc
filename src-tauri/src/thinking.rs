@@ -35,6 +35,54 @@ mod tests {
         assert_eq!(fields, json!({ "chat_template_kwargs": { "enable_thinking": false } }));
     }
 
+    fn guarded(id: &str, budget: u64) -> Value {
+        json!({
+            "request_id": id,
+            "request_tool_count": 3,
+            "request_enable_thinking": true,
+            "thinking_guard": { "enabled": true, "budget_tokens": budget }
+        })
+    }
+
+    fn unguarded(id: &str) -> Value {
+        json!({
+            "request_id": id,
+            "request_tool_count": 3,
+            "request_enable_thinking": true,
+            "thinking_guard": {}
+        })
+    }
+
+    #[test]
+    fn budget_comes_off_the_record_of_the_request() {
+        let metrics = json!({ "recent": [guarded("a", 2048), guarded("b", 4096)] });
+        assert_eq!(budget_from_metrics(&metrics, Some("a")), Some(Some(2048)));
+        let unset = json!({ "recent": [unguarded("a")] });
+        assert_eq!(budget_from_metrics(&unset, Some("a")), Some(None));
+        assert_eq!(budget_from_metrics(&metrics, Some("z")), None);
+    }
+
+    #[test]
+    fn budget_is_unknown_when_the_guard_never_covered_the_request() {
+        let plain = json!({ "recent": [{
+            "request_id": "a",
+            "request_tool_count": 0,
+            "request_enable_thinking": true,
+            "thinking_guard": {}
+        }] });
+        assert_eq!(budget_from_metrics(&plain, Some("a")), None);
+        assert_eq!(budget_from_metrics(&json!("not metrics"), Some("a")), None);
+    }
+
+    #[test]
+    fn budget_without_a_request_takes_the_newest_covered_one() {
+        let plain = json!({ "request_id": "c", "request_tool_count": 0, "thinking_guard": {} });
+        let unset = json!({ "recent": [guarded("a", 2048), unguarded("b"), plain.clone()] });
+        assert_eq!(budget_from_metrics(&unset, None), Some(None));
+        let set = json!({ "recent": [unguarded("a"), guarded("b", 2048), plain] });
+        assert_eq!(budget_from_metrics(&set, None), Some(Some(2048)));
+    }
+
     #[test]
     fn with_thinking_keeps_the_base_payload() {
         let base = json!({ "model": "m", "messages": [] });

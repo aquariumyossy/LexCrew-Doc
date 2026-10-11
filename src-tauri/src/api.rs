@@ -666,7 +666,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
     use tower::ServiceExt;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
 
     async fn json_request(
@@ -1006,6 +1006,48 @@ mod tests {
         assert!(!content.contains("hidden"));
         assert_eq!(content, "コメントを付けました。");
         assert_eq!(body["toolCalls"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn thinking_budget_reads_the_mtplx_metrics_of_a_request() {
+        let mtplx = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/metrics"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "recent": [{
+                    "request_id": "chatcmpl-a",
+                    "request_tool_count": 2,
+                    "request_enable_thinking": true,
+                    "thinking_guard": { "enabled": true, "budget_tokens": 2048 }
+                }]
+            })))
+            .mount(&mtplx)
+            .await;
+        let connection = json!({
+            "llmBaseUrl": format!("{}/v1", mtplx.uri()),
+            "llmApiKey": "test-key",
+        });
+
+        let mut asked = connection.clone();
+        asked["requestId"] = json!("chatcmpl-a");
+        let (status, body) =
+            json_request(create_router(None), "POST", "/api/thinking-budget", asked).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "budget": 2048 }));
+
+        let mut missing = connection.clone();
+        missing["requestId"] = json!("chatcmpl-z");
+        let (_, body) =
+            json_request(create_router(None), "POST", "/api/thinking-budget", missing).await;
+        assert_eq!(body, json!({}));
+
+        let mut wrong = connection;
+        wrong["llmApiKey"] = json!("wrong");
+        let (status, body) =
+            json_request(create_router(None), "POST", "/api/thinking-budget", wrong).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({}));
     }
 
     struct JsonAsSseResponder;

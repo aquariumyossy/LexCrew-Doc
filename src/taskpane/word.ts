@@ -498,8 +498,14 @@ let attachedShapeAnchors: (number | null)[] = [];
 let spentShapes = new Set<number>();
 /** Shape ids already deleted. Tracked changes may leave them in the collection. */
 let deletedShapeIds = new Set<number>();
+let turnSourceText: string | null = null;
+
+export function turnSource(): string | null {
+  return turnSourceText;
+}
 
 function forgetParagraphNumbers(): void {
+  turnSourceText = null;
   attachedParagraphs = new Map();
   attachedParagraphCount = 0;
   attachedShapes = [];
@@ -712,6 +718,9 @@ export async function readDocumentText(
         const mark = listMarkOf(paragraph);
         blankLabels.push(mark.isListItem ? wrapListMark(mark) : "");
       }
+    }
+    if (!shapeError) {
+      turnSourceText = [...displays, ...shapeBlocks.flatMap((block) => block.lines)].join("\n");
     }
     const fitted = shapeError
       ? { text: "", truncated: false, shown: [] as string[], anchors: [] as (number | null)[] }
@@ -4897,11 +4906,9 @@ export async function deleteShape(args: DeleteShapeArgs): Promise<string> {
  * Locate a numbered span in the live body. The span is the paragraphs from
  * `from` to `through`, blank ones between them included.
  */
-function locateSpan(
-  items: Word.Paragraph[],
-  from: number,
-  through: number
-): { first: number; last: number; firstText: string; lastText: string } {
+type LocatedSpan = { first: number; last: number; firstText: string; lastText: string };
+
+function locateSpan(items: Word.Paragraph[], from: number, through: number): LocatedSpan {
   const first = locateParagraph(items, from);
   const last = locateParagraph(items, through);
   if (last.index < first.index) {
@@ -4952,25 +4959,36 @@ export async function replaceParagraphs(
       "この Word ではテキストボックスを削除できません。範囲には手を付けていません。insert_blocks と delete_paragraphs で書き直してください。"
     );
   }
-  await Word.run(async (context) => {
+  const { beforeInsert, sourceText } = await Word.run(async (context) => {
     const paragraphs = context.document.body.paragraphs;
     paragraphs.load("items/text");
     await context.sync();
-    const found = locateSpan(paragraphs.items, from, through);
-    const count = found.last - found.first + 1 + (span.lastAnchor - through);
+    const located = locateSpan(paragraphs.items, from, through);
+    const count = located.last - located.first + 1 + (span.lastAnchor - through);
     if (count > MAX_REPLACE_PARAGRAPHS) {
       throw new Error(
         `範囲が ${count} 段落あり、一度に置き換えられる ${MAX_REPLACE_PARAGRAPHS} 段落を超えています。何も変えていません。範囲を分けてください。`
       );
     }
+    const removedTexts = paragraphs.items.slice(located.first, located.last + 1).map(paragraphText);
+    const boxTexts = shapes.map((number) => attachedShapes[number - 1] ?? "");
+    return { beforeInsert: located, sourceText: [...removedTexts, ...boxTexts].join("\n") };
   });
 
   const landing = await insertDraftParagraphs(specs, "cursor", "", through, format);
 
   try {
-    const replaced = await removeReplacedSpan(from, through, specs, shapes, span, landing);
+    const replaced = await removeReplacedSpan(
+      from,
+      through,
+      beforeInsert,
+      specs,
+      shapes,
+      span,
+      landing
+    );
     const moved = asked.from !== from || asked.through !== through;
-    return moved ? { ...replaced, asked } : replaced;
+    return moved ? { ...replaced, sourceText, asked } : { ...replaced, sourceText };
   } catch (error) {
     const reason = error instanceof Error ? error.message : "Word の操作に失敗しました。";
     throw new Error(
@@ -4983,11 +5001,12 @@ export async function replaceParagraphs(
 async function removeReplacedSpan(
   from: number,
   through: number,
+  beforeInsert: LocatedSpan,
   specs: ParagraphSpec[],
   shapes: number[],
   trail: { lastAnchor: number; end: number },
   landing: InsertLanding
-): Promise<ReplacedSpan> {
+): Promise<Omit<ReplacedSpan, "sourceText">> {
   return Word.run(async (context) => {
     startTracking(context);
     const queued = shapes.length
@@ -4997,7 +5016,12 @@ async function removeReplacedSpan(
     paragraphs.load("items/text");
     await context.sync();
     const items = paragraphs.items;
-    const found = locateSpan(items, from, through);
+    const moved =
+      paragraphText(items[beforeInsert.first] || { text: "" }) !== beforeInsert.firstText ||
+      paragraphText(items[beforeInsert.last] || { text: "" }) !== beforeInsert.lastText;
+    if (moved) {
+      throw new Error(`段落 ${from}〜${through} が挿入の前と同じ位置にありません。`);
+    }
     const facts = (await readBodyFacts(context, items))?.facts ?? null;
 
     // The blanks that held the span's boxes sit past the new paragraphs now,
@@ -5006,14 +5030,15 @@ async function removeReplacedSpan(
     // from a blank, so they stay.
     const created = specs.map((spec) => compact(specPlainText(spec)));
     const landedRight = created.every(
-      (text, offset) => compact(paragraphText(items[found.last + 1 + offset] || { text: "" })) === text
+      (text, offset) =>
+        compact(paragraphText(items[beforeInsert.last + 1 + offset] || { text: "" })) === text
     );
     const doomed: Word.Paragraph[] = [];
     if (landedRight && facts) {
       const blanks: number[] = [];
       let reach = trail.lastAnchor - through;
       for (let step = 1; step <= trail.end - through; step += 1) {
-        const at = found.last + created.length + step;
+        const at = beforeInsert.last + created.length + step;
         const fact = facts[at];
         if (!items[at] || !fact || fact.text.trim() || fact.hasDrawing || fact.pageBreak) {
           break;
@@ -5030,7 +5055,7 @@ async function removeReplacedSpan(
       }
     }
     let keptPictures = 0;
-    for (let index = found.last; index >= found.first; index -= 1) {
+    for (let index = beforeInsert.last; index >= beforeInsert.first; index -= 1) {
       if (facts?.[index]?.hasDrawing) {
         keptPictures += 1;
         continue;
@@ -5055,8 +5080,8 @@ async function removeReplacedSpan(
     return {
       from,
       through,
-      firstText: found.firstText,
-      lastText: found.lastText,
+      firstText: beforeInsert.firstText,
+      lastText: beforeInsert.lastText,
       removed: doomed.length,
       keptPictures,
       shapes: queued.deleted,

@@ -70,6 +70,7 @@ export class StreamAccumulator {
   private finishReason = "";
   private usage: Usage | null = null;
   private tools: ToolAcc[] = [];
+  private requestId: string | undefined;
 
   snapshot(): StreamSnapshot {
     return { content: this.content, reasoningContent: this.reasoning };
@@ -83,6 +84,9 @@ export class StreamAccumulator {
     const err = errorMessage(root);
     if (err) {
       throw new Error(err);
+    }
+    if (typeof root.id === "string" && root.id) {
+      this.requestId = root.id;
     }
 
     const choice = asRecord(asArray(root.choices)[0]);
@@ -140,6 +144,7 @@ export class StreamAccumulator {
       toolCalls,
       finishReason: this.finishReason || (toolCalls.length ? "tool_calls" : "stop"),
       usage: this.usage,
+      requestId: this.requestId,
     };
   }
 

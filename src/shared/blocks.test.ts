@@ -198,6 +198,7 @@ describe("summarizeReplacedParagraphs", () => {
         keptPictures: 0,
         shapes: [1, 2],
         unmatchedShapes: [19],
+        sourceText: "",
         numbers: [
           { number: 200, text: "第１　調査物件" },
           { number: 201, text: "東京都" },
@@ -227,6 +228,7 @@ describe("summarizeReplacedParagraphs", () => {
       keptPictures: 2,
       shapes: [],
       unmatchedShapes: [],
+      sourceText: "",
     });
     expect(summary).toContain("段落 3〜127 の端が空行だったので、番号のある段落 3〜126 に寄せました。");
     expect(summary).toContain("範囲にあった画像の 2 段落は消さずに残しました。");

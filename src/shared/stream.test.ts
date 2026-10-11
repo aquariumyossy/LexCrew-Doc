@@ -25,6 +25,14 @@ describe("StreamAccumulator", () => {
     expect(done.usage?.reasoningTokens).toBe(2);
   });
 
+  it("keeps the request id MTPLX files its metrics under", () => {
+    const acc = new StreamAccumulator();
+    acc.ingest({ id: "chatcmpl-1", choices: [{ delta: { content: "本文" } }] });
+    acc.ingest({ id: "chatcmpl-1", choices: [{ delta: {}, finish_reason: "stop" }] });
+    expect(acc.finish().requestId).toBe("chatcmpl-1");
+    expect(new StreamAccumulator().finish().requestId).toBeUndefined();
+  });
+
   it("merges streamed tool_calls by index", () => {
     const acc = new StreamAccumulator();
     acc.ingest({

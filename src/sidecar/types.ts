@@ -1,5 +1,4 @@
 import { ToolCall, ToolDefinition } from "../shared/tools";
-import { ThinkingLevel } from "../shared/thinking";
 
 /** OpenAI chat message. Assistant turns may carry tool calls; tool turns answer them. */
 export type ChatMessage = {
@@ -35,7 +34,6 @@ export type ChatRequestBody = {
   model?: string;
   messages?: ChatMessage[];
   tools?: ToolDefinition[];
-  thinkingLevel?: ThinkingLevel;
   timeoutMs?: number;
   stream?: boolean;
 };
@@ -59,6 +57,13 @@ export type HealthRequestBody = {
   searxngUrl?: string;
   argosBaseUrl?: string;
   argosApiKey?: string;
+};
+
+export type ThinkingBudgetRequestBody = {
+  llmBaseUrl?: string;
+  llmApiKey?: string;
+  /** The `id` of a streamed reply; without it the newest MTPLX record decides. */
+  requestId?: string;
 };
 
 export type SearchRequestBody = {

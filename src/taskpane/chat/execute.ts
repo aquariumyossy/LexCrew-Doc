@@ -57,7 +57,9 @@ import {
   replaceQuote,
   replaceSelection,
   setOutlineLevel,
+  turnSource,
 } from "../word";
+import { droppedNumbers, unsourcedFacts } from "../../shared/sourceFidelity";
 
 /* global AbortSignal */
 
@@ -70,9 +72,33 @@ const HIT_SNIPPET_CHARS = 300;
  * previous insert left in the document.
  */
 let insertBlocksInTurn = 0;
+let refusedFacts = new Set<string>();
 
 export function beginToolTurn(): void {
   insertBlocksInTurn = 0;
+  refusedFacts = new Set();
+}
+
+type RewriteFacts = { refuse: string[] } | { resent: string[] };
+
+function blockLines(blocks: readonly { text: string; label?: string }[]): string[] {
+  return blocks.map((block) => (block.label ? `${block.label} ${block.text}` : block.text));
+}
+
+function rewriteFacts(
+  blocks: readonly { text: string; label?: string }[],
+  userMessagesText: string
+): RewriteFacts {
+  const source = turnSource();
+  if (source === null) {
+    return { resent: [] };
+  }
+  const missing = unsourcedFacts(blockLines(blocks), `${source}\n${userMessagesText}`);
+  const refuse = missing.filter((fact) => !refusedFacts.has(fact));
+  for (const fact of refuse) {
+    refusedFacts.add(fact);
+  }
+  return refuse.length ? { refuse } : { resent: missing };
 }
 
 export type ToolOutcome = {
@@ -89,6 +115,7 @@ export type ExecuteOptions = {
   indexedReadChars?: number;
   /** The open document already has body text, so settings are not the default face. */
   hasBody?: boolean;
+  userMessagesText?: string;
 };
 
 function failed(message: string): ToolOutcome {
@@ -292,6 +319,13 @@ export async function executeToolCall(
 
       case TOOL_REPLACE_PARAGRAPHS: {
         const { paragraph, through, blocks } = invocation.args;
+        const facts = rewriteFacts(blocks, extras.userMessagesText || "");
+        if ("refuse" in facts) {
+          return failed(
+            `書き込んでいません。添付の本文・図形・利用者の発言のどこにもない数字や語があります（${facts.refuse.join("、")}）。` +
+              "添付から書き直してください。意図して足した語なら、同じ語のまま送り直せば書き込みます。"
+          );
+        }
         const span = await replaceParagraphs(
           paragraph,
           through,
@@ -307,8 +341,16 @@ export async function executeToolCall(
             },
           }
         );
+        const kept = facts.resent.length
+          ? `\n原文にない語（${facts.resent.join("、")}）は、送り直されたので意図した追加として書き込みました。返事で利用者に伝えてください。`
+          : "";
+        const dropped = droppedNumbers(span.sourceText, blockLines(blocks));
+        const lost = dropped.length
+          ? `\n置き換えた範囲の原文にあって、書き直しにない数字があります（${dropped.join("、")}）。` +
+            "省くつもりでなければ、入れた段落を replace_paragraphs で直してください。省いたのなら返事で利用者に伝えてください。"
+          : "";
         return {
-          content: summarizeReplacedParagraphs(blocks, span),
+          content: withNote(summarizeReplacedParagraphs(blocks, span), kept + lost),
           ok: true,
           numbered: Boolean(span.numbers?.length),
         };

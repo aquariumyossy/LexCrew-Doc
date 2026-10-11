@@ -1,7 +1,7 @@
 use crate::constants::DEFAULT_MODEL;
 use crate::json::{parse_completion, Completion};
 use crate::log;
-use crate::thinking::with_thinking;
+use crate::thinking::{budget_from_metrics, with_thinking};
 use reqwest::{Client, StatusCode};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -178,6 +178,45 @@ fn client() -> Client {
     Client::builder().build().unwrap_or_else(|_| Client::new())
 }
 
+const METRICS_TIMEOUT: Duration = Duration::from_secs(5);
+/// MTPLX files a request's record as the reply ends, which can trail the last SSE chunk.
+const METRICS_RECORD_LAG: Duration = Duration::from_millis(300);
+
+async fn fetch_metrics(http: &Client, origin: &str, api_key: &str) -> Option<Value> {
+    let res = http
+        .get(format!("{origin}/metrics"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Accept", "application/json")
+        .timeout(METRICS_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    log::info_status("llm metrics", res.status().as_u16());
+    if !res.status().is_success() {
+        return None;
+    }
+    res.json::<Value>().await.ok()
+}
+
+/// The thinking budget MTPLX applied: `Some(Some(tokens))`, `Some(None)` when
+/// none is set, `None` when unknown.
+pub async fn read_thinking_budget(
+    base_url: &str,
+    api_key: &str,
+    request_id: Option<&str>,
+) -> Option<Option<u64>> {
+    let (origin, _) = split_llm_base(base_url).ok()?;
+    let http = client();
+    let key = api_key.trim();
+    let first = fetch_metrics(&http, &origin, key).await?;
+    let budget = budget_from_metrics(&first, request_id);
+    if budget.is_some() || request_id.is_none() {
+        return budget;
+    }
+    tokio::time::sleep(METRICS_RECORD_LAG).await;
+    budget_from_metrics(&fetch_metrics(&http, &origin, key).await?, request_id)
+}
+
 pub async fn check_llm_health(base_url: &str, api_key: &str) -> HealthResult {
     if api_key.trim().is_empty() {
         return HealthResult {
@@ -314,7 +353,8 @@ pub struct ChatOptions<'a> {
     pub model: &'a str,
     pub messages: &'a [Value],
     pub tools: &'a [Value],
-    pub thinking_level: &'a str,
+    /// MTPLX picks how hard to think; this only turns thinking off.
+    pub thinking: bool,
     pub timeout_ms: u64,
 }
 
@@ -336,7 +376,7 @@ fn build_payload(options: &ChatOptions<'_>, include_thinking: bool, stream: bool
         payload["stream"] = json!(true);
     }
     if include_thinking {
-        payload = with_thinking(&payload, options.thinking_level);
+        payload = with_thinking(&payload, options.thinking);
     }
     payload
 }

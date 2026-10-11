@@ -9,7 +9,13 @@ import { getHistory } from "./history";
 import { rejectReason } from "../shared/fileExtract";
 import { checkArgos, listArgosScopes, searchArgos } from "./argos";
 import { canReadIndexedPath, noteIndexedHits } from "./indexedPaths";
-import { checkLlmHealth, chatCompletions, pipeChatStream, readImageText } from "./llm";
+import {
+  checkLlmHealth,
+  chatCompletions,
+  pipeChatStream,
+  readImageText,
+  readThinkingBudget,
+} from "./llm";
 import { logError, logInfo } from "./logger";
 import { checkSearxng, getSearchProvider } from "./search";
 import {
@@ -30,6 +36,7 @@ import {
   HealthRequestBody,
   OcrRequestBody,
   SearchRequestBody,
+  ThinkingBudgetRequestBody,
 } from "./types";
 
 function clientSignal(res: Response): AbortSignal {
@@ -171,6 +178,20 @@ export function createApp(options: { connectionFile?: string } = {}): express.Ex
     }
   });
 
+  app.post(
+    "/api/thinking-budget",
+    async (req: Request<unknown, unknown, ThinkingBudgetRequestBody>, res) => {
+      const body = req.body || {};
+      const connection = activeConnection(connectionFile, body);
+      const budget = await readThinkingBudget(
+        connection.llmBaseUrl,
+        connection.llmApiKey,
+        body.requestId || undefined
+      );
+      res.json(budget === undefined ? {} : { budget });
+    }
+  );
+
   app.post("/api/chat", async (req: Request<unknown, unknown, ChatRequestBody>, res) => {
     const signal = clientSignal(res);
     const body = req.body || {};
@@ -181,7 +202,6 @@ export function createApp(options: { connectionFile?: string } = {}): express.Ex
       model: body.model || DEFAULT_MODEL,
       messages: body.messages || [],
       tools: body.tools,
-      thinkingLevel: body.thinkingLevel,
       timeoutMs: body.timeoutMs || DEFAULT_TIMEOUT_MS,
       signal,
     };

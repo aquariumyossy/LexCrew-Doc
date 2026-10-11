@@ -47,12 +47,21 @@ pub struct ChatRequest {
     pub messages: Vec<Value>,
     #[serde(default)]
     pub tools: Vec<Value>,
-    #[serde(default, rename = "thinkingLevel")]
-    pub thinking_level: Option<String>,
     #[serde(default, rename = "timeoutMs")]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub stream: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ThinkingBudgetRequest {
+    #[serde(default, rename = "llmBaseUrl")]
+    pub llm_base_url: String,
+    #[serde(default, rename = "llmApiKey")]
+    pub llm_api_key: String,
+    /// The `id` of a streamed reply; without it the newest MTPLX record decides.
+    #[serde(default, rename = "requestId")]
+    pub request_id: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -220,6 +229,29 @@ async fn forward_mtplx_stream(upstream: reqwest::Response) -> Response {
     }
 }
 
+async fn post_thinking_budget(
+    State(state): State<AppState>,
+    Json(body): Json<ThinkingBudgetRequest>,
+) -> Response {
+    let connection = active_connection(
+        &state.connection_file,
+        &body.llm_base_url,
+        &body.llm_api_key,
+        "",
+    );
+    let request_id = Some(body.request_id.trim()).filter(|id| !id.is_empty());
+    match llm::read_thinking_budget(
+        &connection.llm_base_url,
+        &connection.llm_api_key,
+        request_id,
+    )
+    .await
+    {
+        Some(budget) => Json(json!({ "budget": budget })).into_response(),
+        None => Json(json!({})).into_response(),
+    }
+}
+
 async fn post_chat(State(state): State<AppState>, Json(body): Json<ChatRequest>) -> Response {
     let connection = active_connection(
         &state.connection_file,
@@ -232,17 +264,13 @@ async fn post_chat(State(state): State<AppState>, Json(body): Json<ChatRequest>)
     } else {
         body.model.trim()
     };
-    let thinking_level = body
-        .thinking_level
-        .clone()
-        .unwrap_or_else(|| "medium".into());
     let options = ChatOptions {
         base_url: &connection.llm_base_url,
         api_key: &connection.llm_api_key,
         model,
         messages: &body.messages,
         tools: &body.tools,
-        thinking_level: &thinking_level,
+        thinking: true,
         timeout_ms: body.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
     };
 
@@ -457,7 +485,7 @@ async fn post_ocr(State(state): State<AppState>, Json(body): Json<OcrRequest>) -
         model,
         messages: &messages,
         tools: &[],
-        thinking_level: "off",
+        thinking: false,
         timeout_ms: body.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
     };
     match llm::chat_completions(options).await {
@@ -619,6 +647,7 @@ fn create_router_at(static_dir: Option<PathBuf>, connection_file: PathBuf) -> Ro
         .route("/api/health", get(get_health).post(post_health))
         .route("/api/connection", get(get_connection).post(post_connection).put(put_connection))
         .route("/api/chat", post(post_chat))
+        .route("/api/thinking-budget", post(post_thinking_budget))
         // A page image is base64, which grows it by 4/3, so this one route
         // takes more than the limit that guards every other body.
         .route(
@@ -672,7 +701,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
     use tower::ServiceExt;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
 
     async fn json_request(
@@ -900,7 +929,7 @@ mod tests {
             let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
             assert_eq!(body["tools"][0]["function"]["name"], "search");
             assert_eq!(body["tool_choice"], "auto");
-            assert_eq!(body["reasoning_effort"], "medium");
+            assert!(body.get("reasoning_effort").is_none());
             assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
             assert!(body.get("thinking_budget").is_none());
             ResponseTemplate::new(200).set_body_json(json!({
@@ -927,7 +956,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_forwards_tools_and_thinking_then_returns_tool_calls() {
+    async fn chat_forwards_tools_with_thinking_on_and_leaves_its_strength_to_mtplx() {
         let mtplx = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -949,7 +978,7 @@ mod tests {
                     "type": "function",
                     "function": { "name": "search", "parameters": { "type": "object" } }
                 }],
-                "thinkingLevel": "medium",
+                "thinkingLevel": "low",
                 "thinkingBudget": 2048,
             }),
         )
@@ -1003,7 +1032,6 @@ mod tests {
                 "llmBaseUrl": format!("{}/v1", mtplx.uri()),
                 "llmApiKey": "test-key",
                 "messages": [{ "role": "user", "content": "点検して" }],
-                "thinkingLevel": "medium",
             }),
         )
         .await;
@@ -1013,6 +1041,48 @@ mod tests {
         assert!(!content.contains("hidden"));
         assert_eq!(content, "コメントを付けました。");
         assert_eq!(body["toolCalls"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn thinking_budget_reads_the_mtplx_metrics_of_a_request() {
+        let mtplx = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/metrics"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "recent": [{
+                    "request_id": "chatcmpl-a",
+                    "request_tool_count": 2,
+                    "request_enable_thinking": true,
+                    "thinking_guard": { "enabled": true, "budget_tokens": 2048 }
+                }]
+            })))
+            .mount(&mtplx)
+            .await;
+        let connection = json!({
+            "llmBaseUrl": format!("{}/v1", mtplx.uri()),
+            "llmApiKey": "test-key",
+        });
+
+        let mut asked = connection.clone();
+        asked["requestId"] = json!("chatcmpl-a");
+        let (status, body) =
+            json_request(create_router(None), "POST", "/api/thinking-budget", asked).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "budget": 2048 }));
+
+        let mut missing = connection.clone();
+        missing["requestId"] = json!("chatcmpl-z");
+        let (_, body) =
+            json_request(create_router(None), "POST", "/api/thinking-budget", missing).await;
+        assert_eq!(body, json!({}));
+
+        let mut wrong = connection;
+        wrong["llmApiKey"] = json!("wrong");
+        let (status, body) =
+            json_request(create_router(None), "POST", "/api/thinking-budget", wrong).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({}));
     }
 
     struct JsonAsSseResponder;

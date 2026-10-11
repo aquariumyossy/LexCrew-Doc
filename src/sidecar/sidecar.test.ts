@@ -131,7 +131,55 @@ describe("sidecar", () => {
     expect(res.body.llm.ok).toBe(true);
   });
 
-  it("forwards tools and thinking, then returns tool calls and usage", async () => {
+  it("reads the thinking budget off the MTPLX metrics of a request, with the key", async () => {
+    const auth: string[] = [];
+    let served = 0;
+    const mtplx = await listen((req, res) => {
+      auth.push(String(req.headers.authorization));
+      served += 1;
+      const recent = [
+        {
+          request_id: "chatcmpl-a",
+          request_tool_count: 2,
+          request_enable_thinking: true,
+          thinking_guard: { enabled: true, budget_tokens: 2048 },
+        },
+      ];
+      res.writeHead(req.url === "/metrics" ? 200 : 404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ latest: recent[0], recent: served > 1 ? recent : [] }));
+    });
+    servers.push(mtplx);
+    const app = createApp({ connectionFile: absentConnection });
+    const body = { llmBaseUrl: `${mtplx.url}/v1`, llmApiKey: "test-key" };
+
+    const late = await request(app)
+      .post("/api/thinking-budget")
+      .send({ ...body, requestId: "chatcmpl-a" });
+    expect(late.status).toBe(200);
+    expect(late.body).toEqual({ budget: 2048 });
+    expect(served).toBe(2);
+    expect(auth.every((value) => value === "Bearer test-key")).toBe(true);
+
+    const missing = await request(app)
+      .post("/api/thinking-budget")
+      .send({ ...body, requestId: "chatcmpl-z" });
+    expect(missing.body).toEqual({});
+  });
+
+  it("does not know the thinking budget when MTPLX metrics are out of reach", async () => {
+    const mtplx = await listen((_req, res) => {
+      res.writeHead(401);
+      res.end();
+    });
+    servers.push(mtplx);
+    const res = await request(createApp({ connectionFile: absentConnection }))
+      .post("/api/thinking-budget")
+      .send({ llmBaseUrl: `${mtplx.url}/v1`, llmApiKey: "wrong" });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+  });
+
+  it("forwards tools with thinking on, leaving its strength to MTPLX, then returns tool calls and usage", async () => {
     let seen: Record<string, unknown> | null = null;
     const mtplx = await listen((req, res) => {
       readJsonBody(req, (body) => {
@@ -179,15 +227,15 @@ describe("sidecar", () => {
         model: "qwen3.8-flash-next",
         messages: [{ role: "user", content: "SECRET_PROMPT 本文そのもの" }],
         tools: [{ type: "function", function: { name: "search", parameters: { type: "object" } } }],
-        thinkingLevel: "medium",
+        thinkingLevel: "low",
       });
 
     expect(res.status).toBe(200);
     expect(seen).toMatchObject({
       tool_choice: "auto",
-      reasoning_effort: "medium",
       chat_template_kwargs: { enable_thinking: true },
     });
+    expect(seen).not.toHaveProperty("reasoning_effort");
     expect(seen).not.toHaveProperty("thinking_budget");
     expect((seen as { chat_template_kwargs: object }).chat_template_kwargs).not.toHaveProperty(
       "thinking_budget"
@@ -244,7 +292,6 @@ describe("sidecar", () => {
         llmBaseUrl: `${mtplx.url}/v1`,
         llmApiKey: "test-key",
         messages: [{ role: "user", content: "点検して" }],
-        thinkingLevel: "medium",
       });
 
     expect(res.status).toBe(200);

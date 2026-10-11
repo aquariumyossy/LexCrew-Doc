@@ -1,76 +1,63 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_THINKING_BUDGET, MIN_THINKING_BUDGET } from "./constants";
-import {
-  looksLikeFormatInstruction,
-  normalizeFormatThinkingLevel,
-  normalizeThinkingBudget,
-  normalizeThinkingLevel,
-  normalizeThinkingRetryLevel,
-  resolveFormatThinking,
-  thinkingAfterCut,
-  thinkingFields,
-} from "./thinking";
+import { budgetFromMetrics, runawayThinkingChars, thinkingFields } from "./thinking";
+
+const toolCall = { request_tool_count: 3, request_enable_thinking: true };
+const guarded = (id: string, budget: number) => ({
+  ...toolCall,
+  request_id: id,
+  thinking_guard: { enabled: true, budget_tokens: budget, think_tokens: 900, engaged: null },
+});
+const unguarded = (id: string) => ({ ...toolCall, request_id: id, thinking_guard: {} });
+
+describe("budgetFromMetrics", () => {
+  it("reads the budget off the record of the request", () => {
+    const metrics = {
+      latest: guarded("b", 4096),
+      recent: [guarded("a", 2048), guarded("b", 4096)],
+    };
+    expect(budgetFromMetrics(metrics, "a")).toBe(2048);
+  });
+
+  it("says no budget is set when a tool call with thinking went unguarded", () => {
+    expect(budgetFromMetrics({ recent: [unguarded("a")] }, "a")).toBeNull();
+  });
+
+  it("does not know when the record is missing or the guard never covered it", () => {
+    expect(budgetFromMetrics({ recent: [guarded("a", 2048)] }, "z")).toBeUndefined();
+    const plain = {
+      request_id: "a",
+      request_tool_count: 0,
+      request_enable_thinking: true,
+      thinking_guard: {},
+    };
+    expect(budgetFromMetrics({ recent: [plain] }, "a")).toBeUndefined();
+    expect(budgetFromMetrics("not metrics", "a")).toBeUndefined();
+  });
+
+  it("takes the newest covered request when none is named", () => {
+    const plain = { request_id: "c", request_tool_count: 0, thinking_guard: {} };
+    expect(budgetFromMetrics({ recent: [guarded("a", 2048), unguarded("b"), plain] })).toBeNull();
+    expect(budgetFromMetrics({ recent: [unguarded("a"), guarded("b", 2048), plain] })).toBe(2048);
+    expect(budgetFromMetrics({ recent: [] })).toBeUndefined();
+  });
+});
 
 describe("thinkingFields", () => {
-  it("sends medium effort and no budget, which MTPLX does not read", () => {
-    expect(thinkingFields("medium")).toEqual({
-      reasoning_effort: "medium",
-      chat_template_kwargs: { enable_thinking: true },
-    });
+  it("turns thinking on and leaves its strength to MTPLX", () => {
+    expect(thinkingFields(true)).toEqual({ chat_template_kwargs: { enable_thinking: true } });
   });
 
-  it("maps the high level to xhigh", () => {
-    expect(thinkingFields("high").reasoning_effort).toBe("xhigh");
-  });
-
-  it("disables thinking only when the user picks off", () => {
-    expect(thinkingFields("off")).toEqual({
-      chat_template_kwargs: { enable_thinking: false },
-    });
+  it("turns thinking off for calls that do not reason", () => {
+    expect(thinkingFields(false)).toEqual({ chat_template_kwargs: { enable_thinking: false } });
   });
 });
 
-describe("normalizeThinkingBudget", () => {
-  it("falls back to the default budget and enforces a floor", () => {
-    expect(normalizeThinkingBudget(0)).toBe(DEFAULT_THINKING_BUDGET);
-    expect(normalizeThinkingBudget(8)).toBe(MIN_THINKING_BUDGET);
-  });
-});
-
-describe("thinkingAfterCut", () => {
-  it("steps down to the retry level, and to no thinking from low or below it", () => {
-    expect(thinkingAfterCut("high", "low")).toBe("low");
-    expect(thinkingAfterCut("medium", "low")).toBe("low");
-    expect(thinkingAfterCut("low", "low")).toBe("off");
-    expect(thinkingAfterCut("medium", "off")).toBe("off");
+describe("runawayThinkingChars", () => {
+  it("leaves room above the MTPLX budget for its densest observed thinking", () => {
+    expect(runawayThinkingChars(2048)).toBe(16_384);
   });
 
-  it("retries at low unless the setting says otherwise", () => {
-    expect(normalizeThinkingRetryLevel(undefined)).toBe("low");
-    expect(normalizeThinkingRetryLevel("medium")).toBe("low");
-    expect(normalizeThinkingRetryLevel("off")).toBe("off");
-  });
-});
-
-describe("normalizeThinkingLevel", () => {
-  it("falls back to medium for unknown values", () => {
-    expect(normalizeThinkingLevel("xhigh")).toBe("medium");
-    expect(normalizeThinkingLevel(undefined)).toBe("medium");
-    expect(normalizeThinkingLevel("off")).toBe("off");
-  });
-});
-
-describe("format thinking", () => {
-  it("stays on the chat level until the user picks another", () => {
-    expect(normalizeFormatThinkingLevel(undefined)).toBe("same");
-    expect(normalizeFormatThinkingLevel("nope")).toBe("same");
-    expect(normalizeFormatThinkingLevel("low")).toBe("low");
-    expect(resolveFormatThinking("same", "medium")).toBe("medium");
-    expect(resolveFormatThinking("off", "medium")).toBe("off");
-  });
-
-  it("notices a formatting instruction and ignores a drafting one", () => {
-    expect(looksLikeFormatInstruction("見出しを太字にして行間を詰めて")).toBe(true);
-    expect(looksLikeFormatInstruction("第3条を短くして")).toBe(false);
+  it("falls back to 3072 tokens when MTPLX shows no budget", () => {
+    expect(runawayThinkingChars(null)).toBe(24_576);
   });
 });

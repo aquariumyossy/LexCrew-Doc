@@ -25,6 +25,7 @@ import {
   readDocumentText,
   readParagraphs,
   replaceParagraphs,
+  turnSource,
   replaceQuote,
   replaceSelection,
 } from "./word";
@@ -1579,6 +1580,7 @@ describe("replaceParagraphs", () => {
       keptPictures: 0,
       shapes: [1, 2],
       unmatchedShapes: [],
+      sourceText: "調査物件の住所\n\n調査日時\n住所：東京都\n日時：令和8年",
       numbers: [
         { number: 8, text: "第１　調査物件" },
         { number: 9, text: "東京都" },
@@ -1708,6 +1710,55 @@ describe("replaceParagraphs", () => {
       [false, 36, 0],
       [false, 36, 12],
     ]);
+  });
+
+  it("replaces paragraphs it inserted earlier in the turn when the new text repeats their first line", async () => {
+    const { word } = form();
+    await readDocumentText(10_000);
+    await replaceParagraphs(
+      2,
+      4,
+      outline([0, "第１　調査物件"], [4, "架空の住所"], [0, "第２　調査日時"], [4, "令和元年"]),
+      format
+    );
+    const deleted: string[] = [];
+    for (const paragraph of word.paragraphs) {
+      const original = paragraph.delete;
+      paragraph.delete = () => {
+        deleted.push(paragraph.text.replace(/\r$/, ""));
+        original();
+      };
+    }
+
+    const span = await replaceParagraphs(
+      8,
+      11,
+      outline([0, "第１　調査物件"], [4, "東京都"], [0, "第２　調査日時"], [4, "令和8年"]),
+      format
+    );
+
+    expect(deleted).toEqual(["令和元年", "第２　調査日時", "架空の住所", "第１　調査物件"]);
+    expect(word.paragraphs.slice(8, 12).map((p) => p.text.replace(/\r$/, ""))).toEqual([
+      "第１　調査物件",
+      "東京都",
+      "第２　調査日時",
+      "令和8年",
+    ]);
+    expect(span).toMatchObject({
+      from: 8,
+      through: 11,
+      firstText: "第１　調査物件",
+      lastText: "令和元年",
+    });
+  });
+
+  it("keeps the whole body and every box as the turn's source, past the attachment budget", async () => {
+    form();
+    const attached = await readDocumentText(40);
+    expect(attached.truncated).toBe(true);
+    expect(turnSource()).toBe(
+      "報告書\n調査物件の住所\n\n調査日時\n\n写真\n\n住所：東京都\n日時：令和8年\n写真の説明"
+    );
   });
 
   it("says the new text is in when the old span cannot be removed", async () => {
@@ -2649,6 +2700,29 @@ describe("numbers handed out by an insert", () => {
     await formatList({ action: "apply", paragraph: 2, quote: "", style: "arabic" });
     expect(word.paragraphs[2].isListItem).toBe(true);
     expect(word.paragraphs[2].text.replaceAll("\r", "")).toBe("第2条とする。");
+  });
+
+  it("deletes the inserted paragraph, not the attached one with the same text", async () => {
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["甲とする。", "乙とする。", "丙とする。"],
+    });
+    await readDocumentText(1_000);
+    const landing = await insertDraftParagraphs(specs("丙とする。"), "cursor", "", 1);
+    expect(landing.numbers).toEqual([{ number: 4, text: "丙とする。" }]);
+    const deleted: number[] = [];
+    word.paragraphs.forEach((paragraph, index) => {
+      const original = paragraph.delete;
+      paragraph.delete = () => {
+        deleted.push(index);
+        original();
+      };
+    });
+
+    await deleteParagraphs({ paragraphs: [4] });
+
+    expect(deleted).toEqual([1]);
   });
 
   it("keeps the insert when numbering fails, and hands out nothing", async () => {

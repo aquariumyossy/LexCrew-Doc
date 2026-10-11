@@ -484,6 +484,7 @@ function replaceParagraphsTool(): ToolDefinition {
         "節や様式の本文をまとめて書き直すとき、テキストボックスの中身を本文に起こすときは、" +
         "insert_blocks・delete_paragraphs・delete_shape を繰り返さず、これを 1 回呼ぶ。" +
         `一度に消せるのは ${MAX_REPLACE_PARAGRAPHS} 段落まで。` +
+        "数字・カタカナ・英字の語は添付の本文と図形節から写す。どこにもない語があると、一度は書き込まずに返る。" +
         "blocks の書き方は insert_blocks と同じ。" +
         OUTLINE_BLOCK_HINT +
         "結果に、消した範囲の先頭と末尾、入れた段落の番号 [12] が返る。",

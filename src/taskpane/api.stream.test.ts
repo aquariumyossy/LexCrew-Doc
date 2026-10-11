@@ -6,7 +6,6 @@ const body: ChatBody = {
   llmApiKey: "k",
   model: "qwen3.8-flash-next",
   messages: [{ role: "user", content: "点検して" }],
-  thinkingLevel: "medium",
   timeoutMs: 180000,
 };
 

@@ -61,16 +61,6 @@ import { ConversationSummary, NewMessage, StoredMessage } from "../../shared/his
 import { joinArgosScopes, parseArgosScopes } from "../../shared/argos";
 import { systemPrompt } from "../../shared/prompts";
 import {
-  FORMAT_THINKING_LEVELS,
-  FORMAT_THINKING_LABELS,
-  THINKING_LEVELS,
-  THINKING_LEVEL_LABELS,
-  THINKING_RETRY_LEVELS,
-  ThinkingLevel,
-  normalizeFormatThinkingLevel,
-  normalizeThinkingRetryLevel,
-} from "../../shared/thinking";
-import {
   TOOL_ROUND_PRESETS,
   normalizeMaxToolRounds,
   toolRoundPresetLabel,
@@ -92,6 +82,7 @@ import {
 } from "../api";
 import { estimateTokens, messagesTokens, toChatMessages } from "../chat/context";
 import { runTurn } from "../chat/runTurn";
+import { forgetThinkingBudget, readThinkingBudget } from "../chat/thinkingBudget";
 import { applyAdopt } from "../connectionState";
 import { FONT_CHOICES, Settings, clampTimeoutMs, loadSettings, saveSettings, setKeepConnectionInStorage } from "../settings";
 import { UiFontSize, applyUiFont, normalizeUiFontSize, readUiFontScale, uiPx } from "../uiFont";
@@ -542,7 +533,15 @@ const App: React.FC = () => {
         saveSettings(preferred);
         setSettings(preferred);
       }
+      forgetThinkingBudget();
       if (result.llm?.ok) {
+        const budget = await readThinkingBudget(target);
+        const thinking =
+          budget === undefined
+            ? " 思考の上限は、最初の指示のあとに MTPLX の記録から確かめます。"
+            : budget === null
+              ? " MTPLX に思考の上限（--agent-thinking-budget）が設定されていません。思考が長引くことがあります。"
+              : ` 思考の上限は MTPLX の記録で ${budget} トークンです。`;
         const searx = result.searxng
           ? result.searxng.ok
             ? " SearXNG も応答しました。"
@@ -557,10 +556,12 @@ const App: React.FC = () => {
             ? " Argos の確認結果が返りませんでした。トレイ常駐または npm start を起動し直してください。"
             : " Argos URL が空のため索引検索は使えません。";
         const warning =
-          (result.searxng && !result.searxng.ok) || Boolean(argosUrl && !result.argos?.ok);
+          (result.searxng && !result.searxng.ok) ||
+          Boolean(argosUrl && !result.argos?.ok) ||
+          budget === null;
         setBanner({
           intent: warning ? "warning" : "success",
-          text: `MTPLX に接続できました。モデル ${nextModels.length} 件。${searx}${argos}`,
+          text: `MTPLX に接続できました。モデル ${nextModels.length} 件。${thinking}${searx}${argos}`,
         });
       } else {
         setBanner({
@@ -1339,55 +1340,6 @@ const App: React.FC = () => {
                 </Field>
                 <Field
                   size="small"
-                  label="思考レベル"
-                  hint="既定は中。オフは推奨しません（ツール呼び出しが不安定になります）。"
-                >
-                  <RadioGroup
-                    layout="horizontal"
-                    value={settings.thinkingLevel}
-                    onChange={(_, d) => patch({ thinkingLevel: d.value as ThinkingLevel })}
-                  >
-                    {THINKING_LEVELS.map((level) => (
-                      <Radio key={level} value={level} label={THINKING_LEVEL_LABELS[level]} />
-                    ))}
-                  </RadioGroup>
-                </Field>
-                <Field
-                  size="small"
-                  label="書式のときの思考"
-                  hint="書式の作業だけ、この思考レベルにします。既定は上と同じです。オフは推奨しません。"
-                >
-                  <RadioGroup
-                    layout="horizontal"
-                    value={settings.formatThinkingLevel}
-                    onChange={(_, d) =>
-                      patch({ formatThinkingLevel: normalizeFormatThinkingLevel(d.value) })
-                    }
-                  >
-                    {FORMAT_THINKING_LEVELS.map((level) => (
-                      <Radio key={level} value={level} label={FORMAT_THINKING_LABELS[level]} />
-                    ))}
-                  </RadioGroup>
-                </Field>
-                <Field
-                  size="small"
-                  label="打ち切り後の思考"
-                  hint="思考トークン予算を超えて打ち切った呼び出しを、この思考レベルで送り直します。既定は低。低は送り直しの読み込みに少し時間がかかります。"
-                >
-                  <RadioGroup
-                    layout="horizontal"
-                    value={settings.thinkingRetryLevel}
-                    onChange={(_, d) =>
-                      patch({ thinkingRetryLevel: normalizeThinkingRetryLevel(d.value) })
-                    }
-                  >
-                    {THINKING_RETRY_LEVELS.map((level) => (
-                      <Radio key={level} value={level} label={THINKING_LEVEL_LABELS[level]} />
-                    ))}
-                  </RadioGroup>
-                </Field>
-                <Field
-                  size="small"
                   label="ツール往復の上限"
                   hint="1 回の指示あたり。コメントが多い点検は 32 か制限なし。上限に達するとチャットに知らせます。止まらなければキャンセルしてください。"
                 >
@@ -1405,44 +1357,23 @@ const App: React.FC = () => {
                     ))}
                   </RadioGroup>
                 </Field>
-                <div className={dialog.row}>
-                  <Field
+                <Field
+                  size="small"
+                  label="コンテキスト上限"
+                  hint="トークン。超える分は古い順に落とします。"
+                >
+                  <Input
                     size="small"
-                    label="思考トークン予算"
-                    style={{ flex: 1 }}
-                    hint="超えた思考は打ち切り、「打ち切り後の思考」で送り直します。"
-                  >
-                    <Input
-                      size="small"
-                      type="number"
-                      value={String(settings.thinkingBudget)}
-                      onChange={(_, d) => {
-                        const n = Number(d.value);
-                        patch({
-                          thinkingBudget: Number.isFinite(n) && n > 0 ? n : settings.thinkingBudget,
-                        });
-                      }}
-                    />
-                  </Field>
-                  <Field
-                    size="small"
-                    label="コンテキスト上限"
-                    style={{ flex: 1 }}
-                    hint="トークン。超える分は古い順に落とします。"
-                  >
-                    <Input
-                      size="small"
-                      type="number"
-                      value={String(settings.contextLimit)}
-                      onChange={(_, d) => {
-                        const n = Number(d.value);
-                        patch({
-                          contextLimit: Number.isFinite(n) && n > 0 ? n : settings.contextLimit,
-                        });
-                      }}
-                    />
-                  </Field>
-                </div>
+                    type="number"
+                    value={String(settings.contextLimit)}
+                    onChange={(_, d) => {
+                      const n = Number(d.value);
+                      patch({
+                        contextLimit: Number.isFinite(n) && n > 0 ? n : settings.contextLimit,
+                      });
+                    }}
+                  />
+                </Field>
                 <Field
                   size="small"
                   label="本文フォント"

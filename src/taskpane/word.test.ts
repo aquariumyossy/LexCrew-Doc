@@ -1710,6 +1710,41 @@ describe("replaceParagraphs", () => {
     ]);
   });
 
+  it("replaces paragraphs it inserted earlier in the turn when the new text repeats their first line", async () => {
+    const { word } = form();
+    await readDocumentText(10_000);
+    await replaceParagraphs(
+      2,
+      4,
+      outline([0, "第１　調査物件"], [4, "架空の住所"], [0, "第２　調査日時"], [4, "令和元年"]),
+      format
+    );
+    const deleted: string[] = [];
+    for (const paragraph of word.paragraphs) {
+      const original = paragraph.delete;
+      paragraph.delete = () => {
+        deleted.push(paragraph.text.replace(/\r$/, ""));
+        original();
+      };
+    }
+
+    const span = await replaceParagraphs(
+      8,
+      11,
+      outline([0, "第１　調査物件"], [4, "東京都"], [0, "第２　調査日時"], [4, "令和8年"]),
+      format
+    );
+
+    expect(deleted).toEqual(["令和元年", "第２　調査日時", "架空の住所", "第１　調査物件"]);
+    expect(word.paragraphs.slice(8, 12).map((p) => p.text.replace(/\r$/, ""))).toEqual([
+      "第１　調査物件",
+      "東京都",
+      "第２　調査日時",
+      "令和8年",
+    ]);
+    expect(span).toMatchObject({ from: 8, through: 11, firstText: "第１　調査物件", lastText: "令和元年" });
+  });
+
   it("says the new text is in when the old span cannot be removed", async () => {
     const { word } = form();
     await readDocumentText(10_000);

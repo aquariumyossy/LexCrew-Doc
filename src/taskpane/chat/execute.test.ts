@@ -12,8 +12,12 @@ const setOutlineLevel = vi.hoisted(() => vi.fn());
 const applyFormat = vi.hoisted(() => vi.fn());
 const replaceAll = vi.hoisted(() => vi.fn());
 const copyFormat = vi.hoisted(() => vi.fn());
+const replaceParagraphs = vi.hoisted(() => vi.fn());
+const turnSource = vi.hoisted(() => vi.fn((): string | null => null));
 
 vi.mock("../word", () => ({
+  replaceParagraphs,
+  turnSource,
   insertDraftParagraphs,
   insertBlankBefore,
   getSelectionInfo: vi.fn(),
@@ -384,5 +388,82 @@ describe("foreign Han in tool arguments", () => {
     expect(result.numbered).toBeUndefined();
     expect(result.content).toContain("第1条（目的）");
     expect(insertBlankBefore).toHaveBeenCalledWith([4]);
+  });
+});
+
+describe("replace_paragraphs facts", () => {
+  const rewrite = (...texts: string[]) => ({
+    id: "c1",
+    type: "function" as const,
+    function: {
+      name: "replace_paragraphs",
+      arguments: JSON.stringify({
+        paragraph: 1,
+        through: 3,
+        blocks: texts.map((text) => ({ type: "outline", level: 2, text })),
+      }),
+    },
+  });
+  const run = (call: ReturnType<typeof rewrite>, userMessagesText = "") =>
+    executeToolCall(call, DEFAULT_SETTINGS, new AbortController().signal, { userMessagesText });
+
+  beforeEach(() => {
+    beginToolTurn();
+    replaceParagraphs.mockReset();
+    replaceParagraphs.mockResolvedValue({
+      from: 1,
+      through: 3,
+      firstText: "調査物件の住所",
+      lastText: "日時",
+      removed: 3,
+      keptPictures: 0,
+      shapes: [],
+      unmatchedShapes: [],
+      numbers: [{ number: 8, text: "（１）住所：大鋸1034-3" }],
+    });
+    turnSource.mockReturnValue(
+      "調査物件の住所\n住　所：神奈川県藤沢市大鋸1034-3\n電気：16897.5kWh"
+    );
+  });
+
+  it("writes nothing and names the facts the document does not have", async () => {
+    const result = await run(rewrite("（１）住所：用田593番地", "（２）電気：1234.5kWh"));
+    expect(result).toEqual({
+      ok: false,
+      content:
+        "エラー: 書き込んでいません。添付の本文・図形・利用者の発言のどこにもない数字や語があります（593、1234.5）。" +
+        "添付から書き直してください。意図して足した語なら、同じ語のまま送り直せば書き込みます。",
+    });
+    expect(replaceParagraphs).not.toHaveBeenCalled();
+
+    const sourced = await run(rewrite("（１）住所：大鋸1034-3", "（２）電気：16897.5kWh"));
+    expect(sourced.ok).toBe(true);
+    expect(replaceParagraphs.mock.calls[0].slice(0, 2)).toEqual([1, 3]);
+  });
+
+  it("writes a refused fact sent again, and says so in the result", async () => {
+    await run(rewrite("（１）住所：用田593番地"));
+    const again = await run(rewrite("（１）住所：用田593番地"));
+    expect(again.ok).toBe(true);
+    expect(replaceParagraphs).toHaveBeenCalledTimes(1);
+    expect(again.content).toContain(
+      "\n原文にない語（593）は、送り直されたので意図した追加として書き込みました。返事で利用者に伝えてください。"
+    );
+  });
+
+  it("takes facts from what the user wrote", async () => {
+    const result = await run(
+      rewrite("（１）調査日：令和8年10月1日"),
+      "調査日は令和8年10月1日にして"
+    );
+    expect(result.ok).toBe(true);
+    expect(replaceParagraphs).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not check when the turn has no source to check against", async () => {
+    turnSource.mockReturnValue(null);
+    const result = await run(rewrite("（１）住所：用田593番地"));
+    expect(result.ok).toBe(true);
+    expect(result.content).not.toContain("原文にない語");
   });
 });

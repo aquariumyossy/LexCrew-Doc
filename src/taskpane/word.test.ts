@@ -25,6 +25,7 @@ import {
   readDocumentText,
   readParagraphs,
   replaceParagraphs,
+  turnSource,
   replaceQuote,
   replaceSelection,
 } from "./word";
@@ -1742,7 +1743,21 @@ describe("replaceParagraphs", () => {
       "第２　調査日時",
       "令和8年",
     ]);
-    expect(span).toMatchObject({ from: 8, through: 11, firstText: "第１　調査物件", lastText: "令和元年" });
+    expect(span).toMatchObject({
+      from: 8,
+      through: 11,
+      firstText: "第１　調査物件",
+      lastText: "令和元年",
+    });
+  });
+
+  it("keeps the whole body and every box as the turn's source, past the attachment budget", async () => {
+    form();
+    const attached = await readDocumentText(40);
+    expect(attached.truncated).toBe(true);
+    expect(turnSource()).toBe(
+      "報告書\n調査物件の住所\n\n調査日時\n\n写真\n\n住所：東京都\n日時：令和8年\n写真の説明"
+    );
   });
 
   it("says the new text is in when the old span cannot be removed", async () => {
@@ -2687,7 +2702,11 @@ describe("numbers handed out by an insert", () => {
   });
 
   it("deletes the inserted paragraph, not the attached one with the same text", async () => {
-    const word = installWord({ selection: "", body: "", paragraphs: ["甲とする。", "乙とする。", "丙とする。"] });
+    const word = installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["甲とする。", "乙とする。", "丙とする。"],
+    });
     await readDocumentText(1_000);
     const landing = await insertDraftParagraphs(specs("丙とする。"), "cursor", "", 1);
     expect(landing.numbers).toEqual([{ number: 4, text: "丙とする。" }]);

@@ -509,7 +509,8 @@ mod tests {
                     "completionTokens": 4,
                     "totalTokens": 14,
                     "reasoningTokens": 2,
-                    "thinkingCuts": 2
+                    "thinkingCuts": 2,
+                    "finishReason": "stop"
                 })),
                 ..Default::default()
             },
@@ -526,6 +527,7 @@ mod tests {
         assert_eq!(detail.messages[1].reasoning_content, "内部の検討");
         assert_eq!(detail.messages[1].usage.as_ref().unwrap().total_tokens, 14);
         assert_eq!(detail.messages[1].usage.as_ref().unwrap().thinking_cuts, 2);
+        assert_eq!(detail.messages[1].usage.as_ref().unwrap().finish_reason, "stop");
     }
 
     #[test]

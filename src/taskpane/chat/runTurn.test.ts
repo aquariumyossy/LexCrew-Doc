@@ -356,7 +356,47 @@ describe("runTurn", () => {
     expect(sent.at(-1)).toMatchObject({
       role: "assistant",
       content: "答えました。",
-      usage: { ...usage, thinkingCuts: 2 },
+      usage: { ...usage, thinkingCuts: 2, finishReason: "stop" },
+    });
+  });
+
+  it("stops the turn when the resent low call still thinks past four budgets", async () => {
+    const budget = 100;
+    chatStream.mockReset();
+    chatStream.mockImplementation(async (_body: unknown, opts: StreamOptions) => {
+      opts.onDelta?.({ content: "", reasoningContent: "考".repeat(budget * 8) });
+      opts.signal?.throwIfAborted();
+      return completion({ content: "書きました。" });
+    });
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      await expect(
+        runTurn({
+          settings: { ...settings, thinkingBudget: budget, thinkingRetryLevel: "low" },
+          instruction: "調べて",
+          attachment: attach(""),
+          history: [],
+          signal: new AbortController().signal,
+          onMessage: () => undefined,
+        })
+      ).rejects.toThrow(
+        "思考が 800 字に達しても答えが出ないため止めました。指示を分けて送り直してください。"
+      );
+    } finally {
+      info.mockRestore();
+    }
+    const levels = chatStream.mock.calls.map((call) => (call[0] as { thinkingLevel: string }).thinkingLevel);
+    expect(levels).toEqual(["medium", "low", "low"]);
+  });
+
+  it("says so when the model ends with neither text nor a tool call", async () => {
+    chatStream.mockReset();
+    chatStream.mockResolvedValue(completion({ content: "", finishReason: "stop" }));
+    const { sent } = await run("書き直して");
+    expect(sent.at(-1)).toEqual({
+      role: "assistant",
+      content:
+        "モデルが本文も操作も返さずに終わりました（終了理由: stop）。もう一度送るか、指示を分けてください。",
     });
   });
 

@@ -11,7 +11,10 @@ const unguarded = (id: string) => ({ ...toolCall, request_id: id, thinking_guard
 
 describe("budgetFromMetrics", () => {
   it("reads the budget off the record of the request", () => {
-    const metrics = { latest: guarded("b", 4096), recent: [guarded("a", 2048), guarded("b", 4096)] };
+    const metrics = {
+      latest: guarded("b", 4096),
+      recent: [guarded("a", 2048), guarded("b", 4096)],
+    };
     expect(budgetFromMetrics(metrics, "a")).toBe(2048);
   });
 
@@ -21,7 +24,12 @@ describe("budgetFromMetrics", () => {
 
   it("does not know when the record is missing or the guard never covered it", () => {
     expect(budgetFromMetrics({ recent: [guarded("a", 2048)] }, "z")).toBeUndefined();
-    const plain = { request_id: "a", request_tool_count: 0, request_enable_thinking: true, thinking_guard: {} };
+    const plain = {
+      request_id: "a",
+      request_tool_count: 0,
+      request_enable_thinking: true,
+      thinking_guard: {},
+    };
     expect(budgetFromMetrics({ recent: [plain] }, "a")).toBeUndefined();
     expect(budgetFromMetrics("not metrics", "a")).toBeUndefined();
   });

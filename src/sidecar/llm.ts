@@ -1,7 +1,7 @@
 import { DEFAULT_MODEL, DEFAULT_TIMEOUT_MS } from "../shared/constants";
 import { MAX_OCR_PAGE_CHARS, OCR_PROMPT } from "../shared/ocr";
 import { Completion, parseCompletion } from "../shared/stripThinking";
-import { thinkingFields } from "../shared/thinking";
+import { budgetFromMetrics, thinkingFields } from "../shared/thinking";
 import { ToolDefinition } from "../shared/tools";
 import { logError, logInfo } from "./logger";
 import { ChatMessage, HealthResult } from "./types";
@@ -123,6 +123,41 @@ export function pickDefaultModel(ids: string[], preferred = DEFAULT_MODEL): stri
     return candidate.includes(normalized) || normalized.includes(candidate);
   });
   return fuzzy || preferred;
+}
+
+const METRICS_TIMEOUT_MS = 5_000;
+/** MTPLX files a request's record as the reply ends, which can trail the last SSE chunk. */
+const METRICS_RECORD_LAG_MS = 300;
+
+async function fetchMetrics(origin: string, apiKey: string): Promise<unknown> {
+  const res = await fetch(`${origin}/metrics`, {
+    method: "GET",
+    headers: authHeaders(apiKey),
+    signal: AbortSignal.timeout(METRICS_TIMEOUT_MS),
+  });
+  logInfo("llm metrics", { status: res.status });
+  return res.ok ? ((await res.json()) as unknown) : undefined;
+}
+
+/** The thinking budget MTPLX applied: tokens, null when none is set, undefined when unknown. */
+export async function readThinkingBudget(
+  baseUrl: string,
+  apiKey: string,
+  requestId?: string
+): Promise<number | null | undefined> {
+  try {
+    const { origin } = splitLlmBase(baseUrl);
+    const key = (apiKey || "").trim();
+    const budget = budgetFromMetrics(await fetchMetrics(origin, key), requestId);
+    if (budget !== undefined || requestId === undefined) {
+      return budget;
+    }
+    await new Promise((resolve) => setTimeout(resolve, METRICS_RECORD_LAG_MS));
+    return budgetFromMetrics(await fetchMetrics(origin, key), requestId);
+  } catch (error) {
+    logError("llm metrics failed", { name: error instanceof Error ? error.name : "error" });
+    return undefined;
+  }
 }
 
 export async function checkLlmHealth(

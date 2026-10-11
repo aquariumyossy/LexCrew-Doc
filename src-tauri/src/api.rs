@@ -54,6 +54,17 @@ pub struct ChatRequest {
 }
 
 #[derive(Debug, Default, Deserialize)]
+pub struct ThinkingBudgetRequest {
+    #[serde(default, rename = "llmBaseUrl")]
+    pub llm_base_url: String,
+    #[serde(default, rename = "llmApiKey")]
+    pub llm_api_key: String,
+    /// The `id` of a streamed reply; without it the newest MTPLX record decides.
+    #[serde(default, rename = "requestId")]
+    pub request_id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct SearchRequest {
     #[serde(default, rename = "searxngUrl")]
     pub searxng_url: String,
@@ -215,6 +226,29 @@ async fn forward_mtplx_stream(upstream: reqwest::Response) -> Response {
             "MTPLX への問い合わせに失敗しました。",
             None,
         ),
+    }
+}
+
+async fn post_thinking_budget(
+    State(state): State<AppState>,
+    Json(body): Json<ThinkingBudgetRequest>,
+) -> Response {
+    let connection = active_connection(
+        &state.connection_file,
+        &body.llm_base_url,
+        &body.llm_api_key,
+        "",
+    );
+    let request_id = Some(body.request_id.trim()).filter(|id| !id.is_empty());
+    match llm::read_thinking_budget(
+        &connection.llm_base_url,
+        &connection.llm_api_key,
+        request_id,
+    )
+    .await
+    {
+        Some(budget) => Json(json!({ "budget": budget })).into_response(),
+        None => Json(json!({})).into_response(),
     }
 }
 
@@ -613,6 +647,7 @@ fn create_router_at(static_dir: Option<PathBuf>, connection_file: PathBuf) -> Ro
         .route("/api/health", get(get_health).post(post_health))
         .route("/api/connection", get(get_connection).post(post_connection).put(put_connection))
         .route("/api/chat", post(post_chat))
+        .route("/api/thinking-budget", post(post_thinking_budget))
         // A page image is base64, which grows it by 4/3, so this one route
         // takes more than the limit that guards every other body.
         .route(

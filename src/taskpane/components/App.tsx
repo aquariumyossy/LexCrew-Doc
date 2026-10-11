@@ -82,6 +82,7 @@ import {
 } from "../api";
 import { estimateTokens, messagesTokens, toChatMessages } from "../chat/context";
 import { runTurn } from "../chat/runTurn";
+import { forgetThinkingBudget, readThinkingBudget } from "../chat/thinkingBudget";
 import { applyAdopt } from "../connectionState";
 import { FONT_CHOICES, Settings, clampTimeoutMs, loadSettings, saveSettings, setKeepConnectionInStorage } from "../settings";
 import { UiFontSize, applyUiFont, normalizeUiFontSize, readUiFontScale, uiPx } from "../uiFont";
@@ -532,7 +533,15 @@ const App: React.FC = () => {
         saveSettings(preferred);
         setSettings(preferred);
       }
+      forgetThinkingBudget();
       if (result.llm?.ok) {
+        const budget = await readThinkingBudget(target);
+        const thinking =
+          budget === undefined
+            ? " 思考の上限は、最初の指示のあとに MTPLX の記録から確かめます。"
+            : budget === null
+              ? " MTPLX に思考の上限（--agent-thinking-budget）が設定されていません。思考が長引くことがあります。"
+              : ` 思考の上限は MTPLX の記録で ${budget} トークンです。`;
         const searx = result.searxng
           ? result.searxng.ok
             ? " SearXNG も応答しました。"
@@ -547,10 +556,12 @@ const App: React.FC = () => {
             ? " Argos の確認結果が返りませんでした。トレイ常駐または npm start を起動し直してください。"
             : " Argos URL が空のため索引検索は使えません。";
         const warning =
-          (result.searxng && !result.searxng.ok) || Boolean(argosUrl && !result.argos?.ok);
+          (result.searxng && !result.searxng.ok) ||
+          Boolean(argosUrl && !result.argos?.ok) ||
+          budget === null;
         setBanner({
           intent: warning ? "warning" : "success",
-          text: `MTPLX に接続できました。モデル ${nextModels.length} 件。${searx}${argos}`,
+          text: `MTPLX に接続できました。モデル ${nextModels.length} 件。${thinking}${searx}${argos}`,
         });
       } else {
         setBanner({

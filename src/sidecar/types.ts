@@ -59,6 +59,13 @@ export type HealthRequestBody = {
   argosApiKey?: string;
 };
 
+export type ThinkingBudgetRequestBody = {
+  llmBaseUrl?: string;
+  llmApiKey?: string;
+  /** The `id` of a streamed reply; without it the newest MTPLX record decides. */
+  requestId?: string;
+};
+
 export type SearchRequestBody = {
   searxngUrl?: string;
   q?: string;

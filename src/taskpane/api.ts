@@ -138,6 +138,28 @@ export async function checkHealth(
   return data;
 }
 
+/** The thinking budget MTPLX applied: tokens, null when none is set, undefined when unknown. */
+export async function fetchThinkingBudget(body: {
+  llmBaseUrl: string;
+  llmApiKey: string;
+  requestId?: string;
+}): Promise<number | null | undefined> {
+  try {
+    const res = await fetch("/api/thinking-budget", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const { budget } = (await res.json()) as { budget?: unknown };
+    if (budget === null) {
+      return null;
+    }
+    return typeof budget === "number" ? budget : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export type ChatBody = {
   llmBaseUrl: string;
   llmApiKey: string;

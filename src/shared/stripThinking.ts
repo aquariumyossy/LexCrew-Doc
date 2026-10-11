@@ -31,6 +31,8 @@ export type Completion = {
   toolCalls: ToolCall[];
   finishReason: string;
   usage: Usage | null;
+  /** The id MTPLX files the request's metrics under; streamed replies only. */
+  requestId?: string;
 };
 
 function readString(row: Record<string, unknown> | undefined, key: string): string {

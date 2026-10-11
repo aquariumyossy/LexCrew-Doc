@@ -8,7 +8,7 @@ import {
 } from "../../shared/prompts";
 import { joinArgosScopes } from "../../shared/argos";
 import { Usage } from "../../shared/stripThinking";
-import { runawayThinkingChars } from "../../shared/thinking";
+import { THINKING_BUDGET_UNSET_NOTICE, runawayThinkingChars } from "../../shared/thinking";
 import {
   UNLIMITED_TOOL_ROUNDS,
   buildTools,
@@ -22,6 +22,7 @@ import { Settings } from "../settings";
 import { documentHasVisibleText, isWordHost } from "../word";
 import { fitContext, indexedReadCharLimit, messagesTokens, toChatMessages } from "./context";
 import { beginToolTurn, executeToolCall } from "./execute";
+import { knownThinkingBudget, readThinkingBudget } from "./thinkingBudget";
 
 /* global AbortSignal */
 
@@ -189,9 +190,29 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     return { usage, nextRequestTokens: messagesTokens(fitContext(messages, limit)) };
   };
 
+  const toldNoBudget = options.history.some(
+    (message) => message.content === THINKING_BUDGET_UNSET_NOTICE
+  );
+  const end = async (usage: Usage | null): Promise<TurnResult> => {
+    if (knownThinkingBudget() === null && !toldNoBudget) {
+      await options.onMessage({ role: "assistant", content: THINKING_BUDGET_UNSET_NOTICE });
+      messages.push({ role: "assistant", content: THINKING_BUDGET_UNSET_NOTICE });
+    }
+    return finish(usage);
+  };
+
+  let budgetRead = false;
+  const readBudgetOnce = async (body: ChatBody, done: Streamed): Promise<void> => {
+    if (budgetRead || !body.tools?.length || !done.requestId) {
+      return;
+    }
+    budgetRead = true;
+    await readThinkingBudget(settings, done.requestId);
+  };
+
   /** MTPLX closes thinking at its budget; this only stops a call that budget did not hold. */
   const stream = async (body: ChatBody): Promise<Streamed> => {
-    const capChars = runawayThinkingChars(null);
+    const capChars = runawayThinkingChars(knownThinkingBudget() ?? null);
     const cut = new AbortController();
     const forward = () => cut.abort(signal.reason);
     signal.addEventListener("abort", forward, { once: true });
@@ -231,7 +252,9 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     };
     options.onDelta?.({ content: "", reasoningContent: "" });
     try {
-      return await stream(body);
+      const done = await stream(body);
+      await readBudgetOnce(body, done);
+      return done;
     } catch (error) {
       const message = error instanceof Error ? error.message : "";
       if (!withTools || !toolsSupported || !isToolsUnsupportedError(message)) {
@@ -268,7 +291,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       const notice = toolRoundLimitNotice(maxRounds);
       await options.onMessage({ role: "assistant", content: notice });
       messages.push({ role: "assistant", content: notice });
-      return finish(lastUsage);
+      return end(lastUsage);
     }
 
     const completion = await send(true);
@@ -280,7 +303,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
         await options.onMessage({ role: "assistant", content: notice });
         messages.push({ role: "assistant", content: notice });
       }
-      return finish(lastUsage);
+      return end(lastUsage);
     }
 
     for (const call of completion.toolCalls) {

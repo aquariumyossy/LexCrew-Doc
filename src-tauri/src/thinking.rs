@@ -8,6 +8,35 @@ pub fn thinking_fields(enabled: bool) -> Value {
     json!({ "chat_template_kwargs": { "enable_thinking": enabled } })
 }
 
+/// MTPLX guards only requests that carry tools with thinking on, so an empty
+/// guard on such a request means no budget is set; on any other it says nothing.
+fn budget_of_record(record: &Value) -> Option<Option<u64>> {
+    let guard = &record["thinking_guard"];
+    if guard["enabled"] == true {
+        if let Some(budget) = guard["budget_tokens"].as_u64().filter(|n| *n > 0) {
+            return Some(Some(budget));
+        }
+    }
+    let tools = record["request_tool_count"].as_u64().unwrap_or(0);
+    (record["request_enable_thinking"] == true && tools > 0).then_some(None)
+}
+
+/// The budget MTPLX applied, read from its `GET /metrics` records:
+/// `Some(Some(tokens))`, `Some(None)` when none is set, `None` when the
+/// records do not say. Without a request id the newest record that says
+/// anything decides.
+///
+/// Twin of `budgetFromMetrics` in `src/shared/thinking.ts`.
+pub fn budget_from_metrics(metrics: &Value, request_id: Option<&str>) -> Option<Option<u64>> {
+    metrics["recent"]
+        .as_array()?
+        .iter()
+        .rev()
+        .filter(|record| record.is_object())
+        .filter(|record| request_id.is_none_or(|id| record["request_id"] == id))
+        .find_map(budget_of_record)
+}
+
 pub fn with_thinking(body: &Value, enabled: bool) -> Value {
     let mut out = body.clone();
     let fields = thinking_fields(enabled);
@@ -26,13 +55,19 @@ mod tests {
     #[test]
     fn on_leaves_the_strength_to_mtplx() {
         let fields = thinking_fields(true);
-        assert_eq!(fields, json!({ "chat_template_kwargs": { "enable_thinking": true } }));
+        assert_eq!(
+            fields,
+            json!({ "chat_template_kwargs": { "enable_thinking": true } })
+        );
     }
 
     #[test]
     fn off_disables_thinking() {
         let fields = thinking_fields(false);
-        assert_eq!(fields, json!({ "chat_template_kwargs": { "enable_thinking": false } }));
+        assert_eq!(
+            fields,
+            json!({ "chat_template_kwargs": { "enable_thinking": false } })
+        );
     }
 
     fn guarded(id: &str, budget: u64) -> Value {

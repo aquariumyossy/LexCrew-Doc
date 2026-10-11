@@ -4952,23 +4952,24 @@ export async function replaceParagraphs(
       "この Word ではテキストボックスを削除できません。範囲には手を付けていません。insert_blocks と delete_paragraphs で書き直してください。"
     );
   }
-  await Word.run(async (context) => {
+  const found = await Word.run(async (context) => {
     const paragraphs = context.document.body.paragraphs;
     paragraphs.load("items/text");
     await context.sync();
-    const found = locateSpan(paragraphs.items, from, through);
-    const count = found.last - found.first + 1 + (span.lastAnchor - through);
+    const located = locateSpan(paragraphs.items, from, through);
+    const count = located.last - located.first + 1 + (span.lastAnchor - through);
     if (count > MAX_REPLACE_PARAGRAPHS) {
       throw new Error(
         `範囲が ${count} 段落あり、一度に置き換えられる ${MAX_REPLACE_PARAGRAPHS} 段落を超えています。何も変えていません。範囲を分けてください。`
       );
     }
+    return located;
   });
 
   const landing = await insertDraftParagraphs(specs, "cursor", "", through, format);
 
   try {
-    const replaced = await removeReplacedSpan(from, through, specs, shapes, span, landing);
+    const replaced = await removeReplacedSpan(from, through, found, specs, shapes, span, landing);
     const moved = asked.from !== from || asked.through !== through;
     return moved ? { ...replaced, asked } : replaced;
   } catch (error) {
@@ -4980,9 +4981,15 @@ export async function replaceParagraphs(
   }
 }
 
+/**
+ * The span is taken where it was found before the insert. The new paragraphs
+ * land after it, so its positions hold, and looking it up again by text would
+ * find a new paragraph that repeats an old one.
+ */
 async function removeReplacedSpan(
   from: number,
   through: number,
+  found: ReturnType<typeof locateSpan>,
   specs: ParagraphSpec[],
   shapes: number[],
   trail: { lastAnchor: number; end: number },
@@ -4997,7 +5004,12 @@ async function removeReplacedSpan(
     paragraphs.load("items/text");
     await context.sync();
     const items = paragraphs.items;
-    const found = locateSpan(items, from, through);
+    const moved =
+      paragraphText(items[found.first] || { text: "" }) !== found.firstText ||
+      paragraphText(items[found.last] || { text: "" }) !== found.lastText;
+    if (moved) {
+      throw new Error(`段落 ${from}〜${through} が挿入の前と同じ位置にありません。`);
+    }
     const facts = (await readBodyFacts(context, items))?.facts ?? null;
 
     // The blanks that held the span's boxes sit past the new paragraphs now,

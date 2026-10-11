@@ -9,7 +9,11 @@ import {
 import { CommittedFile } from "../../shared/fileSource";
 import { NewMessage } from "../../shared/history";
 import { ChatMessage } from "../../sidecar/types";
-import { THINKING_BUDGET_UNSET_NOTICE, runawayThinkingChars } from "../../shared/thinking";
+import {
+  THINKING_BRIDGE,
+  THINKING_BUDGET_UNSET_NOTICE,
+  runawayThinkingChars,
+} from "../../shared/thinking";
 import { StoredMessage } from "../../shared/history";
 import { forgetThinkingBudget } from "./thinkingBudget";
 import { MAX_TOOL_ROUNDS, UNLIMITED_TOOL_ROUNDS, toolRoundLimitNotice } from "../../shared/tools";
@@ -300,6 +304,48 @@ describe("runTurn", () => {
     }
     expect(chatStream).toHaveBeenCalledTimes(1);
     expect(sent.some((message) => message.content === "届かない")).toBe(false);
+  });
+
+  it("stops a call whose answer repeats the MTPLX bridge and sends it once more", async () => {
+    const leaked = `<\n\n${THINKING_BRIDGE}\n<\n\n${THINKING_BRIDGE}\n<`;
+    chatStream.mockReset();
+    chatStream
+      .mockImplementationOnce(async (_body: unknown, opts: StreamOptions) => {
+        opts.onDelta?.({ content: "<", reasoningContent: `考えた。\n\n${THINKING_BRIDGE}\n` });
+        expect(opts.signal.aborted).toBe(false);
+        opts.onDelta?.({ content: leaked, reasoningContent: `考えた。\n\n${THINKING_BRIDGE}\n` });
+        opts.signal.throwIfAborted();
+        return completion({ content: leaked });
+      })
+      .mockResolvedValueOnce(completion({ content: "置き換えました。" }));
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    let sent: NewMessage[] = [];
+    try {
+      ({ sent } = await run("書き直して"));
+    } finally {
+      info.mockRestore();
+    }
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    expect(sent.some((message) => message.content.includes(THINKING_BRIDGE))).toBe(false);
+    expect(sent.at(-1)).toMatchObject({ role: "assistant", content: "置き換えました。" });
+  });
+
+  it("stops the turn when the resent call repeats the MTPLX bridge again", async () => {
+    chatStream.mockReset();
+    chatStream.mockImplementation(async (_body: unknown, opts: StreamOptions) => {
+      opts.onDelta?.({ content: `<\n\n${THINKING_BRIDGE}\n<`, reasoningContent: "考えた。" });
+      opts.signal.throwIfAborted();
+      return completion({ content: "届かない" });
+    });
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      await expect(run("書き直して")).rejects.toThrow(
+        "MTPLX が思考を閉じられず、同じ文を繰り返したため止めました。"
+      );
+    } finally {
+      info.mockRestore();
+    }
+    expect(chatStream).toHaveBeenCalledTimes(2);
   });
 
   it("reads the MTPLX budget after the first call and stops thinking that runs past it", async () => {

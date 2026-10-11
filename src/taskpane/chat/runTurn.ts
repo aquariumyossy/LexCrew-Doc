@@ -8,7 +8,11 @@ import {
 } from "../../shared/prompts";
 import { joinArgosScopes } from "../../shared/argos";
 import { Usage } from "../../shared/stripThinking";
-import { THINKING_BUDGET_UNSET_NOTICE, runawayThinkingChars } from "../../shared/thinking";
+import {
+  THINKING_BRIDGE,
+  THINKING_BUDGET_UNSET_NOTICE,
+  runawayThinkingChars,
+} from "../../shared/thinking";
 import {
   UNLIMITED_TOOL_ROUNDS,
   buildTools,
@@ -211,18 +215,24 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   };
 
   /** MTPLX closes thinking at its budget; this only stops a call that budget did not hold. */
-  const stream = async (body: ChatBody): Promise<Streamed> => {
+  const stream = async (body: ChatBody, resent = false): Promise<Streamed> => {
     const capChars = runawayThinkingChars(knownThinkingBudget() ?? null);
     const cut = new AbortController();
     const forward = () => cut.abort(signal.reason);
     signal.addEventListener("abort", forward, { once: true });
     let thought = 0;
+    let bridgeLeaked = false;
     const onDelta = (snapshot: { content: string; reasoningContent: string }) => {
-      options.onDelta?.(snapshot);
       thought = snapshot.reasoningContent.length;
-      if (!cut.signal.aborted && thought > capChars) {
-        cut.abort();
+      if (cut.signal.aborted) {
+        return;
       }
+      bridgeLeaked = snapshot.content.includes(THINKING_BRIDGE);
+      if (bridgeLeaked || thought > capChars) {
+        cut.abort();
+        return;
+      }
+      options.onDelta?.(snapshot);
     };
     try {
       return withFinishReason(await chatStream(body, { signal: cut.signal, onDelta }));
@@ -230,11 +240,23 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       if (signal.aborted || !cut.signal.aborted) {
         throw error;
       }
-      logInfo("thinking runaway", { reasoningChars: thought, capChars });
-      throw new Error(
-        `思考が ${thought} 字に達しても答えが出ないため止めました。` +
-          "MTPLX に思考の上限が設定されているか確かめ、指示を分けて送り直してください。"
-      );
+      if (!bridgeLeaked) {
+        logInfo("thinking runaway", { reasoningChars: thought, capChars });
+        throw new Error(
+          `思考が ${thought} 字に達しても答えが出ないため止めました。` +
+            "MTPLX に思考の上限が設定されているか確かめ、指示を分けて送り直してください。"
+        );
+      }
+      logInfo("thinking bridge leaked", { reasoningChars: thought, resent });
+      if (resent) {
+        throw new Error(
+          "MTPLX が思考を閉じられず、同じ文を繰り返したため止めました。" +
+            "もう一度送ってください。続くときは MTPLX を再起動してください。"
+        );
+      }
+      meter.llmCalls += 1;
+      options.onDelta?.({ content: "", reasoningContent: "" });
+      return stream(body, true);
     } finally {
       signal.removeEventListener("abort", forward);
     }

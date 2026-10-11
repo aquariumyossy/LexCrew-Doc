@@ -20,6 +20,13 @@ export function runawayThinkingChars(budget: number | null): number {
   return (budget ?? FALLBACK_THINKING_BUDGET) * RUNAWAY_CHARS_PER_TOKEN;
 }
 
+/**
+ * MTPLX's default `MTPLX_THINKING_BRIDGE`, written just before it force-closes
+ * thinking at the budget. Seen in the answer, it means the close did not land
+ * and the guard is re-forcing it in a loop.
+ */
+export const THINKING_BRIDGE = "I have enough analysis — deciding now and acting.";
+
 export const THINKING_BUDGET_UNSET_NOTICE =
   "MTPLX に思考の上限（--agent-thinking-budget）が設定されていません。" +
   `上限がないと思考が長く続くことがあるため、作業ウィンドウは思考が ${runawayThinkingChars(null).toLocaleString("ja-JP")} 字を超えたところでターンを止めます。` +

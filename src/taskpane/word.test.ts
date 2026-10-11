@@ -2686,6 +2686,25 @@ describe("numbers handed out by an insert", () => {
     expect(word.paragraphs[2].text.replaceAll("\r", "")).toBe("第2条とする。");
   });
 
+  it("deletes the inserted paragraph, not the attached one with the same text", async () => {
+    const word = installWord({ selection: "", body: "", paragraphs: ["甲とする。", "乙とする。", "丙とする。"] });
+    await readDocumentText(1_000);
+    const landing = await insertDraftParagraphs(specs("丙とする。"), "cursor", "", 1);
+    expect(landing.numbers).toEqual([{ number: 4, text: "丙とする。" }]);
+    const deleted: number[] = [];
+    word.paragraphs.forEach((paragraph, index) => {
+      const original = paragraph.delete;
+      paragraph.delete = () => {
+        deleted.push(index);
+        original();
+      };
+    });
+
+    await deleteParagraphs({ paragraphs: [4] });
+
+    expect(deleted).toEqual([1]);
+  });
+
   it("keeps the insert when numbering fails, and hands out nothing", async () => {
     installWord({ selection: "", body: "", paragraphs: [""] });
     await readDocumentText(1_000);

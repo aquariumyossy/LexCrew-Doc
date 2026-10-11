@@ -1,80 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_THINKING_BUDGET, MIN_THINKING_BUDGET } from "./constants";
-import {
-  looksLikeFormatInstruction,
-  normalizeFormatThinkingLevel,
-  normalizeThinkingBudget,
-  normalizeThinkingLevel,
-  normalizeThinkingRetryLevel,
-  resolveFormatThinking,
-  thinkingAfterCut,
-  thinkingFields,
-} from "./thinking";
+import { runawayThinkingChars, thinkingFields } from "./thinking";
 
 describe("thinkingFields", () => {
-  it("sends medium effort and no budget, which MTPLX does not read", () => {
-    expect(thinkingFields("medium")).toEqual({
-      reasoning_effort: "medium",
-      chat_template_kwargs: { enable_thinking: true },
-    });
+  it("turns thinking on and leaves its strength to MTPLX", () => {
+    expect(thinkingFields(true)).toEqual({ chat_template_kwargs: { enable_thinking: true } });
   });
 
-  it("maps the high level to xhigh", () => {
-    expect(thinkingFields("high").reasoning_effort).toBe("xhigh");
-  });
-
-  it("disables thinking only when the user picks off", () => {
-    expect(thinkingFields("off")).toEqual({
-      chat_template_kwargs: { enable_thinking: false },
-    });
+  it("turns thinking off for calls that do not reason", () => {
+    expect(thinkingFields(false)).toEqual({ chat_template_kwargs: { enable_thinking: false } });
   });
 });
 
-describe("normalizeThinkingBudget", () => {
-  it("falls back to the default budget and enforces a floor", () => {
-    expect(normalizeThinkingBudget(0)).toBe(DEFAULT_THINKING_BUDGET);
-    expect(normalizeThinkingBudget(8)).toBe(MIN_THINKING_BUDGET);
-  });
-});
-
-describe("thinkingAfterCut", () => {
-  it("steps down to low, and lets a cut low call finish instead of dropping thinking", () => {
-    expect(thinkingAfterCut("high", "low")).toEqual({ level: "low", capped: true });
-    expect(thinkingAfterCut("medium", "low")).toEqual({ level: "low", capped: true });
-    expect(thinkingAfterCut("low", "low")).toEqual({ level: "low", capped: false });
+describe("runawayThinkingChars", () => {
+  it("leaves room above the MTPLX budget for its densest observed thinking", () => {
+    expect(runawayThinkingChars(2048)).toBe(16_384);
   });
 
-  it("drops thinking only when the setting asks for it", () => {
-    expect(thinkingAfterCut("medium", "off")).toEqual({ level: "off", capped: false });
-    expect(thinkingAfterCut("low", "off")).toEqual({ level: "off", capped: false });
-  });
-
-  it("retries at low unless the setting says otherwise", () => {
-    expect(normalizeThinkingRetryLevel(undefined)).toBe("low");
-    expect(normalizeThinkingRetryLevel("medium")).toBe("low");
-    expect(normalizeThinkingRetryLevel("off")).toBe("off");
-  });
-});
-
-describe("normalizeThinkingLevel", () => {
-  it("falls back to medium for unknown values", () => {
-    expect(normalizeThinkingLevel("xhigh")).toBe("medium");
-    expect(normalizeThinkingLevel(undefined)).toBe("medium");
-    expect(normalizeThinkingLevel("off")).toBe("off");
-  });
-});
-
-describe("format thinking", () => {
-  it("stays on the chat level until the user picks another", () => {
-    expect(normalizeFormatThinkingLevel(undefined)).toBe("same");
-    expect(normalizeFormatThinkingLevel("nope")).toBe("same");
-    expect(normalizeFormatThinkingLevel("low")).toBe("low");
-    expect(resolveFormatThinking("same", "medium")).toBe("medium");
-    expect(resolveFormatThinking("off", "medium")).toBe("off");
-  });
-
-  it("notices a formatting instruction and ignores a drafting one", () => {
-    expect(looksLikeFormatInstruction("見出しを太字にして行間を詰めて")).toBe(true);
-    expect(looksLikeFormatInstruction("第3条を短くして")).toBe(false);
+  it("falls back to 3072 tokens when MTPLX shows no budget", () => {
+    expect(runawayThinkingChars(null)).toBe(24_576);
   });
 });

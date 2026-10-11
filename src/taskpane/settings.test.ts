@@ -76,12 +76,24 @@ describe("loadSettings timeout migration", () => {
     expect(loadSettings().contextLimit).toBe(DEFAULT_CONTEXT_LIMIT);
   });
 
-  it("keeps formatting on the same thinking level until the user picks another", () => {
-    expect(loadSettings().formatThinkingLevel).toBe("same");
-    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ formatThinkingLevel: "low" }));
-    expect(loadSettings().formatThinkingLevel).toBe("low");
-    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ formatThinkingLevel: "loud" }));
-    expect(loadSettings().formatThinkingLevel).toBe("same");
+  it("forgets the thinking settings, which MTPLX now owns", () => {
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({
+        thinkingLevel: "off",
+        formatThinkingLevel: "low",
+        thinkingBudget: 8192,
+        thinkingRetryLevel: "off",
+        maxToolRounds: 32,
+      })
+    );
+    const loaded = loadSettings();
+    expect(loaded.maxToolRounds).toBe(32);
+    for (const key of ["thinkingLevel", "formatThinkingLevel", "thinkingBudget", "thinkingRetryLevel"]) {
+      expect(loaded).not.toHaveProperty(key);
+    }
+    saveSettings(loaded);
+    expect(localStorage.getItem(SETTINGS_STORAGE_KEY)).not.toContain("thinking");
   });
 
   it("defaults the tool-round cap and keeps unlimited", () => {

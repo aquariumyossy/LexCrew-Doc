@@ -131,7 +131,7 @@ describe("sidecar", () => {
     expect(res.body.llm.ok).toBe(true);
   });
 
-  it("forwards tools and thinking, then returns tool calls and usage", async () => {
+  it("forwards tools with thinking on, leaving its strength to MTPLX, then returns tool calls and usage", async () => {
     let seen: Record<string, unknown> | null = null;
     const mtplx = await listen((req, res) => {
       readJsonBody(req, (body) => {
@@ -179,15 +179,15 @@ describe("sidecar", () => {
         model: "qwen3.8-flash-next",
         messages: [{ role: "user", content: "SECRET_PROMPT 本文そのもの" }],
         tools: [{ type: "function", function: { name: "search", parameters: { type: "object" } } }],
-        thinkingLevel: "medium",
+        thinkingLevel: "low",
       });
 
     expect(res.status).toBe(200);
     expect(seen).toMatchObject({
       tool_choice: "auto",
-      reasoning_effort: "medium",
       chat_template_kwargs: { enable_thinking: true },
     });
+    expect(seen).not.toHaveProperty("reasoning_effort");
     expect(seen).not.toHaveProperty("thinking_budget");
     expect((seen as { chat_template_kwargs: object }).chat_template_kwargs).not.toHaveProperty(
       "thinking_budget"
@@ -244,7 +244,6 @@ describe("sidecar", () => {
         llmBaseUrl: `${mtplx.url}/v1`,
         llmApiKey: "test-key",
         messages: [{ role: "user", content: "点検して" }],
-        thinkingLevel: "medium",
       });
 
     expect(res.status).toBe(200);

@@ -900,7 +900,7 @@ mod tests {
             let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
             assert_eq!(body["tools"][0]["function"]["name"], "search");
             assert_eq!(body["tool_choice"], "auto");
-            assert_eq!(body["reasoning_effort"], "medium");
+            assert!(body.get("reasoning_effort").is_none());
             assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
             assert!(body.get("thinking_budget").is_none());
             ResponseTemplate::new(200).set_body_json(json!({
@@ -927,7 +927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_forwards_tools_and_thinking_then_returns_tool_calls() {
+    async fn chat_forwards_tools_with_thinking_on_and_leaves_its_strength_to_mtplx() {
         let mtplx = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -949,7 +949,7 @@ mod tests {
                     "type": "function",
                     "function": { "name": "search", "parameters": { "type": "object" } }
                 }],
-                "thinkingLevel": "medium",
+                "thinkingLevel": "low",
                 "thinkingBudget": 2048,
             }),
         )
@@ -1003,7 +1003,6 @@ mod tests {
                 "llmBaseUrl": format!("{}/v1", mtplx.uri()),
                 "llmApiKey": "test-key",
                 "messages": [{ "role": "user", "content": "点検して" }],
-                "thinkingLevel": "medium",
             }),
         )
         .await;

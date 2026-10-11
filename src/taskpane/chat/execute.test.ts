@@ -419,10 +419,11 @@ describe("replace_paragraphs facts", () => {
       keptPictures: 0,
       shapes: [],
       unmatchedShapes: [],
+      sourceText: "調査物件の住所\n住　所：神奈川県藤沢市大鋸1034-3\n物件名：ドルチェA棟102",
       numbers: [{ number: 8, text: "（１）住所：大鋸1034-3" }],
     });
     turnSource.mockReturnValue(
-      "調査物件の住所\n住　所：神奈川県藤沢市大鋸1034-3\n電気：16897.5kWh"
+      "調査物件の住所\n住　所：神奈川県藤沢市大鋸1034-3\n物件名：ドルチェA棟102\n電気：16897.5kWh"
     );
   });
 
@@ -465,5 +466,17 @@ describe("replace_paragraphs facts", () => {
     const result = await run(rewrite("（１）住所：用田593番地"));
     expect(result.ok).toBe(true);
     expect(result.content).not.toContain("原文にない語");
+  });
+
+  it("names the numbers of the replaced span the rewrite lost", async () => {
+    const lost = await run(rewrite("（１）住所：大鋸1034-3", "（２）物件名：ドルチェA棟"));
+    expect(lost.ok).toBe(true);
+    expect(lost.content).toContain(
+      "\n置き換えた範囲の原文にあって、書き直しにない数字があります（102）。" +
+        "省くつもりでなければ、入れた段落を replace_paragraphs で直してください。省いたのなら返事で利用者に伝えてください。"
+    );
+
+    const kept = await run(rewrite("（１）住所：大鋸1034-3", "（２）物件名：ドルチェA棟102"));
+    expect(kept.content).not.toContain("書き直しにない数字");
   });
 });

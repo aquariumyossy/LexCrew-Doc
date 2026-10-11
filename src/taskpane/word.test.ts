@@ -1580,6 +1580,7 @@ describe("replaceParagraphs", () => {
       keptPictures: 0,
       shapes: [1, 2],
       unmatchedShapes: [],
+      sourceText: "調査物件の住所\n\n調査日時\n住所：東京都\n日時：令和8年",
       numbers: [
         { number: 8, text: "第１　調査物件" },
         { number: 9, text: "東京都" },

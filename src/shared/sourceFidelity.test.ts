@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { unsourcedFacts } from "./sourceFidelity";
+import { droppedNumbers, unsourcedFacts } from "./sourceFidelity";
 
 const BOXES = [
   "住　所：神奈川県藤沢市大鋸1034-3",
@@ -55,5 +55,26 @@ describe("unsourcedFacts", () => {
 
   it("names each missing word once", () => {
     expect(unsourcedFacts(["ニデックに電話", "ニデックの所在"], BOXES)).toEqual(["ニデック"]);
+  });
+});
+
+describe("droppedNumbers", () => {
+  it("names the number a rewrite lost from the source", () => {
+    expect(
+      droppedNumbers(BOXES, [
+        "住所は、神奈川県藤沢市大鋸1034-3、物件名はドルチェA棟1034-3ドルチェA棟です。",
+        "電気メーターは16897.5kWhで、動いています。ガスメーターは4452.415㎥で、動いています。",
+        "オオタ　ツクモ（被告の弟）と相対しました。",
+        "電話番号は090-8306-3723で、停止している。",
+      ])
+    ).toEqual(["102"]);
+  });
+
+  it("finds a number written in another width, and skips single digits and outline heads", () => {
+    expect(
+      droppedNumbers("（１２）　物件名：ドルチェＡ棟１０２\n第１回目調査", [
+        "物件名：ドルチェA棟102",
+      ])
+    ).toEqual([]);
   });
 });

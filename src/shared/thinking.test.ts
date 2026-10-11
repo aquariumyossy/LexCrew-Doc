@@ -38,11 +38,15 @@ describe("normalizeThinkingBudget", () => {
 });
 
 describe("thinkingAfterCut", () => {
-  it("steps down to the retry level, and to no thinking from low or below it", () => {
-    expect(thinkingAfterCut("high", "low")).toBe("low");
-    expect(thinkingAfterCut("medium", "low")).toBe("low");
-    expect(thinkingAfterCut("low", "low")).toBe("off");
-    expect(thinkingAfterCut("medium", "off")).toBe("off");
+  it("steps down to low, and lets a cut low call finish instead of dropping thinking", () => {
+    expect(thinkingAfterCut("high", "low")).toEqual({ level: "low", capped: true });
+    expect(thinkingAfterCut("medium", "low")).toEqual({ level: "low", capped: true });
+    expect(thinkingAfterCut("low", "low")).toEqual({ level: "low", capped: false });
+  });
+
+  it("drops thinking only when the setting asks for it", () => {
+    expect(thinkingAfterCut("medium", "off")).toEqual({ level: "off", capped: false });
+    expect(thinkingAfterCut("low", "off")).toEqual({ level: "off", capped: false });
   });
 
   it("retries at low unless the setting says otherwise", () => {

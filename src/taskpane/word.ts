@@ -4959,7 +4959,7 @@ export async function replaceParagraphs(
       "この Word ではテキストボックスを削除できません。範囲には手を付けていません。insert_blocks と delete_paragraphs で書き直してください。"
     );
   }
-  const beforeInsert = await Word.run(async (context) => {
+  const { beforeInsert, sourceText } = await Word.run(async (context) => {
     const paragraphs = context.document.body.paragraphs;
     paragraphs.load("items/text");
     await context.sync();
@@ -4970,7 +4970,9 @@ export async function replaceParagraphs(
         `範囲が ${count} 段落あり、一度に置き換えられる ${MAX_REPLACE_PARAGRAPHS} 段落を超えています。何も変えていません。範囲を分けてください。`
       );
     }
-    return located;
+    const removedTexts = paragraphs.items.slice(located.first, located.last + 1).map(paragraphText);
+    const boxTexts = shapes.map((number) => attachedShapes[number - 1] ?? "");
+    return { beforeInsert: located, sourceText: [...removedTexts, ...boxTexts].join("\n") };
   });
 
   const landing = await insertDraftParagraphs(specs, "cursor", "", through, format);
@@ -4986,7 +4988,7 @@ export async function replaceParagraphs(
       landing
     );
     const moved = asked.from !== from || asked.through !== through;
-    return moved ? { ...replaced, asked } : replaced;
+    return moved ? { ...replaced, sourceText, asked } : { ...replaced, sourceText };
   } catch (error) {
     const reason = error instanceof Error ? error.message : "Word の操作に失敗しました。";
     throw new Error(
@@ -5004,7 +5006,7 @@ async function removeReplacedSpan(
   shapes: number[],
   trail: { lastAnchor: number; end: number },
   landing: InsertLanding
-): Promise<ReplacedSpan> {
+): Promise<Omit<ReplacedSpan, "sourceText">> {
   return Word.run(async (context) => {
     startTracking(context);
     const queued = shapes.length

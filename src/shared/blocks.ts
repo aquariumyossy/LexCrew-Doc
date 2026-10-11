@@ -469,6 +469,8 @@ export type ReplacedSpan = {
   shapes: number[];
   /** `[図]` numbers in the span that could not be matched to a box. */
   unmatchedShapes: number[];
+  /** The removed paragraphs and boxes as they read before the replace. */
+  sourceText: string;
   numbers?: InsertedParagraph[];
 };
 

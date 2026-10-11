@@ -59,7 +59,7 @@ import {
   setOutlineLevel,
   turnSource,
 } from "../word";
-import { unsourcedFacts } from "../../shared/sourceFidelity";
+import { droppedNumbers, unsourcedFacts } from "../../shared/sourceFidelity";
 
 /* global AbortSignal */
 
@@ -81,6 +81,10 @@ export function beginToolTurn(): void {
 
 type RewriteFacts = { refuse: string[] } | { resent: string[] };
 
+function blockLines(blocks: readonly { text: string; label?: string }[]): string[] {
+  return blocks.map((block) => (block.label ? `${block.label} ${block.text}` : block.text));
+}
+
 function rewriteFacts(
   blocks: readonly { text: string; label?: string }[],
   userMessagesText: string
@@ -89,10 +93,7 @@ function rewriteFacts(
   if (source === null) {
     return { resent: [] };
   }
-  const missing = unsourcedFacts(
-    blocks.map((block) => (block.label ? `${block.label} ${block.text}` : block.text)),
-    `${source}\n${userMessagesText}`
-  );
+  const missing = unsourcedFacts(blockLines(blocks), `${source}\n${userMessagesText}`);
   const refuse = missing.filter((fact) => !refusedFacts.has(fact));
   for (const fact of refuse) {
     refusedFacts.add(fact);
@@ -343,8 +344,13 @@ export async function executeToolCall(
         const kept = facts.resent.length
           ? `\n原文にない語（${facts.resent.join("、")}）は、送り直されたので意図した追加として書き込みました。返事で利用者に伝えてください。`
           : "";
+        const dropped = droppedNumbers(span.sourceText, blockLines(blocks));
+        const lost = dropped.length
+          ? `\n置き換えた範囲の原文にあって、書き直しにない数字があります（${dropped.join("、")}）。` +
+            "省くつもりでなければ、入れた段落を replace_paragraphs で直してください。省いたのなら返事で利用者に伝えてください。"
+          : "";
         return {
-          content: withNote(summarizeReplacedParagraphs(blocks, span), kept),
+          content: withNote(summarizeReplacedParagraphs(blocks, span), kept + lost),
           ok: true,
           numbered: Boolean(span.numbers?.length),
         };

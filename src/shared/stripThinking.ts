@@ -23,6 +23,7 @@ export type Usage = {
   totalTokens: number;
   reasoningTokens: number;
   thinkingCuts?: number;
+  finishReason?: string;
 };
 
 export type Completion = {

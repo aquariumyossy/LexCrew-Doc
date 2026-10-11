@@ -61,8 +61,19 @@ export type TurnResult = {
 
 type Streamed = Awaited<ReturnType<typeof chatStream>>;
 
-function counted(done: Streamed, cuts: number): Streamed {
-  return cuts && done.usage ? { ...done, usage: { ...done.usage, thinkingCuts: cuts } } : done;
+/** An uncapped resend still stops here, so a call that never settles cannot run for minutes. */
+const RUNAWAY_THINKING_BUDGETS = 4;
+
+function annotated(done: Streamed, cuts: number): Streamed {
+  if (!done.usage) {
+    return done;
+  }
+  const usage = { ...done.usage, finishReason: done.finishReason };
+  return { ...done, usage: cuts ? { ...usage, thinkingCuts: cuts } : usage };
+}
+
+function silentEndNotice(finishReason: string): string {
+  return `モデルが本文も操作も返さずに終わりました（終了理由: ${finishReason || "不明"}）。もう一度送るか、指示を分けてください。`;
 }
 
 function attachmentShowsBody(attachment: Attachment): boolean | null {
@@ -198,12 +209,13 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     return { usage, nextRequestTokens: messagesTokens(fitContext(messages, limit)) };
   };
 
-  /** MTPLX does not read a thinking budget, so the pane enforces it. */
+  /** MTPLX reads no thinking budget from the request, so the pane enforces it. */
   const stream = async (body: ChatBody, capped = true, cuts = 0): Promise<Streamed> => {
-    if (!capped || !body.thinkingLevel || body.thinkingLevel === "off") {
-      return counted(await chatStream(body, { signal, onDelta: options.onDelta }), cuts);
+    if (!body.thinkingLevel || body.thinkingLevel === "off") {
+      return annotated(await chatStream(body, { signal, onDelta: options.onDelta }), cuts);
     }
     const level = body.thinkingLevel;
+    const capChars = capped ? thinkingCapChars : thinkingCapChars * RUNAWAY_THINKING_BUDGETS;
     const cut = new AbortController();
     const forward = () => cut.abort(signal.reason);
     signal.addEventListener("abort", forward, { once: true });
@@ -211,15 +223,21 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     const onDelta = (snapshot: { content: string; reasoningContent: string }) => {
       options.onDelta?.(snapshot);
       thought = snapshot.reasoningContent.length;
-      if (!cut.signal.aborted && thought > thinkingCapChars) {
+      if (!cut.signal.aborted && thought > capChars) {
         cut.abort();
       }
     };
     try {
-      return counted(await chatStream(body, { signal: cut.signal, onDelta }), cuts);
+      return annotated(await chatStream(body, { signal: cut.signal, onDelta }), cuts);
     } catch (error) {
       if (signal.aborted || !cut.signal.aborted) {
         throw error;
+      }
+      if (!capped) {
+        logInfo("thinking runaway", { level, reasoningChars: thought, cuts });
+        throw new Error(
+          `思考が ${thought} 字に達しても答えが出ないため止めました。指示を分けて送り直してください。`
+        );
       }
       const next = thinkingAfterCut(level, settings.thinkingRetryLevel);
       logInfo("thinking cut", {
@@ -293,6 +311,11 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     await emitAssistant(completion);
 
     if (!completion.toolCalls.length) {
+      if (!completion.content.trim()) {
+        const notice = silentEndNotice(completion.finishReason);
+        await options.onMessage({ role: "assistant", content: notice });
+        messages.push({ role: "assistant", content: notice });
+      }
       return finish(lastUsage);
     }
 

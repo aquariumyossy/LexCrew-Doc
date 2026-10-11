@@ -177,6 +177,13 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     meter.totalTokens += usage.totalTokens || 0;
   };
 
+  const userMessagesText = [
+    ...options.history
+      .filter((message) => message.role === "user")
+      .map((message) => message.content),
+    options.instruction,
+  ].join("\n");
+
   let round = 0;
   const finish = (usage: Usage | null): TurnResult => {
     meter.toolRounds = round;
@@ -191,12 +198,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     return { usage, nextRequestTokens: messagesTokens(fitContext(messages, limit)) };
   };
 
-  /**
-   * MTPLX does not read a thinking budget, so the pane enforces it: once the
-   * streamed reasoning passes the cap, that call is dropped and sent again at
-   * the retry level. A low call that runs over is sent again at low without
-   * the cap. The next round goes back to the turn's level.
-   */
+  /** MTPLX does not read a thinking budget, so the pane enforces it. */
   const stream = async (body: ChatBody, capped = true, cuts = 0): Promise<Streamed> => {
     if (!capped || !body.thinkingLevel || body.thinkingLevel === "off") {
       return counted(await chatStream(body, { signal, onDelta: options.onDelta }), cuts);
@@ -220,7 +222,12 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
         throw error;
       }
       const next = thinkingAfterCut(level, settings.thinkingRetryLevel);
-      logInfo("thinking cut", { level, reasoningChars: thought, next: next.level, capped: next.capped });
+      logInfo("thinking cut", {
+        level,
+        reasoningChars: thought,
+        next: next.level,
+        capped: next.capped,
+      });
       meter.llmCalls += 1;
       options.onDelta?.({ content: "", reasoningContent: "" });
       return stream({ ...body, thinkingLevel: next.level }, next.capped, cuts + 1);
@@ -298,6 +305,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
         argosPathPrefixes: options.argosPathPrefixes,
         indexedReadChars: indexedReadCharLimit(limit, toolContents),
         hasBody,
+        userMessagesText,
       });
       await options.onMessage({ role: "tool", content: outcome.content, toolCallId: call.id });
       messages.push({ role: "tool", content: outcome.content, tool_call_id: call.id });

@@ -22,7 +22,6 @@ export type Usage = {
   completionTokens: number;
   totalTokens: number;
   reasoningTokens: number;
-  /** Calls dropped for thinking past the budget before this one answered. */
   thinkingCuts?: number;
 };
 

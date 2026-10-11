@@ -80,10 +80,6 @@ const THINKING_RANK: Record<ThinkingLevel, number> = { off: 0, low: 1, medium: 2
 
 export type ThinkingResend = { level: ThinkingLevel; capped: boolean };
 
-/**
- * Where a cut call goes next. A cut low call runs again at low to the end:
- * without thinking the model writes a whole document rewrite from nothing.
- */
 export function thinkingAfterCut(cut: ThinkingLevel, retry: ThinkingRetryLevel): ThinkingResend {
   if (retry === "off") {
     return { level: "off", capped: false };

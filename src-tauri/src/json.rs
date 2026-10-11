@@ -35,7 +35,6 @@ pub struct Usage {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub reasoning_tokens: u64,
-    /// Set by the pane, not the server: calls dropped for thinking past the budget.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub thinking_cuts: u64,
 }

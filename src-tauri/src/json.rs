@@ -35,14 +35,8 @@ pub struct Usage {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub reasoning_tokens: u64,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub thinking_cuts: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub finish_reason: String,
-}
-
-fn is_zero(n: &u64) -> bool {
-    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -109,7 +103,6 @@ fn parse_usage(payload: &Value) -> Option<Usage> {
         completion_tokens: count_at(usage.get("completion_tokens")),
         total_tokens: count_at(usage.get("total_tokens")),
         reasoning_tokens: count_at(details.and_then(|d| d.get("reasoning_tokens"))),
-        thinking_cuts: 0,
         finish_reason: String::new(),
     })
 }
@@ -180,7 +173,6 @@ mod tests {
                 completion_tokens: 40,
                 total_tokens: 160,
                 reasoning_tokens: 25,
-                thinking_cuts: 0,
                 finish_reason: String::new(),
             })
         );

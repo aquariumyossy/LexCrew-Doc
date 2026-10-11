@@ -181,7 +181,6 @@ export function createApp(options: { connectionFile?: string } = {}): express.Ex
       model: body.model || DEFAULT_MODEL,
       messages: body.messages || [],
       tools: body.tools,
-      thinkingLevel: body.thinkingLevel,
       timeoutMs: body.timeoutMs || DEFAULT_TIMEOUT_MS,
       signal,
     };

@@ -22,7 +22,6 @@ export type Usage = {
   completionTokens: number;
   totalTokens: number;
   reasoningTokens: number;
-  thinkingCuts?: number;
   finishReason?: string;
 };
 

@@ -6,8 +6,6 @@ import {
   DEFAULT_FONT_NAME,
   DEFAULT_LINE_SPACING_CHARS,
   DEFAULT_MODEL,
-  DEFAULT_THINKING_BUDGET,
-  DEFAULT_THINKING_LEVEL,
   DEFAULT_TIMEOUT_MS,
   DEFAULT_TITLE_PT,
   FALLBACK_FONT_NAME,
@@ -19,16 +17,6 @@ import {
   normalizeLineSpacingChars,
   SETTINGS_STORAGE_KEY,
 } from "../shared/constants";
-import {
-  DEFAULT_THINKING_RETRY_LEVEL,
-  FormatThinkingLevel,
-  ThinkingLevel,
-  ThinkingRetryLevel,
-  normalizeFormatThinkingLevel,
-  normalizeThinkingBudget,
-  normalizeThinkingLevel,
-  normalizeThinkingRetryLevel,
-} from "../shared/thinking";
 import { MAX_TOOL_ROUNDS, normalizeMaxToolRounds } from "../shared/tools";
 import { settingsForStorage } from "./connectionState";
 import { UiFontSize, normalizeUiFontSize } from "./uiFont";
@@ -48,12 +36,6 @@ export type Settings = {
   titlePt: number;
   lineSpacingChars: LineSpacingChars;
   outlineLayout: OutlineLayout;
-  thinkingLevel: ThinkingLevel;
-  /** Thinking used on formatting turns. "same" keeps thinkingLevel. */
-  formatThinkingLevel: FormatThinkingLevel;
-  thinkingBudget: number;
-  /** Thinking for the resend after a call ran past thinkingBudget. */
-  thinkingRetryLevel: ThinkingRetryLevel;
   contextLimit: number;
   /** 0 means no cap. */
   maxToolRounds: number;
@@ -73,10 +55,6 @@ export const DEFAULT_SETTINGS: Settings = {
   titlePt: DEFAULT_TITLE_PT,
   lineSpacingChars: DEFAULT_LINE_SPACING_CHARS,
   outlineLayout: DEFAULT_OUTLINE_LAYOUT,
-  thinkingLevel: DEFAULT_THINKING_LEVEL,
-  formatThinkingLevel: "same",
-  thinkingBudget: DEFAULT_THINKING_BUDGET,
-  thinkingRetryLevel: DEFAULT_THINKING_RETRY_LEVEL,
   contextLimit: DEFAULT_CONTEXT_LIMIT,
   maxToolRounds: MAX_TOOL_ROUNDS,
   uiFontSize: "medium",
@@ -120,16 +98,17 @@ export function loadSettings(): Settings {
       return { ...DEFAULT_SETTINGS };
     }
     const parsed = JSON.parse(raw) as Partial<Settings>;
-    const merged = { ...DEFAULT_SETTINGS, ...parsed };
+    const merged = { ...DEFAULT_SETTINGS };
+    for (const key of Object.keys(DEFAULT_SETTINGS) as (keyof Settings)[]) {
+      if (parsed[key] !== undefined) {
+        Object.assign(merged, { [key]: parsed[key] });
+      }
+    }
     return {
       ...merged,
       timeoutMs: migrateTimeoutMs(merged.timeoutMs),
       lineSpacingChars: normalizeLineSpacingChars(merged.lineSpacingChars),
       outlineLayout: normalizeOutlineLayout(merged.outlineLayout),
-      thinkingLevel: normalizeThinkingLevel(merged.thinkingLevel),
-      formatThinkingLevel: normalizeFormatThinkingLevel(merged.formatThinkingLevel),
-      thinkingBudget: normalizeThinkingBudget(merged.thinkingBudget),
-      thinkingRetryLevel: normalizeThinkingRetryLevel(merged.thinkingRetryLevel),
       contextLimit: migrateContextLimit(merged.contextLimit),
       maxToolRounds: normalizeMaxToolRounds(merged.maxToolRounds),
       uiFontSize: normalizeUiFontSize(parsed.uiFontSize),

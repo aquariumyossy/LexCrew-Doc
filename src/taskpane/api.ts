@@ -8,7 +8,6 @@ import {
 } from "../shared/history";
 import { StreamAccumulator, StreamSnapshot, takeSseData } from "../shared/stream";
 import { Completion } from "../shared/stripThinking";
-import { ThinkingLevel } from "../shared/thinking";
 import { ToolDefinition } from "../shared/tools";
 import { ChatMessage, SearchHit } from "../sidecar/types";
 import { ConnectionFields, ConnectionView } from "./connectionState";
@@ -145,7 +144,6 @@ export type ChatBody = {
   model: string;
   messages: ChatMessage[];
   tools?: ToolDefinition[];
-  thinkingLevel: ThinkingLevel;
   timeoutMs: number;
 };
 

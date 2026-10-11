@@ -314,7 +314,8 @@ pub struct ChatOptions<'a> {
     pub model: &'a str,
     pub messages: &'a [Value],
     pub tools: &'a [Value],
-    pub thinking_level: &'a str,
+    /// MTPLX picks how hard to think; this only turns thinking off.
+    pub thinking: bool,
     pub timeout_ms: u64,
 }
 
@@ -336,7 +337,7 @@ fn build_payload(options: &ChatOptions<'_>, include_thinking: bool, stream: bool
         payload["stream"] = json!(true);
     }
     if include_thinking {
-        payload = with_thinking(&payload, options.thinking_level);
+        payload = with_thinking(&payload, options.thinking);
     }
     payload
 }

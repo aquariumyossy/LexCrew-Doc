@@ -47,8 +47,6 @@ pub struct ChatRequest {
     pub messages: Vec<Value>,
     #[serde(default)]
     pub tools: Vec<Value>,
-    #[serde(default, rename = "thinkingLevel")]
-    pub thinking_level: Option<String>,
     #[serde(default, rename = "timeoutMs")]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
@@ -232,17 +230,13 @@ async fn post_chat(State(state): State<AppState>, Json(body): Json<ChatRequest>)
     } else {
         body.model.trim()
     };
-    let thinking_level = body
-        .thinking_level
-        .clone()
-        .unwrap_or_else(|| "medium".into());
     let options = ChatOptions {
         base_url: &connection.llm_base_url,
         api_key: &connection.llm_api_key,
         model,
         messages: &body.messages,
         tools: &body.tools,
-        thinking_level: &thinking_level,
+        thinking: true,
         timeout_ms: body.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
     };
 
@@ -457,7 +451,7 @@ async fn post_ocr(State(state): State<AppState>, Json(body): Json<OcrRequest>) -
         model,
         messages: &messages,
         tools: &[],
-        thinking_level: "off",
+        thinking: false,
         timeout_ms: body.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
     };
     match llm::chat_completions(options).await {

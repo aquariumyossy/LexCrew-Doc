@@ -89,9 +89,8 @@ describe("loadSettings timeout migration", () => {
     );
     const loaded = loadSettings();
     expect(loaded.maxToolRounds).toBe(32);
-    for (const key of ["thinkingLevel", "formatThinkingLevel", "thinkingBudget", "thinkingRetryLevel"]) {
-      expect(loaded).not.toHaveProperty(key);
-    }
+    expect(Object.keys(loaded).filter((key) => key.startsWith("thinking"))).toEqual([]);
+    expect(loaded).not.toHaveProperty("formatThinkingLevel");
     saveSettings(loaded);
     expect(localStorage.getItem(SETTINGS_STORAGE_KEY)).not.toContain("thinking");
   });

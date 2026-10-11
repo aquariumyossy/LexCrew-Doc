@@ -526,7 +526,6 @@ mod tests {
         assert_eq!(detail.messages[1].tool_calls.len(), 1);
         assert_eq!(detail.messages[1].reasoning_content, "内部の検討");
         assert_eq!(detail.messages[1].usage.as_ref().unwrap().total_tokens, 14);
-        assert_eq!(detail.messages[1].usage.as_ref().unwrap().thinking_cuts, 2);
         assert_eq!(detail.messages[1].usage.as_ref().unwrap().finish_reason, "stop");
     }
 

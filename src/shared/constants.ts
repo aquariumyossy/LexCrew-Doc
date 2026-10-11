@@ -27,10 +27,6 @@ export function lineSpacingPt(fontPt: number, chars: number): number {
   return fontPt * chars;
 }
 
-export const DEFAULT_THINKING_LEVEL = "medium" as const;
-export const DEFAULT_THINKING_BUDGET = 2_048;
-export const MIN_THINKING_BUDGET = 64;
-
 export const DEFAULT_CONTEXT_LIMIT = 131_072;
 /** Previous default; too small to attach a contract, so stored copies are migrated. */
 export const LEGACY_DEFAULT_CONTEXT_LIMIT = 32_768;

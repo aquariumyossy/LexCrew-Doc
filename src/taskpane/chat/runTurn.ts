@@ -7,14 +7,8 @@ import {
   userMessageWithAttachment,
 } from "../../shared/prompts";
 import { joinArgosScopes } from "../../shared/argos";
-import { CHARS_PER_TOKEN } from "../../shared/constants";
 import { Usage } from "../../shared/stripThinking";
-import {
-  looksLikeFormatInstruction,
-  normalizeThinkingBudget,
-  resolveFormatThinking,
-  thinkingAfterCut,
-} from "../../shared/thinking";
+import { runawayThinkingChars } from "../../shared/thinking";
 import {
   UNLIMITED_TOOL_ROUNDS,
   buildTools,
@@ -61,15 +55,8 @@ export type TurnResult = {
 
 type Streamed = Awaited<ReturnType<typeof chatStream>>;
 
-/** An uncapped resend still stops here, so a call that never settles cannot run for minutes. */
-const RUNAWAY_THINKING_BUDGETS = 4;
-
-function annotated(done: Streamed, cuts: number): Streamed {
-  if (!done.usage) {
-    return done;
-  }
-  const usage = { ...done.usage, finishReason: done.finishReason };
-  return { ...done, usage: cuts ? { ...usage, thinkingCuts: cuts } : usage };
+function withFinishReason(done: Streamed): Streamed {
+  return done.usage ? { ...done, usage: { ...done.usage, finishReason: done.finishReason } } : done;
 }
 
 function silentEndNotice(finishReason: string): string {
@@ -162,13 +149,6 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   let tools = toolsFor();
   let toolsSupported = true;
   let lastUsage: Usage | null = null;
-  // One level for the whole turn: the chat template puts the low and xhigh
-  // instructions at the head of the prompt, so switching mid-turn throws away
-  // the server's prefix cache.
-  const turnThinking = looksLikeFormatInstruction(options.instruction)
-    ? resolveFormatThinking(settings.formatThinkingLevel, settings.thinkingLevel)
-    : settings.thinkingLevel;
-  const thinkingCapChars = normalizeThinkingBudget(settings.thinkingBudget) * CHARS_PER_TOKEN;
   const started = Date.now();
   const meter = {
     toolRounds: 0,
@@ -209,13 +189,9 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     return { usage, nextRequestTokens: messagesTokens(fitContext(messages, limit)) };
   };
 
-  /** MTPLX reads no thinking budget from the request, so the pane enforces it. */
-  const stream = async (body: ChatBody, capped = true, cuts = 0): Promise<Streamed> => {
-    if (!body.thinkingLevel || body.thinkingLevel === "off") {
-      return annotated(await chatStream(body, { signal, onDelta: options.onDelta }), cuts);
-    }
-    const level = body.thinkingLevel;
-    const capChars = capped ? thinkingCapChars : thinkingCapChars * RUNAWAY_THINKING_BUDGETS;
+  /** MTPLX closes thinking at its budget; this only stops a call that budget did not hold. */
+  const stream = async (body: ChatBody): Promise<Streamed> => {
+    const capChars = runawayThinkingChars(null);
     const cut = new AbortController();
     const forward = () => cut.abort(signal.reason);
     signal.addEventListener("abort", forward, { once: true });
@@ -228,27 +204,16 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       }
     };
     try {
-      return annotated(await chatStream(body, { signal: cut.signal, onDelta }), cuts);
+      return withFinishReason(await chatStream(body, { signal: cut.signal, onDelta }));
     } catch (error) {
       if (signal.aborted || !cut.signal.aborted) {
         throw error;
       }
-      if (!capped) {
-        logInfo("thinking runaway", { level, reasoningChars: thought, cuts });
-        throw new Error(
-          `思考が ${thought} 字に達しても答えが出ないため止めました。指示を分けて送り直してください。`
-        );
-      }
-      const next = thinkingAfterCut(level, settings.thinkingRetryLevel);
-      logInfo("thinking cut", {
-        level,
-        reasoningChars: thought,
-        next: next.level,
-        capped: next.capped,
-      });
-      meter.llmCalls += 1;
-      options.onDelta?.({ content: "", reasoningContent: "" });
-      return stream({ ...body, thinkingLevel: next.level }, next.capped, cuts + 1);
+      logInfo("thinking runaway", { reasoningChars: thought, capChars });
+      throw new Error(
+        `思考が ${thought} 字に達しても答えが出ないため止めました。` +
+          "MTPLX に思考の上限が設定されているか確かめ、指示を分けて送り直してください。"
+      );
     } finally {
       signal.removeEventListener("abort", forward);
     }
@@ -262,7 +227,6 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       model: settings.llmModel,
       messages: fitContext(messages, limit),
       tools: withTools && toolsSupported ? tools : undefined,
-      thinkingLevel: turnThinking,
       timeoutMs: settings.timeoutMs,
     };
     options.onDelta?.({ content: "", reasoningContent: "" });

@@ -1,7 +1,7 @@
 import { DEFAULT_MODEL, DEFAULT_TIMEOUT_MS } from "../shared/constants";
 import { MAX_OCR_PAGE_CHARS, OCR_PROMPT } from "../shared/ocr";
 import { Completion, parseCompletion } from "../shared/stripThinking";
-import { ThinkingLevel, normalizeThinkingLevel, thinkingFields } from "../shared/thinking";
+import { thinkingFields } from "../shared/thinking";
 import { ToolDefinition } from "../shared/tools";
 import { logError, logInfo } from "./logger";
 import { ChatMessage, HealthResult } from "./types";
@@ -221,7 +221,8 @@ export type ChatCallOptions = {
   model: string;
   messages: (ChatMessage | VisionMessage)[];
   tools?: ToolDefinition[];
-  thinkingLevel?: ThinkingLevel;
+  /** On unless turned off; MTPLX picks how hard to think. */
+  thinking?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal;
   stream?: boolean;
@@ -240,7 +241,7 @@ function buildPayload(options: ChatCallOptions, withThinking: boolean): Record<s
     payload.stream = true;
   }
   if (withThinking) {
-    Object.assign(payload, thinkingFields(normalizeThinkingLevel(options.thinkingLevel)));
+    Object.assign(payload, thinkingFields(options.thinking !== false));
   }
   return payload;
 }
@@ -342,7 +343,7 @@ export async function readImageText(options: {
     apiKey: options.apiKey,
     model: options.model,
     messages: [message],
-    thinkingLevel: "off",
+    thinking: false,
     timeoutMs: options.timeoutMs,
     signal: options.signal,
   });

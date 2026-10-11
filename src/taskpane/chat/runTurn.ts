@@ -59,6 +59,12 @@ export type TurnResult = {
   nextRequestTokens: number;
 };
 
+type Streamed = Awaited<ReturnType<typeof chatStream>>;
+
+function counted(done: Streamed, cuts: number): Streamed {
+  return cuts && done.usage ? { ...done, usage: { ...done.usage, thinkingCuts: cuts } } : done;
+}
+
 function attachmentShowsBody(attachment: Attachment): boolean | null {
   if (attachment.scope === "document") {
     if (attachment.document.trim() || attachment.truncated) {
@@ -188,12 +194,12 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   /**
    * MTPLX does not read a thinking budget, so the pane enforces it: once the
    * streamed reasoning passes the cap, that call is dropped and sent again at
-   * the retry level, and with thinking off if that runs over too. The next
-   * round goes back to the turn's level.
+   * the retry level. A low call that runs over is sent again at low without
+   * the cap. The next round goes back to the turn's level.
    */
-  const stream = async (body: ChatBody): ReturnType<typeof chatStream> => {
-    if (!body.thinkingLevel || body.thinkingLevel === "off") {
-      return chatStream(body, { signal, onDelta: options.onDelta });
+  const stream = async (body: ChatBody, capped = true, cuts = 0): Promise<Streamed> => {
+    if (!capped || !body.thinkingLevel || body.thinkingLevel === "off") {
+      return counted(await chatStream(body, { signal, onDelta: options.onDelta }), cuts);
     }
     const level = body.thinkingLevel;
     const cut = new AbortController();
@@ -208,16 +214,16 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       }
     };
     try {
-      return await chatStream(body, { signal: cut.signal, onDelta });
+      return counted(await chatStream(body, { signal: cut.signal, onDelta }), cuts);
     } catch (error) {
       if (signal.aborted || !cut.signal.aborted) {
         throw error;
       }
       const next = thinkingAfterCut(level, settings.thinkingRetryLevel);
-      logInfo("thinking cut", { level, reasoningChars: thought, next });
+      logInfo("thinking cut", { level, reasoningChars: thought, next: next.level, capped: next.capped });
       meter.llmCalls += 1;
       options.onDelta?.({ content: "", reasoningContent: "" });
-      return stream({ ...body, thinkingLevel: next });
+      return stream({ ...body, thinkingLevel: next.level }, next.capped, cuts + 1);
     } finally {
       signal.removeEventListener("abort", forward);
     }

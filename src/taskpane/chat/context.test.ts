@@ -1,15 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CHARS_PER_TOKEN, MAX_FILE_CHARS, TOOL_RESULT_BUDGET_RATIO } from "../../shared/constants";
 import { StoredMessage } from "../../shared/history";
-import { STALE_DOCUMENT_READ } from "../../shared/tools";
+import { buildTools, STALE_DOCUMENT_READ } from "../../shared/tools";
 import { ChatMessage } from "../../sidecar/types";
 import {
   capToolResults,
   dropOldest,
   estimateTokens,
+  fitContext,
   indexedReadCharLimit,
   messagesTokens,
+  requestTokens,
   toChatMessages,
+  toolSchemaTokens,
 } from "./context";
 
 function stored(partial: Partial<StoredMessage> & Pick<StoredMessage, "role">): StoredMessage {
@@ -156,6 +159,31 @@ describe("dropOldest", () => {
     expect(trimmed[trimmed.length - 1].content).toBe("つぎ");
   });
 
+  it("pins the current instruction and the tool round after it", () => {
+    const messages: ChatMessage[] = [
+      { role: "system", content: "ルール" },
+      { role: "user", content: "古い指示" },
+      { role: "assistant", content: "古い返事" },
+      { role: "user", content: "いまの指示" + "あ".repeat(400) },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "c9", type: "function", function: { name: "search", arguments: "{}" } }],
+      },
+      { role: "tool", content: "結果", tool_call_id: "c9" },
+    ];
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    try {
+      const trimmed = dropOldest(messages, 10);
+      expect(trimmed.map((message) => message.role)).toEqual(["system", "user", "assistant", "tool"]);
+      expect(trimmed[1].content?.startsWith("いまの指示")).toBe(true);
+      expect(trimmed.some((message) => message.content === "古い指示")).toBe(false);
+      expect(info.mock.calls.some((call) => call[1] === "context trim")).toBe(true);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
   it("never leaves a tool reply without its call", () => {
     const trimmed = dropOldest(conversation, 240);
     const orphan = trimmed.some(
@@ -163,6 +191,35 @@ describe("dropOldest", () => {
     );
     expect(orphan).toBe(false);
     expect(messagesTokens(trimmed)).toBeLessThanOrEqual(240);
+  });
+});
+
+describe("tool schema in the meter", () => {
+  it("counts the schema on top of the messages", () => {
+    const tools = buildTools({ search: true, argos: true, selection: true, numbered: true });
+    const messages: ChatMessage[] = [{ role: "system", content: "ルール" }];
+    const schema = toolSchemaTokens(tools);
+    expect(schema).toBeGreaterThan(1000);
+    expect(requestTokens(messages, tools)).toBe(messagesTokens(messages) + schema);
+    expect(requestTokens(messages)).toBe(messagesTokens(messages));
+  });
+
+  it("fits messages into the room left after the schema", () => {
+    const tools = buildTools({ search: false, selection: false, numbered: false });
+    const schema = toolSchemaTokens(tools);
+    const current = "いまの指示";
+    const messages: ChatMessage[] = [
+      { role: "system", content: "s" },
+      { role: "user", content: "あ".repeat(CHARS_PER_TOKEN * 80) },
+      { role: "assistant", content: "古い返事" },
+      { role: "user", content: current },
+    ];
+    const tail = messagesTokens([messages[0], messages[3]]);
+    const limit = tail + schema + 5;
+    const fitted = fitContext(messages, limit, tools);
+    expect(fitted.map((message) => message.content)).toEqual(["s", current]);
+    expect(requestTokens(fitted, tools)).toBeLessThanOrEqual(limit);
+    expect(fitContext(messages, limit).length).toBe(messages.length);
   });
 });
 

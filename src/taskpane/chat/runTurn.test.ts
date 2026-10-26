@@ -16,7 +16,16 @@ import {
 } from "../../shared/thinking";
 import { StoredMessage } from "../../shared/history";
 import { forgetThinkingBudget } from "./thinkingBudget";
-import { MAX_TOOL_ROUNDS, UNLIMITED_TOOL_ROUNDS, toolRoundLimitNotice } from "../../shared/tools";
+import { EDIT_DECLINED_TOOL_RESULT } from "../../shared/questionTurn";
+import {
+  MAX_TOOL_ROUNDS,
+  TOOL_FORMAT_TEXT,
+  TOOL_READ_PARAGRAPHS,
+  TOOL_SET_OUTLINE,
+  UNLIMITED_TOOL_ROUNDS,
+  isDocumentEditTool,
+  toolRoundLimitNotice,
+} from "../../shared/tools";
 import { DEFAULT_SETTINGS } from "../settings";
 import { runTurn } from "./runTurn";
 
@@ -142,10 +151,17 @@ describe("runTurn", () => {
       onMessage: () => undefined,
     });
 
-    const user = (chatStream.mock.calls[0][0] as ChatBody).messages.at(-1);
+    const messages = (chatStream.mock.calls[0][0] as ChatBody).messages;
+    const user = messages.at(-1);
+    expect(user?.role).toBe("user");
     expect(user?.content).toContain("--- 文書全体 ---");
     expect(user?.content).toContain("第1条（目的）");
     expect(user?.content).toContain("--- 選択範囲 ---");
+    expect(user?.content?.endsWith("全体を点検して")).toBe(true);
+    expect(user?.content?.indexOf("--- 文書全体 ---")).toBeLessThan(
+      user?.content?.lastIndexOf("全体を点検して") ?? 0
+    );
+    expect(messages[0].content).not.toContain("第1条（目的）");
   });
 
   it("stores a note instead of the body, since the body is read again next turn", async () => {
@@ -188,8 +204,10 @@ describe("runTurn", () => {
       signal: new AbortController().signal,
       onMessage: () => undefined,
     });
-    const marked = (chatStream.mock.calls[0][0] as ChatBody).messages[0]?.content || "";
+    const markedMessages = (chatStream.mock.calls[0][0] as ChatBody).messages;
+    const marked = markedMessages.at(-1)?.content || "";
     expect(marked).toContain("Word の項番号");
+    expect(markedMessages[0].content).not.toContain("Word の項番号");
 
     chatStream.mockClear();
     chatStream.mockResolvedValue(completion({ content: "はい。" }));
@@ -201,8 +219,9 @@ describe("runTurn", () => {
       signal: new AbortController().signal,
       onMessage: () => undefined,
     });
-    const plain = (chatStream.mock.calls[0][0] as ChatBody).messages[0]?.content || "";
-    expect(plain).not.toContain("Word の項番号");
+    const plainMessages = (chatStream.mock.calls[0][0] as ChatBody).messages;
+    expect(plainMessages.at(-1)?.content || "").not.toContain("Word の項番号");
+    expect(plainMessages[0].content).not.toContain("Word の項番号");
   });
 
   it("requires a quote from the comment tool when there is no selection to fall back on", async () => {
@@ -684,6 +703,132 @@ describe("runTurn", () => {
   });
 });
 
+describe("question turn edit guard", () => {
+  it("runs an edit on a normal instruction without asking", async () => {
+    const confirm = vi.fn(async () => "allow" as const);
+    chatStream
+      .mockResolvedValueOnce(
+        completion({
+          toolCalls: [toolCall("c1", TOOL_FORMAT_TEXT, '{"bold":true}')],
+          finishReason: "tool_calls",
+        })
+      )
+      .mockResolvedValueOnce(completion({ content: "直しました。" }));
+    await runTurn({
+      settings,
+      instruction: "見出しを直して",
+      attachment: attach(""),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+      confirmDocumentEdit: confirm,
+    });
+    expect(confirm).not.toHaveBeenCalled();
+    expect(executeToolCall).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not gate a read on a question", async () => {
+    const confirm = vi.fn(async () => "decline" as const);
+    chatStream
+      .mockResolvedValueOnce(
+        completion({
+          toolCalls: [toolCall("c1", TOOL_READ_PARAGRAPHS, '{"from":1}')],
+          finishReason: "tool_calls",
+        })
+      )
+      .mockResolvedValueOnce(completion({ content: "第1条は委託です。" }));
+    await runTurn({
+      settings,
+      instruction: "なぜこの条なの？",
+      attachment: attach(""),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+      confirmDocumentEdit: confirm,
+    });
+    expect(confirm).not.toHaveBeenCalled();
+    expect(executeToolCall).toHaveBeenCalledTimes(1);
+    expect(executeToolCall.mock.calls[0][0].function.name).toBe(TOOL_READ_PARAGRAPHS);
+  });
+
+  it("decline skips the edit and continues with editing tools withheld", async () => {
+    const confirm = vi.fn(async () => "decline" as const);
+    chatStream
+      .mockResolvedValueOnce(
+        completion({
+          toolCalls: [
+            toolCall("c1", TOOL_READ_PARAGRAPHS, '{"from":1}'),
+            toolCall("c2", TOOL_SET_OUTLINE, '{"level":1}'),
+          ],
+          finishReason: "tool_calls",
+        })
+      )
+      .mockResolvedValueOnce(completion({ content: "チャットで答えます。" }));
+    const sent: NewMessage[] = [];
+    await runTurn({
+      settings,
+      instruction: "なぜ？\n本文は修正しないでチャットで答えて",
+      attachment: attach(""),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: (message) => {
+        sent.push(message);
+      },
+      confirmDocumentEdit: confirm,
+    });
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(executeToolCall).toHaveBeenCalledTimes(1);
+    expect(executeToolCall.mock.calls[0][0].function.name).toBe(TOOL_READ_PARAGRAPHS);
+    expect(sent.some((message) => message.content === EDIT_DECLINED_TOOL_RESULT)).toBe(true);
+    const second = chatStream.mock.calls[1][0] as ChatBody;
+    const names = (second.tools as { function: { name: string } }[]).map(
+      (tool) => tool.function.name
+    );
+    expect(names).toContain(TOOL_READ_PARAGRAPHS);
+    expect(names.every((name) => !isDocumentEditTool(name))).toBe(true);
+    const declined = second.messages.find((message) => message.tool_call_id === "c2");
+    expect(declined?.content).toBe(EDIT_DECLINED_TOOL_RESULT);
+  });
+
+  it("allow runs every edit in the turn and does not ask again", async () => {
+    const confirm = vi.fn(async () => "allow" as const);
+    chatStream
+      .mockResolvedValueOnce(
+        completion({
+          toolCalls: [
+            toolCall("c1", TOOL_FORMAT_TEXT, '{"bold":true}'),
+            toolCall("c2", TOOL_FORMAT_TEXT, '{"bold":true}'),
+          ],
+          finishReason: "tool_calls",
+        })
+      )
+      .mockResolvedValueOnce(
+        completion({
+          toolCalls: [toolCall("c3", TOOL_SET_OUTLINE, '{"level":1}')],
+          finishReason: "tool_calls",
+        })
+      )
+      .mockResolvedValueOnce(completion({ content: "直しました。" }));
+    await runTurn({
+      settings,
+      instruction: "この見出しの理由は？",
+      attachment: attach(""),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+      confirmDocumentEdit: confirm,
+    });
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(executeToolCall).toHaveBeenCalledTimes(3);
+    const third = chatStream.mock.calls[2][0] as ChatBody;
+    const names = (third.tools as { function: { name: string } }[]).map(
+      (tool) => tool.function.name
+    );
+    expect(names).toContain(TOOL_FORMAT_TEXT);
+    expect(names).toContain(TOOL_SET_OUTLINE);
+  });
+});
+
 function attachedFile(name: string, body: string): CommittedFile {
   return {
     id: name,
@@ -717,10 +862,12 @@ describe("runTurn with attached files", () => {
 
   it("sends the text to the model and only a stub to the transcript", async () => {
     const { sent, body } = await runWithFiles([attachedFile("覚書.pdf", "第1条 本覚書は…")]);
-    const asked = body.messages.at(-1)?.content || "";
-    expect(asked).toContain("第1条 本覚書は…");
+    expect(body.messages[0].content).toContain("第1条 本覚書は…");
+    expect(body.messages.at(-1)?.content).not.toContain("第1条 本覚書は…");
+    expect(body.messages.at(-1)?.content?.endsWith("この資料を読んで")).toBe(true);
     expect(sent[0].content).toContain("覚書.pdf");
     expect(sent[0].content).not.toContain("第1条 本覚書は…");
+    expect(sent[0].content.startsWith("この資料を読んで")).toBe(true);
   });
 
   it("explains how to treat the material only when some rode along", async () => {
@@ -734,15 +881,15 @@ describe("runTurn with attached files", () => {
   });
 
   /*
-   * The files sit in the current message, which `dropOldest` never drops, so a
+   * The files sit in the system message, which `dropOldest` never drops, so a
    * window too narrow to hold them has to be handled before the request goes.
    */
   it("cuts the text to the window rather than sending it over the limit", async () => {
     const long = attachedFile("長い.txt", "あ".repeat(50_000));
     const { sent, body } = await runWithFiles([long], { contextLimit: 4_096 });
-    const asked = body.messages.at(-1)?.content || "";
-    expect(asked.length).toBeLessThan(6_000);
-    expect(asked).toContain("--- 添付ファイル ---");
+    const system = body.messages[0].content || "";
+    expect(system).toContain("--- 添付ファイル ---");
+    expect(system).not.toContain("あ".repeat(5_000));
     // The transcript records what actually rode along, not what was read.
     expect(sent[0].content).toContain("長いので途中まで");
   });
@@ -752,9 +899,45 @@ describe("runTurn with attached files", () => {
       [attachedFile("小.txt", "い".repeat(50)), attachedFile("大.txt", "う".repeat(50_000))],
       { contextLimit: 4_096 }
     );
-    const asked = body.messages.at(-1)?.content || "";
-    expect(asked).toContain("[1] 小.txt");
-    expect(asked).toContain("[2] 大.txt");
-    expect(asked).toContain("い".repeat(50));
+    const system = body.messages[0].content || "";
+    expect(system).toContain("[1] 小.txt");
+    expect(system).toContain("[2] 大.txt");
+    expect(system).toContain("い".repeat(50));
+  });
+
+  it("keeps the file prefix identical when only the document and the instruction change", async () => {
+    const prior: StoredMessage = {
+      id: 1,
+      role: "user",
+      content: "前に直して\n\n--- 文書全体 ---\n古い本文",
+      reasoningContent: "",
+      toolCalls: [],
+      toolCallId: "",
+      usage: null,
+      createdAt: "",
+    };
+    const file = attachedFile("覚書.pdf", "第1条 本覚書は安定している");
+    const first = await runWithFiles([file]);
+    chatStream.mockClear();
+    chatStream.mockResolvedValue(completion({ content: "はい。" }));
+    await runTurn({
+      settings,
+      instruction: "なぜこの建付けなの？",
+      attachment: attach("第2条", "第1条（目的）\n第2条（報酬）"),
+      files: [file],
+      history: [prior],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+    });
+    const second = chatStream.mock.calls[0][0] as ChatBody;
+    expect(second.messages[0].content).toBe(first.body.messages[0].content);
+    expect(second.messages[0].content).toContain("第1条 本覚書は安定している");
+    expect(second.messages[1]).toMatchObject({ role: "user", content: "前に直して" });
+    const last = second.messages.at(-1)?.content || "";
+    expect(last).toContain("--- 文書全体 ---");
+    expect(last).toContain("第2条（報酬）");
+    expect(last).not.toContain("--- 添付ファイル ---");
+    expect(last.endsWith("なぜこの建付けなの？")).toBe(true);
+    expect(last.indexOf("--- 文書全体 ---")).toBeLessThan(last.lastIndexOf("--- 指示 ---"));
   });
 });

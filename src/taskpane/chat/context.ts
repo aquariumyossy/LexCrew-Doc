@@ -2,6 +2,7 @@ import { CHARS_PER_TOKEN, MAX_FILE_CHARS, TOOL_RESULT_BUDGET_RATIO } from "../..
 import { StoredMessage } from "../../shared/history";
 import { stripAttachment } from "../../shared/prompts";
 import { isDocumentSnapshotTool, STALE_DOCUMENT_READ } from "../../shared/tools";
+import { logInfo } from "../../sidecar/logger";
 import { ChatMessage } from "../../sidecar/types";
 
 /** Rough count used for the header readout and for trimming. */
@@ -23,12 +24,41 @@ export function messagesTokens(messages: ChatMessage[]): number {
 }
 
 /**
+ * The tool schema rides in the request beside the messages. The meter and
+ * `fitContext` both count it; leaving it out under-reads the window by the
+ * whole schema (about ten thousand tokens for this tool set).
+ */
+export function toolSchemaTokens(tools: readonly unknown[] | null | undefined): number {
+  if (!tools?.length) {
+    return 0;
+  }
+  return estimateTokens(JSON.stringify(tools));
+}
+
+/** Messages plus the tool schema the server also bills. */
+export function requestTokens(
+  messages: ChatMessage[],
+  tools?: readonly unknown[] | null
+): number {
+  return messagesTokens(messages) + toolSchemaTokens(tools);
+}
+
+/**
  * Past turns are replayed without their reasoning channel to save context.
  * Within a single turn the loop keeps it, which is what Qwen expects.
  *
  * Attachments are dropped too. The current one is read from the document each
  * turn, so an old copy would only describe a document that has since changed —
  * and would crowd out the room the new one needs.
+ *
+ * A document snapshot is replaced here, on replay, with one constant string.
+ * The turn that produced the read still sends the full text: that copy lives
+ * in the in-memory messages and is not loaded back from history. Every later
+ * turn substitutes the same constant, so the replayed prefix does not change
+ * from one of those turns to the next. The single divergence is the boundary
+ * out of the producing turn (full text there, the stub afterwards). Saving the
+ * stub instead of the read would not close that gap, because the model still
+ * has to see the snapshot before the turn ends.
  */
 function toolNameById(stored: StoredMessage[]): Map<string, string> {
   const names = new Map<string, string>();
@@ -101,39 +131,81 @@ export function capToolResults(messages: ChatMessage[], limit: number): ChatMess
   }
 
   const out = [...messages];
+  let shrunk = 0;
   for (const index of toolIndexes) {
     if (used <= budget) {
       break;
     }
     const before = messageTokens(out[index]);
     // Keep the newest results intact by shrinking the oldest to a stub.
-    const shrunk: ChatMessage = { ...out[index], content: truncate(out[index].content || "", 40) };
-    out[index] = shrunk;
-    used -= before - messageTokens(shrunk);
+    const shrunkMessage: ChatMessage = {
+      ...out[index],
+      content: truncate(out[index].content || "", 40),
+    };
+    if (shrunkMessage.content === out[index].content) {
+      continue;
+    }
+    out[index] = shrunkMessage;
+    used -= before - messageTokens(shrunkMessage);
+    shrunk += 1;
+  }
+  if (shrunk > 0) {
+    logInfo("context trim", { shrunkToolResults: shrunk, tokens: messagesTokens(out), limit });
   }
   return out;
+}
+
+/**
+ * Index of the latest user message. That message is the current instruction
+ * (with this turn's document behind it). Everything after it is this turn's
+ * tool round. Older exchanges, between the system prompt and that message,
+ * are what may be dropped.
+ */
+function currentTurnStart(messages: ChatMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === "user") {
+      return index;
+    }
+  }
+  return Math.max(0, messages.length - 1);
 }
 
 /**
  * Drop whole exchanges from the front until the request fits. An assistant turn
  * with tool calls leaves with its tool replies: the server rejects an orphan of
  * either half.
+ *
+ * The system prompt (and the committed files inside it) stays. So does the
+ * latest user message and everything after it: after a tool round the current
+ * instruction is no longer the last message, and dropping it would send the
+ * next call with no instruction.
  */
 export function dropOldest(messages: ChatMessage[], limit: number): ChatMessage[] {
   const pinnedFront = messages[0]?.role === "system" ? 1 : 0;
   const out = [...messages];
+  let dropped = 0;
 
-  while (messagesTokens(out) > limit && out.length > pinnedFront + 1) {
-    const dropped = out.splice(pinnedFront, 1)[0];
-    if (dropped.tool_calls?.length) {
-      while (out[pinnedFront]?.role === "tool") {
+  while (messagesTokens(out) > limit && currentTurnStart(out) > pinnedFront) {
+    const removed = out.splice(pinnedFront, 1)[0];
+    dropped += 1;
+    if (removed.tool_calls?.length) {
+      while (out[pinnedFront]?.role === "tool" && pinnedFront < currentTurnStart(out)) {
         out.splice(pinnedFront, 1);
+        dropped += 1;
       }
     }
+  }
+  if (dropped > 0) {
+    logInfo("context trim", { dropped, tokens: messagesTokens(out), limit });
   }
   return out;
 }
 
-export function fitContext(messages: ChatMessage[], limit: number): ChatMessage[] {
-  return dropOldest(capToolResults(messages, limit), limit);
+export function fitContext(
+  messages: ChatMessage[],
+  limit: number,
+  tools?: readonly unknown[] | null
+): ChatMessage[] {
+  const room = Math.max(0, limit - toolSchemaTokens(tools));
+  return dropOldest(capToolResults(messages, room), room);
 }

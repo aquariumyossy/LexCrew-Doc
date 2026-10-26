@@ -59,9 +59,10 @@ import { assertChatInput } from "../../shared/guards";
 import { REMOTE_OCR_NOTICE, isLoopbackUrl } from "../../shared/ocr";
 import { ConversationSummary, NewMessage, StoredMessage } from "../../shared/history";
 import { joinArgosScopes, parseArgosScopes } from "../../shared/argos";
-import { systemPrompt } from "../../shared/prompts";
+import { stableSystemPrompt, turnAttachmentNotes } from "../../shared/prompts";
 import {
   TOOL_ROUND_PRESETS,
+  buildTools,
   normalizeMaxToolRounds,
   toolRoundPresetLabel,
 } from "../../shared/tools";
@@ -80,7 +81,7 @@ import {
   saveStoredConnection,
   setConversationFiles as saveConversationFiles,
 } from "../api";
-import { estimateTokens, messagesTokens, toChatMessages } from "../chat/context";
+import { estimateTokens, messagesTokens, toChatMessages, toolSchemaTokens } from "../chat/context";
 import { runTurn } from "../chat/runTurn";
 import { forgetThinkingBudget, readThinkingBudget } from "../chat/thinkingBudget";
 import { applyAdopt } from "../connectionState";
@@ -100,7 +101,7 @@ import {
 import { OcrRunner, useFileSources } from "../files/useFileSources";
 import { ocrFile } from "../files/ocr";
 import { aboutCopy } from "../about";
-import ChatPane, { ChatDraft } from "./ChatPane";
+import ChatPane, { ChatDraft, EditConfirm } from "./ChatPane";
 import { AboutDialog } from "./AboutDialog";
 import ArgosScopePicker from "./ArgosScopePicker";
 import { FileAttachButton, FileBadges } from "./FileAttachBar";
@@ -329,6 +330,7 @@ const App: React.FC = () => {
   const [attachedFiles, setAttachedFiles] = React.useState<CommittedFile[]>([]);
   const [dragging, setDragging] = React.useState(false);
   const [draft, setDraft] = React.useState<ChatDraft | null>(null);
+  const [editConfirm, setEditConfirm] = React.useState<EditConfirm | null>(null);
   const [selectionChars, setSelectionChars] = React.useState(0);
   const [stats, setStats] = React.useState<DocumentStats>({
     chars: 0,
@@ -346,35 +348,6 @@ const App: React.FC = () => {
   const inputRef = React.useRef<HTMLTextAreaElement>(null);
 
   const settingsIncomplete = !settings.llmBaseUrl.trim() || !settings.llmApiKey.trim();
-
-  const systemTokens = React.useMemo(
-    () =>
-      estimateTokens(
-        systemPrompt({
-          fontName: settings.fontName,
-          bodyPt: settings.bodyPt,
-          titlePt: settings.titlePt,
-          lineSpacingChars: settings.lineSpacingChars,
-          search: Boolean(settings.searxngUrl.trim()),
-          argos: Boolean(settings.argosBaseUrl.trim()),
-          argosPathPrefix,
-          selection: selectionChars > 0,
-          markup: markup && scope !== "none",
-        })
-      ),
-    [
-      settings.fontName,
-      settings.bodyPt,
-      settings.titlePt,
-      settings.lineSpacingChars,
-      settings.searxngUrl,
-      settings.argosBaseUrl,
-      argosPathPrefix,
-      selectionChars,
-      markup,
-      scope,
-    ]
-  );
 
   const runOcr = React.useCallback<OcrRunner>(
     (file, pages, onProgress, signal) => {
@@ -434,31 +407,79 @@ const App: React.FC = () => {
   );
   const readingFiles = pendingFiles.some(isPendingRead);
 
-  // Mirrors the reservation in `runTurn`, so the meter shows what will be sent
-  // rather than what was read.
-  const fileChars = React.useMemo(() => {
-    const reserved =
-      systemTokens * CHARS_PER_TOKEN + attachedDocChars + attachedFocusChars + markupChars;
-    const budget = fileCharBudget(settings.contextLimit, reserved);
-    return filesChars(clampFiles(turnFiles, budget));
+  const promptEstimate = React.useMemo(() => {
+    const base = {
+      fontName: settings.fontName,
+      bodyPt: settings.bodyPt,
+      titlePt: settings.titlePt,
+      lineSpacingChars: settings.lineSpacingChars,
+      search: Boolean(settings.searxngUrl.trim()),
+      argos: Boolean(settings.argosBaseUrl.trim()),
+      argosPathPrefix,
+    };
+    const stable = stableSystemPrompt({ ...base, files: turnFiles.length > 0 });
+    const notes = turnAttachmentNotes({
+      ...base,
+      selection: selectionChars > 0,
+      numbered: scope === "document" && attachedDocChars > 0,
+      markup: withMarkup,
+      hasBody: stats.chars > 0,
+      reviewedBody: scope !== "none",
+    });
+    const tools = buildTools({
+      search: Boolean(settings.searxngUrl.trim()),
+      argos: Boolean(settings.argosBaseUrl.trim()),
+      selection: selectionChars > 0,
+      numbered: scope === "document" && attachedDocChars > 0,
+    });
+    return {
+      stableChars: stable.length,
+      stableTokens: estimateTokens(stable),
+      noteTokens: estimateTokens(notes),
+      toolTokens: toolSchemaTokens(tools),
+    };
   }, [
-    turnFiles,
-    settings.contextLimit,
-    systemTokens,
+    settings.fontName,
+    settings.bodyPt,
+    settings.titlePt,
+    settings.lineSpacingChars,
+    settings.searxngUrl,
+    settings.argosBaseUrl,
+    argosPathPrefix,
+    turnFiles.length,
+    selectionChars,
+    scope,
     attachedDocChars,
-    attachedFocusChars,
-    markupChars,
+    withMarkup,
+    stats.chars,
   ]);
+
+  // Mirrors the reservation in `runTurn`: files are sized from the stable
+  // prompt, not from this turn's document, so the meter matches the prefix.
+  const fileChars = React.useMemo(() => {
+    const budget = fileCharBudget(settings.contextLimit, promptEstimate.stableChars);
+    return filesChars(clampFiles(turnFiles, budget));
+  }, [turnFiles, settings.contextLimit, promptEstimate.stableChars]);
 
   const estimated = React.useMemo(
     () =>
-      systemTokens +
+      promptEstimate.stableTokens +
+      promptEstimate.noteTokens +
+      promptEstimate.toolTokens +
       messagesTokens(toChatMessages(messages)) +
       estimateTokens(input) +
       Math.ceil(
         (attachedDocChars + attachedFocusChars + markupChars + fileChars) / CHARS_PER_TOKEN
       ),
-    [systemTokens, messages, input, attachedDocChars, attachedFocusChars, markupChars, fileChars]
+    [
+      promptEstimate,
+      messages,
+      input,
+      attachedDocChars,
+      attachedFocusChars,
+      markupChars,
+      fileChars,
+    ]
   );
 
   const attachLabel = describeAttachment({
@@ -890,6 +911,43 @@ const App: React.FC = () => {
         onMessage,
         onDelta: (snapshot) => setDraft(snapshot),
         argosPathPrefixes,
+        confirmDocumentEdit: () =>
+          new Promise<"allow" | "decline">((resolve, reject) => {
+            let settled = false;
+            const finish = (choice: "allow" | "decline") => {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              ac.signal.removeEventListener("abort", onAbort);
+              setEditConfirm(null);
+              resolve(choice);
+            };
+            const onAbort = () => {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              setEditConfirm(null);
+              const reason = ac.signal.reason;
+              if (reason instanceof Error && reason.name === "AbortError") {
+                reject(reason);
+                return;
+              }
+              const error = new Error("中止しました。");
+              error.name = "AbortError";
+              reject(error);
+            };
+            if (ac.signal.aborted) {
+              onAbort();
+              return;
+            }
+            ac.signal.addEventListener("abort", onAbort, { once: true });
+            setEditConfirm({
+              onAllow: () => finish("allow"),
+              onDecline: () => finish("decline"),
+            });
+          }),
       });
       await refreshConversations();
     } catch (error) {
@@ -910,6 +968,7 @@ const App: React.FC = () => {
       setBusy(false);
       setBusyLabel("");
       setDraft(null);
+      setEditConfirm(null);
       // The turn probably edited the document, so the meter needs the new size.
       refreshStats();
     }
@@ -1013,11 +1072,16 @@ const App: React.FC = () => {
 
       {banner && <StatusBanner banner={banner} onDismiss={() => setBanner(null)} />}
 
-      <ChatPane messages={messages} draft={draft} />
+      <ChatPane messages={messages} draft={draft} editConfirm={editConfirm} />
 
       {busy && (
         <div className={styles.row}>
-          <Spinner size="tiny" label={draft ? "生成中…" : `${busyLabel}を待っています…`} />
+          <Spinner
+            size="tiny"
+            label={
+              editConfirm ? "確認を待っています…" : draft ? "生成中…" : `${busyLabel}を待っています…`
+            }
+          />
           <Button appearance="secondary" onClick={cancel}>
             キャンセル
           </Button>

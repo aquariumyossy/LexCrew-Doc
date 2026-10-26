@@ -14,8 +14,11 @@ import {
   SHAPES_MARKER,
   SELECTION_MARKER,
   splitUserMessage,
+  stableSystemPrompt,
   stripAttachment,
+  systemMessageWithFiles,
   systemPrompt,
+  turnAttachmentNotes,
   userMessageForHistory,
   userMessageWithAttachment,
 } from "./prompts";
@@ -33,6 +36,46 @@ describe("systemPrompt", () => {
     expect(text).toContain("ツールを動かす前の文書");
     expect(text).toContain("確かめるために read_paragraphs で読み直しません");
     expect(text).toContain("書く前に read_paragraphs で読み直さず、添付から書きます");
+  });
+
+  it("answers a question in chat and leaves the document alone", () => {
+    const text = systemPrompt({ ...base, search: false, argos: false });
+    expect(text).toContain("質問しているとき、または理由や説明を求めているときは、チャットで答え、文書は変えません");
+  });
+
+  it("keeps the cached prefix free of this turn's document shape", () => {
+    const withBody = stableSystemPrompt({
+      ...base,
+      search: false,
+      argos: false,
+      hasBody: true,
+      selection: true,
+      numbered: true,
+      markup: true,
+      listMarks: true,
+      shapes: true,
+      shapeNumbers: true,
+    });
+    const empty = stableSystemPrompt({
+      ...base,
+      search: false,
+      argos: false,
+      hasBody: false,
+      selection: false,
+      numbered: false,
+    });
+    expect(withBody).toBe(empty);
+    expect(withBody).not.toContain("行頭の [12] はその段落の番号です");
+    expect(withBody).not.toContain("この文書には本文があります");
+    const notes = turnAttachmentNotes({
+      ...base,
+      search: false,
+      argos: false,
+      hasBody: true,
+      numbered: true,
+    });
+    expect(notes).toContain("この文書には本文があります");
+    expect(notes).toContain("行頭の [12] はその段落の番号です");
   });
 
   it("describes both search tools when both providers are on", () => {
@@ -329,10 +372,12 @@ describe("userMessageWithAttachment", () => {
     expect(text).toContain(SELECTION_MARKER);
   });
 
-  it("puts the body and then the selection after the instruction", () => {
+  it("puts the document and the selection before the instruction", () => {
     const text = userMessageWithAttachment("点検して", attachment({ focus: "第2条（報酬）" }));
-    expect(text.indexOf("点検して")).toBeLessThan(text.indexOf("--- 文書全体 ---"));
     expect(text.indexOf("--- 文書全体 ---")).toBeLessThan(text.indexOf("--- 選択範囲 ---"));
+    expect(text.indexOf("--- 選択範囲 ---")).toBeLessThan(text.lastIndexOf("点検して"));
+    expect(text.endsWith("点検して")).toBe(true);
+    expect(text.startsWith("指示は末尾にあります。")).toBe(true);
   });
 
   it("says where the body was cut so the model does not treat it as the end", () => {
@@ -368,24 +413,33 @@ describe("attached files", () => {
   };
 
   it("sends the text behind one marker, naming each file in the body", () => {
-    const text = userMessageWithAttachment("両方を見比べて", EMPTY_ATTACHMENT, [scan, contract]);
-    expect(text.match(/--- 添付ファイル ---/g)).toHaveLength(1);
+    const text = systemMessageWithFiles(
+      stableSystemPrompt({ ...base, search: false, argos: false, files: true }),
+      [scan, contract]
+    );
+    // The rules name the marker once; the section that follows is the only heading.
+    expect(text.split("\n\n--- 添付ファイル ---\n")).toHaveLength(2);
     expect(text).toContain("[1] 覚書.pdf（OCR 読み取り）");
     expect(text).toContain("[2] 契約.docx（テキスト読み取り）");
     expect(text).toContain("第1条 本覚書は…");
     expect(text).toContain("分割払いにしたい。");
+    const rulesAt = text.indexOf("参考資料です");
+    const sectionAt = text.indexOf("\n\n--- 添付ファイル ---\n");
+    expect(rulesAt).toBeGreaterThan(-1);
+    expect(sectionAt).toBeGreaterThan(rulesAt);
   });
 
-  it("puts the material behind the document and before the selection", () => {
-    const text = userMessageWithAttachment("点検して", attachment({ focus: "第2条（報酬）" }), [
-      scan,
-    ]);
-    expect(text.indexOf("--- 文書全体 ---")).toBeLessThan(text.indexOf("--- 添付ファイル ---"));
-    expect(text.indexOf("--- 添付ファイル ---")).toBeLessThan(text.indexOf("--- 選択範囲 ---"));
+  it("keeps the files out of the turn message, ahead of where the instruction ends", () => {
+    const turn = userMessageWithAttachment("点検して", attachment({ focus: "第2条（報酬）" }));
+    expect(turn).not.toContain("--- 添付ファイル ---");
+    expect(turn.endsWith("点検して")).toBe(true);
+    const system = systemMessageWithFiles("ルール", [scan]);
+    expect(system.startsWith("ルール")).toBe(true);
+    expect(system).toContain("第1条 本覚書は…");
   });
 
   it("leaves out a comment section for a file that cannot carry one", () => {
-    const text = userMessageWithAttachment("読んで", EMPTY_ATTACHMENT, [scan]);
+    const text = systemMessageWithFiles("ルール", [scan]);
     expect(text).not.toContain("コメント:");
   });
 
@@ -404,8 +458,9 @@ describe("attached files", () => {
   });
 
   it("writes nothing at all on a turn with no files", () => {
-    expect(userMessageWithAttachment("骨子を作って", EMPTY_ATTACHMENT, [])).toBe("骨子を作って");
+    expect(userMessageWithAttachment("骨子を作って", EMPTY_ATTACHMENT)).toBe("骨子を作って");
     expect(userMessageForHistory("骨子を作って", EMPTY_ATTACHMENT, [])).toBe("骨子を作って");
+    expect(systemMessageWithFiles("ルール", [])).toBe("ルール");
   });
 });
 
@@ -421,8 +476,9 @@ describe("userMessageForHistory", () => {
 
 describe("splitUserMessage", () => {
   it("separates the instruction, the body and the selection", () => {
+    // Stored and older transcripts keep the instruction in front of the markers.
     const parts = splitUserMessage(
-      userMessageWithAttachment("点検して", attachment({ focus: "第2条（報酬）" }))
+      "点検して\n\n--- 文書全体 ---\n第1条（目的）\n第2条（報酬）\n\n--- 選択範囲 ---\n第2条（報酬）"
     );
     expect(parts.instruction).toBe("点検して");
     expect(parts.document).toContain("第1条（目的）");
@@ -430,14 +486,12 @@ describe("splitUserMessage", () => {
   });
 
   it("separates the comments and the tracked changes as well", () => {
-    const parts = splitUserMessage(
-      userMessageWithAttachment(
-        "相手の赤字を教えて",
-        attachment({ markup: true, comments: comments([comment()]), changes: changes([change()]) })
-      )
+    const stored = userMessageForHistory(
+      "相手の赤字を教えて",
+      attachment({ markup: true, comments: comments([comment()]), changes: changes([change()]) })
     );
+    const parts = splitUserMessage(stored);
     expect(parts.instruction).toBe("相手の赤字を教えて");
-    expect(parts.document).toContain("第1条（目的）");
     expect(parts.comments).toContain("分割払いにしたい。");
     expect(parts.changes).toContain("無催告で");
   });
@@ -591,16 +645,17 @@ describe("markup sections", () => {
   });
 
   it("drops the markup on replay, along with the rest of the attachment", () => {
-    const sent = userMessageWithAttachment(
+    const stored = userMessageForHistory(
       "読んで",
       attachment({ markup: true, comments: comments([comment()]), changes: changes([change()]) })
     );
-    expect(stripAttachment(sent)).toBe("読んで");
+    expect(stripAttachment(stored)).toBe("読んで");
   });
 });
 
 describe("stripAttachment", () => {
   it("keeps the instruction only", () => {
-    expect(stripAttachment(userMessageWithAttachment("点検して", attachment()))).toBe("点検して");
+    expect(stripAttachment(userMessageForHistory("点検して", attachment()))).toBe("点検して");
+    expect(stripAttachment("点検して\n\n--- 文書全体 ---\n第1条（目的）")).toBe("点検して");
   });
 });

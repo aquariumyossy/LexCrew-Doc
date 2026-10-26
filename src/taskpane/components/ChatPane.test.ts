@@ -20,15 +20,31 @@ function message(partial: Partial<StoredMessage>): StoredMessage {
   };
 }
 
-function html(messages: StoredMessage[], draft?: { content: string; reasoningContent: string }) {
+function html(
+  messages: StoredMessage[],
+  draft?: { content: string; reasoningContent: string },
+  editConfirm?: { onAllow: () => void; onDecline: () => void } | null
+) {
   return renderToStaticMarkup(
     React.createElement(
       FluentProvider,
       { theme: guriLightTheme },
-      React.createElement(ChatPane, { messages, draft })
+      React.createElement(ChatPane, { messages, draft, editConfirm })
     )
   );
 }
+
+describe("ChatPane edit confirmation", () => {
+  it("shows the question-turn prompt and both buttons", () => {
+    const markup = html([message({ role: "user", content: "なぜ？" })], undefined, {
+      onAllow: () => undefined,
+      onDecline: () => undefined,
+    });
+    expect(markup).toContain("質問への回答として文書を変えようとしています");
+    expect(markup).toContain("変更してよい");
+    expect(markup).toContain("変更せずに答えて");
+  });
+});
 
 describe("ChatPane foreign character notice", () => {
   it("warns when the assistant reply mixes simplified Chinese", () => {

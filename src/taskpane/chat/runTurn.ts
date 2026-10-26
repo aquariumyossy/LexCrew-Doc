@@ -2,10 +2,16 @@ import { Attachment } from "../../shared/attachment";
 import { CommittedFile, clampFiles, fileCharBudget } from "../../shared/fileSource";
 import { NewMessage, StoredMessage } from "../../shared/history";
 import {
-  systemPrompt,
+  stableSystemPrompt,
+  systemMessageWithFiles,
+  turnAttachmentNotes,
   userMessageForHistory,
   userMessageWithAttachment,
 } from "../../shared/prompts";
+import {
+  EDIT_DECLINED_TOOL_RESULT,
+  isQuestionInstruction,
+} from "../../shared/questionTurn";
 import { joinArgosScopes } from "../../shared/argos";
 import { Usage } from "../../shared/stripThinking";
 import {
@@ -16,15 +22,17 @@ import {
 import {
   UNLIMITED_TOOL_ROUNDS,
   buildTools,
+  isDocumentEditTool,
   isToolsUnsupportedError,
   toolRoundLimitNotice,
+  withoutDocumentEdits,
 } from "../../shared/tools";
 import { logInfo } from "../../sidecar/logger";
 import { ChatMessage } from "../../sidecar/types";
 import { ChatBody, chatStream } from "../api";
 import { Settings } from "../settings";
 import { documentHasVisibleText, isWordHost } from "../word";
-import { fitContext, indexedReadCharLimit, messagesTokens, toChatMessages } from "./context";
+import { fitContext, indexedReadCharLimit, requestTokens, toChatMessages } from "./context";
 import { beginToolTurn, executeToolCall } from "./execute";
 import { knownThinkingBudget, readThinkingBudget } from "./thinkingBudget";
 
@@ -50,6 +58,12 @@ export type RunTurnOptions = {
   onDelta?: (snapshot: { content: string; reasoningContent: string }) => void;
   /** Folder prefixes for Argos; empty means the whole index. */
   argosPathPrefixes?: string[];
+  /**
+   * Question turns call this before the first edit. 「allow」 runs it and does
+   * not ask again this turn. 「decline」 skips the edit and withholds editing
+   * tools for the rest of the turn. Absent is treated as decline.
+   */
+  confirmDocumentEdit?: () => Promise<"allow" | "decline">;
 };
 
 export type TurnResult = {
@@ -87,51 +101,54 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   const shown = attachmentShowsBody(options.attachment);
   const hasBody =
     shown !== null ? shown : isWordHost() ? await documentHasVisibleText() : false;
+  const promptBase = {
+    fontName: settings.fontName,
+    bodyPt: settings.bodyPt,
+    titlePt: settings.titlePt,
+    lineSpacingChars: settings.lineSpacingChars,
+    search: Boolean(settings.searxngUrl.trim()),
+    argos: Boolean(settings.argosBaseUrl.trim()),
+    argosPathPrefix: joinArgosScopes(options.argosPathPrefixes || []),
+  };
+  /*
+   * Files are clamped from the stable prompt only. The document and the
+   * instruction change every turn; folding them into the budget would resize
+   * the file text and invalidate the prefix cache from the system message on.
+   */
+  const stable = stableSystemPrompt({
+    ...promptBase,
+    files: Boolean(options.files?.length),
+  });
+  const files = clampFiles(options.files || [], fileCharBudget(limit, stable.length));
+  const notes = turnAttachmentNotes({
+    ...promptBase,
+    hasBody,
+    selection: hasSelection,
+    numbered,
+    markup: options.attachment.markup,
+    reviewedBody: Boolean(options.attachment.document.trim()) || options.attachment.scope !== "none",
+    reviewedFallback: options.attachment.reviewedFallback === true,
+    inlineMarkup: options.attachment.inlineMarkup === true,
+    listMarks: Boolean(options.attachment.listMarks),
+    shapes: Boolean(
+      options.attachment.shapes &&
+        (options.attachment.shapes.text ||
+          options.attachment.shapes.error ||
+          options.attachment.shapes.truncated)
+    ),
+    shapeNumbers: (options.attachment.shapes?.count ?? 0) > 0,
+  });
   const system: ChatMessage = {
     role: "system",
-    content: systemPrompt({
-      fontName: settings.fontName,
-      bodyPt: settings.bodyPt,
-      titlePt: settings.titlePt,
-      lineSpacingChars: settings.lineSpacingChars,
-      hasBody,
-      search: Boolean(settings.searxngUrl.trim()),
-      argos: Boolean(settings.argosBaseUrl.trim()),
-      argosPathPrefix: joinArgosScopes(options.argosPathPrefixes || []),
-      selection: hasSelection,
-      numbered,
-      markup: options.attachment.markup,
-      reviewedBody: Boolean(options.attachment.document.trim()) || options.attachment.scope !== "none",
-      reviewedFallback: options.attachment.reviewedFallback === true,
-      inlineMarkup: options.attachment.inlineMarkup === true,
-      files: Boolean(options.files?.length),
-      listMarks: Boolean(options.attachment.listMarks),
-      shapes: Boolean(
-        options.attachment.shapes &&
-          (options.attachment.shapes.text ||
-            options.attachment.shapes.error ||
-            options.attachment.shapes.truncated)
-      ),
-      shapeNumbers: (options.attachment.shapes?.count ?? 0) > 0,
-    }),
+    content: systemMessageWithFiles(stable, files),
   };
-
-  /*
-   * The files share what the rest of this request does not already take. They
-   * sit in the current message, which `dropOldest` never drops, so anything
-   * over the window has to be cut here rather than trimmed later.
-   */
-  const reserved =
-    system.content.length +
-    userMessageWithAttachment(options.instruction, options.attachment).length;
-  const files = clampFiles(options.files || [], fileCharBudget(limit, reserved));
 
   const messages: ChatMessage[] = [
     system,
     ...toChatMessages(options.history),
     {
       role: "user",
-      content: userMessageWithAttachment(options.instruction, options.attachment, files),
+      content: userMessageWithAttachment(options.instruction, options.attachment, notes),
     },
   ];
   await options.onMessage({
@@ -142,7 +159,10 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   // An insert hands out numbers for its new paragraphs, so from that round on
   // the tools take a paragraph number even when the attachment had none.
   let numbersHandedOut = false;
-  const toolsFor = () =>
+  const question = isQuestionInstruction(options.instruction);
+  let editsAllowed = !question;
+  let editsDeclined = false;
+  const offeredTools = () =>
     buildTools({
       search: Boolean(settings.searxngUrl.trim()),
       argos: Boolean(settings.argosBaseUrl.trim()),
@@ -151,6 +171,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       insertedNumbers: numbersHandedOut,
       shapes: (options.attachment.shapes?.count ?? 0) > 0,
     });
+  const toolsFor = () => (editsDeclined ? withoutDocumentEdits(offeredTools()) : offeredTools());
   let tools = toolsFor();
   let toolsSupported = true;
   let lastUsage: Usage | null = null;
@@ -191,7 +212,11 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       totalTokens: meter.totalTokens,
       elapsedMs: Date.now() - started,
     });
-    return { usage, nextRequestTokens: messagesTokens(fitContext(messages, limit)) };
+    const nextTools = offeredTools();
+    return {
+      usage,
+      nextRequestTokens: requestTokens(fitContext(messages, limit, nextTools), nextTools),
+    };
   };
 
   const toldNoBudget = options.history.some(
@@ -264,12 +289,13 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
 
   const send = async (withTools: boolean) => {
     meter.llmCalls += 1;
+    const activeTools = withTools && toolsSupported ? tools : undefined;
     const body: ChatBody = {
       llmBaseUrl: settings.llmBaseUrl,
       llmApiKey: settings.llmApiKey,
       model: settings.llmModel,
-      messages: fitContext(messages, limit),
-      tools: withTools && toolsSupported ? tools : undefined,
+      messages: fitContext(messages, limit, activeTools),
+      tools: activeTools,
       timeoutMs: settings.timeoutMs,
     };
     options.onDelta?.({ content: "", reasoningContent: "" });
@@ -284,7 +310,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       }
       toolsSupported = false;
       meter.llmCalls += 1;
-      return stream({ ...body, tools: undefined });
+      return stream({ ...body, tools: undefined, messages: fitContext(messages, limit) });
     }
   };
 
@@ -330,6 +356,31 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
 
     for (const call of completion.toolCalls) {
       signal.throwIfAborted();
+      if (question && !editsAllowed && isDocumentEditTool(call.function.name) && !editsDeclined) {
+        const choice = options.confirmDocumentEdit
+          ? await options.confirmDocumentEdit()
+          : "decline";
+        signal.throwIfAborted();
+        if (choice === "allow") {
+          editsAllowed = true;
+        } else {
+          editsDeclined = true;
+          tools = toolsFor();
+        }
+      }
+      if (editsDeclined && isDocumentEditTool(call.function.name)) {
+        await options.onMessage({
+          role: "tool",
+          content: EDIT_DECLINED_TOOL_RESULT,
+          toolCallId: call.id,
+        });
+        messages.push({
+          role: "tool",
+          content: EDIT_DECLINED_TOOL_RESULT,
+          tool_call_id: call.id,
+        });
+        continue;
+      }
       const toolContents = messages
         .filter((message) => message.role === "tool")
         .map((message) => message.content || "");

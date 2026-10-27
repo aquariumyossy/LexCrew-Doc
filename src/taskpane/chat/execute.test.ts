@@ -38,6 +38,7 @@ vi.mock("../word", () => ({
 vi.mock("../api", () => ({ search: vi.fn(), searchArgosIndex: vi.fn(), readArgosFile: vi.fn() }));
 vi.mock("../files/read", () => ({ readBuffer }));
 
+import { ABORTED_TOOL_RESULT } from "./context";
 import { beginToolTurn, executeToolCall } from "./execute";
 import { readArgosFile, searchArgosIndex } from "../api";
 
@@ -98,6 +99,23 @@ describe("insert_blocks placement", () => {
       new AbortController().signal
     );
     expect(continued.content).toContain("直前に挿入した段落の続き");
+  });
+
+  it("returns 中止しました when the edit is aborted", async () => {
+    const controller = new AbortController();
+    insertDraftParagraphs.mockImplementation(() => {
+      controller.abort();
+      const error = new Error("The operation was aborted.");
+      error.name = "AbortError";
+      throw error;
+    });
+    const result = await executeToolCall(
+      insertCall({ blocks: [{ type: "body", text: "前文" }] }),
+      DEFAULT_SETTINGS,
+      controller.signal
+    );
+    expect(result.content).toBe(ABORTED_TOOL_RESULT);
+    expect(result.ok).toBe(false);
   });
 
   it("passes the quote through so the blocks go after a named clause", async () => {

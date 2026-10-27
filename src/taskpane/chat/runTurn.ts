@@ -2,7 +2,9 @@ import { Attachment } from "../../shared/attachment";
 import { CommittedFile, clampFiles, fileCharBudget } from "../../shared/fileSource";
 import { NewMessage, StoredMessage } from "../../shared/history";
 import {
-  systemPrompt,
+  stableSystemPrompt,
+  systemMessageWithFiles,
+  turnAttachmentNotes,
   userMessageForHistory,
   userMessageWithAttachment,
 } from "../../shared/prompts";
@@ -24,7 +26,13 @@ import { ChatMessage } from "../../sidecar/types";
 import { ChatBody, chatStream } from "../api";
 import { Settings } from "../settings";
 import { documentHasVisibleText, isWordHost } from "../word";
-import { fitContext, indexedReadCharLimit, messagesTokens, toChatMessages } from "./context";
+import {
+  ABORTED_TOOL_RESULT,
+  fitContext,
+  indexedReadCharLimit,
+  requestTokens,
+  toChatMessages,
+} from "./context";
 import { beginToolTurn, executeToolCall } from "./execute";
 import { knownThinkingBudget, readThinkingBudget } from "./thinkingBudget";
 
@@ -64,6 +72,13 @@ function withFinishReason(done: Streamed): Streamed {
   return done.usage ? { ...done, usage: { ...done.usage, finishReason: done.finishReason } } : done;
 }
 
+function isAbortError(error: unknown, signal: AbortSignal): boolean {
+  if (signal.aborted) {
+    return true;
+  }
+  return error instanceof Error && error.name === "AbortError";
+}
+
 function silentEndNotice(finishReason: string): string {
   return `モデルが本文も操作も返さずに終わりました（終了理由: ${finishReason || "不明"}）。もう一度送るか、指示を分けてください。`;
 }
@@ -85,53 +100,57 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   // Numbers are only addresses if the model was handed them with the body.
   const numbered = Boolean(options.attachment.document.trim());
   const shown = attachmentShowsBody(options.attachment);
-  const hasBody =
-    shown !== null ? shown : isWordHost() ? await documentHasVisibleText() : false;
+  const hasBody = shown !== null ? shown : isWordHost() ? await documentHasVisibleText() : false;
+  const promptBase = {
+    fontName: settings.fontName,
+    bodyPt: settings.bodyPt,
+    titlePt: settings.titlePt,
+    lineSpacingChars: settings.lineSpacingChars,
+    search: Boolean(settings.searxngUrl.trim()),
+    argos: Boolean(settings.argosBaseUrl.trim()),
+    argosPathPrefix: joinArgosScopes(options.argosPathPrefixes || []),
+  };
+  /*
+   * The file budget does not yield to the document. Files are clamped from
+   * the stable prompt only. The document and the instruction change every
+   * turn; folding them into the budget would resize the file text and
+   * invalidate the prefix cache from the system message on.
+   */
+  const stable = stableSystemPrompt({
+    ...promptBase,
+    files: Boolean(options.files?.length),
+  });
+  const files = clampFiles(options.files || [], fileCharBudget(limit, stable.length));
+  const notes = turnAttachmentNotes({
+    ...promptBase,
+    hasBody,
+    selection: hasSelection,
+    numbered,
+    markup: options.attachment.markup,
+    reviewedBody:
+      Boolean(options.attachment.document.trim()) || options.attachment.scope !== "none",
+    reviewedFallback: options.attachment.reviewedFallback === true,
+    inlineMarkup: options.attachment.inlineMarkup === true,
+    listMarks: Boolean(options.attachment.listMarks),
+    shapes: Boolean(
+      options.attachment.shapes &&
+      (options.attachment.shapes.text ||
+        options.attachment.shapes.error ||
+        options.attachment.shapes.truncated)
+    ),
+    shapeNumbers: (options.attachment.shapes?.count ?? 0) > 0,
+  });
   const system: ChatMessage = {
     role: "system",
-    content: systemPrompt({
-      fontName: settings.fontName,
-      bodyPt: settings.bodyPt,
-      titlePt: settings.titlePt,
-      lineSpacingChars: settings.lineSpacingChars,
-      hasBody,
-      search: Boolean(settings.searxngUrl.trim()),
-      argos: Boolean(settings.argosBaseUrl.trim()),
-      argosPathPrefix: joinArgosScopes(options.argosPathPrefixes || []),
-      selection: hasSelection,
-      numbered,
-      markup: options.attachment.markup,
-      reviewedBody: Boolean(options.attachment.document.trim()) || options.attachment.scope !== "none",
-      reviewedFallback: options.attachment.reviewedFallback === true,
-      inlineMarkup: options.attachment.inlineMarkup === true,
-      files: Boolean(options.files?.length),
-      listMarks: Boolean(options.attachment.listMarks),
-      shapes: Boolean(
-        options.attachment.shapes &&
-          (options.attachment.shapes.text ||
-            options.attachment.shapes.error ||
-            options.attachment.shapes.truncated)
-      ),
-      shapeNumbers: (options.attachment.shapes?.count ?? 0) > 0,
-    }),
+    content: systemMessageWithFiles(stable, files),
   };
-
-  /*
-   * The files share what the rest of this request does not already take. They
-   * sit in the current message, which `dropOldest` never drops, so anything
-   * over the window has to be cut here rather than trimmed later.
-   */
-  const reserved =
-    system.content.length +
-    userMessageWithAttachment(options.instruction, options.attachment).length;
-  const files = clampFiles(options.files || [], fileCharBudget(limit, reserved));
 
   const messages: ChatMessage[] = [
     system,
     ...toChatMessages(options.history),
     {
       role: "user",
-      content: userMessageWithAttachment(options.instruction, options.attachment, files),
+      content: userMessageWithAttachment(options.instruction, options.attachment, notes),
     },
   ];
   await options.onMessage({
@@ -142,7 +161,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   // An insert hands out numbers for its new paragraphs, so from that round on
   // the tools take a paragraph number even when the attachment had none.
   let numbersHandedOut = false;
-  const toolsFor = () =>
+  const offeredTools = () =>
     buildTools({
       search: Boolean(settings.searxngUrl.trim()),
       argos: Boolean(settings.argosBaseUrl.trim()),
@@ -151,7 +170,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       insertedNumbers: numbersHandedOut,
       shapes: (options.attachment.shapes?.count ?? 0) > 0,
     });
-  let tools = toolsFor();
+  let tools = offeredTools();
   let toolsSupported = true;
   let lastUsage: Usage | null = null;
   const started = Date.now();
@@ -191,7 +210,11 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       totalTokens: meter.totalTokens,
       elapsedMs: Date.now() - started,
     });
-    return { usage, nextRequestTokens: messagesTokens(fitContext(messages, limit)) };
+    const nextTools = offeredTools();
+    return {
+      usage,
+      nextRequestTokens: requestTokens(fitContext(messages, limit, nextTools), nextTools),
+    };
   };
 
   const toldNoBudget = options.history.some(
@@ -264,12 +287,13 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
 
   const send = async (withTools: boolean) => {
     meter.llmCalls += 1;
+    const activeTools = withTools && toolsSupported ? tools : undefined;
     const body: ChatBody = {
       llmBaseUrl: settings.llmBaseUrl,
       llmApiKey: settings.llmApiKey,
       model: settings.llmModel,
-      messages: fitContext(messages, limit),
-      tools: withTools && toolsSupported ? tools : undefined,
+      messages: fitContext(messages, limit, activeTools),
+      tools: activeTools,
       timeoutMs: settings.timeoutMs,
     };
     options.onDelta?.({ content: "", reasoningContent: "" });
@@ -284,7 +308,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       }
       toolsSupported = false;
       meter.llmCalls += 1;
-      return stream({ ...body, tools: undefined });
+      return stream({ ...body, tools: undefined, messages: fitContext(messages, limit) });
     }
   };
 
@@ -328,23 +352,53 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       return end(lastUsage);
     }
 
-    for (const call of completion.toolCalls) {
-      signal.throwIfAborted();
-      const toolContents = messages
-        .filter((message) => message.role === "tool")
-        .map((message) => message.content || "");
-      const outcome = await executeToolCall(call, settings, signal, {
-        argosPathPrefixes: options.argosPathPrefixes,
-        indexedReadChars: indexedReadCharLimit(limit, toolContents),
-        hasBody,
-        userMessagesText,
-      });
-      await options.onMessage({ role: "tool", content: outcome.content, toolCallId: call.id });
-      messages.push({ role: "tool", content: outcome.content, tool_call_id: call.id });
-      if (outcome.numbered && !numbersHandedOut) {
-        numbersHandedOut = true;
-        tools = toolsFor();
+    // Ids are `call_${index}` when the server omits them, so they repeat across
+    // rounds. Only results written for this round count as answering this round.
+    const answeredThisRound = new Set<string>();
+    try {
+      for (const call of completion.toolCalls) {
+        signal.throwIfAborted();
+        const toolContents = messages
+          .filter((message) => message.role === "tool")
+          .map((message) => message.content || "");
+        const outcome = await executeToolCall(call, settings, signal, {
+          argosPathPrefixes: options.argosPathPrefixes,
+          indexedReadChars: indexedReadCharLimit(limit, toolContents),
+          hasBody,
+          userMessagesText,
+        });
+        await options.onMessage({ role: "tool", content: outcome.content, toolCallId: call.id });
+        messages.push({ role: "tool", content: outcome.content, tool_call_id: call.id });
+        answeredThisRound.add(call.id);
+        if (outcome.numbered && !numbersHandedOut) {
+          numbersHandedOut = true;
+          tools = offeredTools();
+        }
+        signal.throwIfAborted();
       }
+    } catch (error) {
+      if (!isAbortError(error, signal)) {
+        throw error;
+      }
+      // The assistant turn is already stored with tool_calls. Close every call
+      // that did not finish, or the next request is rejected.
+      for (const call of completion.toolCalls) {
+        if (answeredThisRound.has(call.id)) {
+          continue;
+        }
+        await options.onMessage({
+          role: "tool",
+          content: ABORTED_TOOL_RESULT,
+          toolCallId: call.id,
+        });
+        messages.push({
+          role: "tool",
+          content: ABORTED_TOOL_RESULT,
+          tool_call_id: call.id,
+        });
+        answeredThisRound.add(call.id);
+      }
+      throw error;
     }
     round += 1;
   }

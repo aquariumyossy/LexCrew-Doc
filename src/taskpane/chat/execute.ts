@@ -33,6 +33,7 @@ import {
   parseToolArguments,
 } from "../../shared/tools";
 import { readArgosFile, search, searchArgosIndex } from "../api";
+import { ABORTED_TOOL_RESULT } from "./context";
 import { sliceIndexedText } from "../../shared/indexedRead";
 import { Settings } from "../settings";
 import {
@@ -120,6 +121,13 @@ export type ExecuteOptions = {
 
 function failed(message: string): ToolOutcome {
   return { content: `エラー: ${message}`, ok: false };
+}
+
+function isAbortError(error: unknown, signal: AbortSignal): boolean {
+  if (signal.aborted) {
+    return true;
+  }
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function blockOptions(settings: Settings): FontOptions {
@@ -273,7 +281,10 @@ export async function executeToolCall(
 
       case TOOL_REPLACE_SELECTION: {
         const note = await replaceSelection(invocation.args.text);
-        return { content: withNote("選択範囲を置き換えました（変更履歴に記録）。", note), ok: true };
+        return {
+          content: withNote("選択範囲を置き換えました（変更履歴に記録）。", note),
+          ok: true,
+        };
       }
 
       case TOOL_REPLACE_QUOTE: {
@@ -462,6 +473,9 @@ export async function executeToolCall(
         return failed(`${call.function.name} は実行できません。`);
     }
   } catch (error) {
+    if (isAbortError(error, signal)) {
+      return { content: ABORTED_TOOL_RESULT, ok: false };
+    }
     return failed(error instanceof Error ? error.message : "Word の操作に失敗しました。");
   }
 }

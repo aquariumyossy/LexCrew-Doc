@@ -59,9 +59,10 @@ import { assertChatInput } from "../../shared/guards";
 import { REMOTE_OCR_NOTICE, isLoopbackUrl } from "../../shared/ocr";
 import { ConversationSummary, NewMessage, StoredMessage } from "../../shared/history";
 import { joinArgosScopes, parseArgosScopes } from "../../shared/argos";
-import { systemPrompt } from "../../shared/prompts";
+import { stableSystemPrompt, turnAttachmentNotes } from "../../shared/prompts";
 import {
   TOOL_ROUND_PRESETS,
+  buildTools,
   normalizeMaxToolRounds,
   toolRoundPresetLabel,
 } from "../../shared/tools";
@@ -80,11 +81,18 @@ import {
   saveStoredConnection,
   setConversationFiles as saveConversationFiles,
 } from "../api";
-import { estimateTokens, messagesTokens, toChatMessages } from "../chat/context";
+import { estimateTokens, messagesTokens, toChatMessages, toolSchemaTokens } from "../chat/context";
 import { runTurn } from "../chat/runTurn";
 import { forgetThinkingBudget, readThinkingBudget } from "../chat/thinkingBudget";
 import { applyAdopt } from "../connectionState";
-import { FONT_CHOICES, Settings, clampTimeoutMs, loadSettings, saveSettings, setKeepConnectionInStorage } from "../settings";
+import {
+  FONT_CHOICES,
+  Settings,
+  clampTimeoutMs,
+  loadSettings,
+  saveSettings,
+  setKeepConnectionInStorage,
+} from "../settings";
 import { UiFontSize, applyUiFont, normalizeUiFontSize, readUiFontScale, uiPx } from "../uiFont";
 import {
   DocumentStats,
@@ -347,35 +355,6 @@ const App: React.FC = () => {
 
   const settingsIncomplete = !settings.llmBaseUrl.trim() || !settings.llmApiKey.trim();
 
-  const systemTokens = React.useMemo(
-    () =>
-      estimateTokens(
-        systemPrompt({
-          fontName: settings.fontName,
-          bodyPt: settings.bodyPt,
-          titlePt: settings.titlePt,
-          lineSpacingChars: settings.lineSpacingChars,
-          search: Boolean(settings.searxngUrl.trim()),
-          argos: Boolean(settings.argosBaseUrl.trim()),
-          argosPathPrefix,
-          selection: selectionChars > 0,
-          markup: markup && scope !== "none",
-        })
-      ),
-    [
-      settings.fontName,
-      settings.bodyPt,
-      settings.titlePt,
-      settings.lineSpacingChars,
-      settings.searxngUrl,
-      settings.argosBaseUrl,
-      argosPathPrefix,
-      selectionChars,
-      markup,
-      scope,
-    ]
-  );
-
   const runOcr = React.useCallback<OcrRunner>(
     (file, pages, onProgress, signal) => {
       // Said as the read starts, not when the file is picked: a PDF with a text
@@ -434,31 +413,72 @@ const App: React.FC = () => {
   );
   const readingFiles = pendingFiles.some(isPendingRead);
 
-  // Mirrors the reservation in `runTurn`, so the meter shows what will be sent
-  // rather than what was read.
-  const fileChars = React.useMemo(() => {
-    const reserved =
-      systemTokens * CHARS_PER_TOKEN + attachedDocChars + attachedFocusChars + markupChars;
-    const budget = fileCharBudget(settings.contextLimit, reserved);
-    return filesChars(clampFiles(turnFiles, budget));
+  const promptEstimate = React.useMemo(() => {
+    const base = {
+      fontName: settings.fontName,
+      bodyPt: settings.bodyPt,
+      titlePt: settings.titlePt,
+      lineSpacingChars: settings.lineSpacingChars,
+      search: Boolean(settings.searxngUrl.trim()),
+      argos: Boolean(settings.argosBaseUrl.trim()),
+      argosPathPrefix,
+    };
+    const stable = stableSystemPrompt({ ...base, files: turnFiles.length > 0 });
+    const notes = turnAttachmentNotes({
+      ...base,
+      selection: selectionChars > 0,
+      numbered: scope === "document" && attachedDocChars > 0,
+      markup: withMarkup,
+      hasBody: stats.chars > 0,
+      reviewedBody: scope !== "none",
+    });
+    const tools = buildTools({
+      search: Boolean(settings.searxngUrl.trim()),
+      argos: Boolean(settings.argosBaseUrl.trim()),
+      selection: selectionChars > 0,
+      numbered: scope === "document" && attachedDocChars > 0,
+    });
+    return {
+      stableChars: stable.length,
+      stableTokens: estimateTokens(stable),
+      noteTokens: estimateTokens(notes),
+      toolTokens: toolSchemaTokens(tools),
+    };
   }, [
-    turnFiles,
-    settings.contextLimit,
-    systemTokens,
+    settings.fontName,
+    settings.bodyPt,
+    settings.titlePt,
+    settings.lineSpacingChars,
+    settings.searxngUrl,
+    settings.argosBaseUrl,
+    argosPathPrefix,
+    turnFiles.length,
+    selectionChars,
+    scope,
     attachedDocChars,
-    attachedFocusChars,
-    markupChars,
+    withMarkup,
+    stats.chars,
   ]);
+
+  // The file budget does not yield to the document. Same reservation as
+  // `runTurn`: files are sized from the stable prompt only, so the meter
+  // matches the prefix.
+  const fileChars = React.useMemo(() => {
+    const budget = fileCharBudget(settings.contextLimit, promptEstimate.stableChars);
+    return filesChars(clampFiles(turnFiles, budget));
+  }, [turnFiles, settings.contextLimit, promptEstimate.stableChars]);
 
   const estimated = React.useMemo(
     () =>
-      systemTokens +
+      promptEstimate.stableTokens +
+      promptEstimate.noteTokens +
+      promptEstimate.toolTokens +
       messagesTokens(toChatMessages(messages)) +
       estimateTokens(input) +
       Math.ceil(
         (attachedDocChars + attachedFocusChars + markupChars + fileChars) / CHARS_PER_TOKEN
       ),
-    [systemTokens, messages, input, attachedDocChars, attachedFocusChars, markupChars, fileChars]
+    [promptEstimate, messages, input, attachedDocChars, attachedFocusChars, markupChars, fileChars]
   );
 
   const attachLabel = describeAttachment({
@@ -1196,7 +1216,9 @@ const App: React.FC = () => {
                   <Input
                     size="small"
                     value={settings.llmBaseUrl}
-                    onChange={(_, d) => setSettings((current) => ({ ...current, llmBaseUrl: d.value }))}
+                    onChange={(_, d) =>
+                      setSettings((current) => ({ ...current, llmBaseUrl: d.value }))
+                    }
                     placeholder="http://192.168.x.x:8000/v1"
                   />
                 </Field>
@@ -1209,7 +1231,9 @@ const App: React.FC = () => {
                     size="small"
                     type="password"
                     value={settings.llmApiKey}
-                    onChange={(_, d) => setSettings((current) => ({ ...current, llmApiKey: d.value }))}
+                    onChange={(_, d) =>
+                      setSettings((current) => ({ ...current, llmApiKey: d.value }))
+                    }
                     placeholder="mtplx の API キー"
                   />
                 </Field>
@@ -1246,7 +1270,9 @@ const App: React.FC = () => {
                   <Input
                     size="small"
                     value={settings.searxngUrl}
-                    onChange={(_, d) => setSettings((current) => ({ ...current, searxngUrl: d.value }))}
+                    onChange={(_, d) =>
+                      setSettings((current) => ({ ...current, searxngUrl: d.value }))
+                    }
                     placeholder="http://192.168.x.x:8080"
                   />
                 </Field>

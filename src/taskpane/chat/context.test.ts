@@ -280,7 +280,7 @@ describe("tool call ids repeat across turns", () => {
     ).toEqual([
       ["user", "", "あ".repeat(400)],
       ["assistant", "", ""],
-      ["tool", "call_1", "第2条だけ残った"],
+      ["tool", "call_1", STALE_DOCUMENT_READ],
       ["tool", "call_0", ABORTED_TOOL_RESULT],
       ["user", "", "つぎ"],
       ["assistant", "", ""],
@@ -333,6 +333,41 @@ describe("tool call ids repeat across turns", () => {
     const replayed = toChatMessages(transcript);
     expect(JSON.stringify(replayed)).toBe(JSON.stringify(replayAtD0315ae(transcript)));
     expect(replayed[2].content).toBe(STALE_DOCUMENT_READ);
+  });
+
+  it("stubs each read from the call that produced it when call_0 is reused", () => {
+    const oldRead = "[1] 古い条の本文";
+    const formatted = "太字にしました。";
+    const transcript: StoredMessage[] = [
+      stored({ role: "user", content: "読んで" }),
+      calls(["call_0"], "read_paragraphs"),
+      toolResult("call_0", oldRead),
+      stored({ role: "user", content: "太字にして" }),
+      calls(["call_0"], "format_text"),
+      toolResult("call_0", formatted),
+    ];
+    const replayed = toChatMessages(transcript);
+    const tools = replayed
+      .filter((message) => message.role === "tool")
+      .map((message) => message.content);
+    expect(tools).toEqual([STALE_DOCUMENT_READ, formatted]);
+    expect(replayed.some((message) => message.content === oldRead)).toBe(false);
+  });
+
+  it("leaves a conversation with unique ids byte-identical to the old id map", () => {
+    const transcript: StoredMessage[] = [
+      stored({ role: "user", content: "読んで" }),
+      calls(["c-read"], "read_paragraphs"),
+      toolResult("c-read", "[1] 第1条 甲は乙に委託する。"),
+      calls(["c-find"], "find_in_document"),
+      toolResult("c-find", "[8] 第6条を準用する"),
+      calls(["c-format"], "format_text"),
+      toolResult("c-format", "太字にしました。"),
+      stored({ role: "assistant", content: "直しました。" }),
+    ];
+    expect(JSON.stringify(toChatMessages(transcript))).toBe(
+      JSON.stringify(replayAtD0315ae(transcript))
+    );
   });
 });
 

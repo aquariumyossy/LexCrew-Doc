@@ -30,6 +30,38 @@ function html(messages: StoredMessage[], draft?: { content: string; reasoningCon
   );
 }
 
+describe("ChatPane tool names", () => {
+  it("reads the name from the call just before the result when call_0 is reused", () => {
+    const hits = JSON.stringify([
+      { title: "民法", url: "http://example.test/minpo", content: "条文" },
+    ]);
+    const markup = html([
+      message({
+        id: 1,
+        role: "assistant",
+        toolCalls: [
+          {
+            id: "call_0",
+            type: "function",
+            function: { name: "search", arguments: '{"q":"民法"}' },
+          },
+        ],
+      }),
+      message({ id: 2, role: "tool", toolCallId: "call_0", content: hits }),
+      message({
+        id: 3,
+        role: "assistant",
+        toolCalls: [
+          { id: "call_0", type: "function", function: { name: "format_text", arguments: "{}" } },
+        ],
+      }),
+      message({ id: 4, role: "tool", toolCallId: "call_0", content: "太字にしました。" }),
+    ]);
+    expect(markup).toContain("検索結果 1 件");
+    expect(markup).toContain("民法");
+  });
+});
+
 describe("ChatPane foreign character notice", () => {
   it("warns when the assistant reply mixes simplified Chinese", () => {
     const markup = html([message({ content: "这个条款を直しました。" })]);

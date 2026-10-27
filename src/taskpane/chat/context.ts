@@ -60,21 +60,46 @@ export function requestTokens(messages: ChatMessage[], tools?: readonly unknown[
  * stub instead of the read would not close that gap, because the model still
  * has to see the snapshot before the turn ends.
  */
-function toolNameById(stored: StoredMessage[]): Map<string, string> {
-  const names = new Map<string, string>();
-  for (const message of stored) {
-    for (const call of message.toolCalls) {
-      names.set(call.id, call.function.name);
+/**
+ * Name of the call this tool message answers. The server often omits ids, and
+ * the client then reuses `call_${index}` every round, so a map of the whole
+ * conversation would attach a later call's name to an earlier result. Only the
+ * assistant message immediately before this run of tool messages counts, and
+ * the nth result with an id answers the nth call with that id.
+ */
+export function toolNameForResult(stored: StoredMessage[], index: number): string {
+  let cursor = index;
+  while (cursor > 0 && stored[cursor].role === "tool") {
+    cursor -= 1;
+  }
+  const assistant = stored[cursor];
+  if (cursor === index || assistant?.role !== "assistant") {
+    return "";
+  }
+  const id = stored[index].toolCallId;
+  let seen = 0;
+  for (let at = cursor + 1; at <= index; at += 1) {
+    if (stored[at].role === "tool" && stored[at].toolCallId === id) {
+      seen += 1;
     }
   }
-  return names;
+  let match = 0;
+  for (const call of assistant.toolCalls) {
+    if (call.id !== id) {
+      continue;
+    }
+    match += 1;
+    if (match === seen) {
+      return call.function.name;
+    }
+  }
+  return "";
 }
 
 export function toChatMessages(stored: StoredMessage[]): ChatMessage[] {
-  const names = toolNameById(stored);
-  const chat = stored.map((message) => {
+  const chat = stored.map((message, index) => {
     let content = message.role === "user" ? stripAttachment(message.content) : message.content;
-    if (message.role === "tool" && isDocumentSnapshotTool(names.get(message.toolCallId) || "")) {
+    if (message.role === "tool" && isDocumentSnapshotTool(toolNameForResult(stored, index))) {
       content = STALE_DOCUMENT_READ;
     }
     const mapped: ChatMessage = { role: message.role, content };

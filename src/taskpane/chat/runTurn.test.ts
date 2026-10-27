@@ -19,6 +19,7 @@ import { forgetThinkingBudget } from "./thinkingBudget";
 import { ABORTED_TOOL_RESULT } from "./context";
 import {
   MAX_TOOL_ROUNDS,
+  STALE_DOCUMENT_READ,
   TOOL_FORMAT_TEXT,
   TOOL_SET_OUTLINE,
   UNLIMITED_TOOL_ROUNDS,
@@ -733,6 +734,78 @@ function priorTurn(id: string, result: string): StoredMessage[] {
     },
   ];
 }
+
+function storedTurn(
+  id: number,
+  role: StoredMessage["role"],
+  extra: Partial<StoredMessage>
+): StoredMessage {
+  return {
+    id,
+    role,
+    content: "",
+    reasoningContent: "",
+    toolCalls: [],
+    toolCallId: "",
+    usage: null,
+    createdAt: "",
+    ...extra,
+  };
+}
+
+describe("reused tool call ids", () => {
+  it("stubs the old read, keeps the format result, and sends this turn's read in full", async () => {
+    const oldRead = "[1] 古い条の本文";
+    const formatted = "太字にしました。";
+    const newestRead = "[1] いま読み直した本文";
+    executeToolCall.mockResolvedValue({ content: newestRead, ok: true, numbered: true });
+    chatStream
+      .mockResolvedValueOnce(
+        completion({
+          toolCalls: [toolCall("call_0", "read_paragraphs", '{"from":1}')],
+          finishReason: "tool_calls",
+        })
+      )
+      .mockResolvedValueOnce(completion({ content: "読み直しました。" }));
+    await runTurn({
+      settings,
+      instruction: "もう一度読んで",
+      attachment: attach(""),
+      history: [
+        storedTurn(1, "assistant", {
+          toolCalls: [
+            {
+              id: "call_0",
+              type: "function",
+              function: { name: "read_paragraphs", arguments: "{}" },
+            },
+          ],
+        }),
+        storedTurn(2, "tool", { content: oldRead, toolCallId: "call_0" }),
+        storedTurn(3, "assistant", {
+          toolCalls: [
+            { id: "call_0", type: "function", function: { name: "format_text", arguments: "{}" } },
+          ],
+        }),
+        storedTurn(4, "tool", { content: formatted, toolCallId: "call_0" }),
+      ],
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+    });
+    const firstTools = (chatStream.mock.calls[0][0] as ChatBody).messages.filter(
+      (message) => message.role === "tool"
+    );
+    expect(firstTools.map((message) => message.content)).toEqual([STALE_DOCUMENT_READ, formatted]);
+    const secondTools = (chatStream.mock.calls[1][0] as ChatBody).messages.filter(
+      (message) => message.role === "tool"
+    );
+    expect(secondTools.map((message) => message.content)).toEqual([
+      STALE_DOCUMENT_READ,
+      formatted,
+      newestRead,
+    ]);
+  });
+});
 
 describe("abort during a tool round", () => {
   it("writes 中止しました for this round's call_0 even when history already has call_0", async () => {

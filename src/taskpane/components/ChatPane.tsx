@@ -3,6 +3,7 @@ import { Badge, Text, makeStyles, tokens } from "@fluentui/react-components";
 import { StoredMessage } from "../../shared/history";
 import { foreignCharNoticeForAssistant } from "../../shared/japaneseHan";
 import { splitUserMessage } from "../../shared/prompts";
+import { toolNameForResult } from "../chat/context";
 import { TOOL_SEARCH, TOOL_SEARCH_INDEX, describeToolCall } from "../../shared/tools";
 import { SearchHit } from "../../sidecar/types";
 import { uiPx } from "../uiFont";
@@ -103,17 +104,6 @@ const useStyles = makeStyles({
     marginTop: "6px",
   },
 });
-
-/** Tool replies only carry an id, so the name comes from the call that asked for it. */
-function toolNameById(messages: StoredMessage[]): Map<string, string> {
-  const names = new Map<string, string>();
-  for (const message of messages) {
-    for (const call of message.toolCalls) {
-      names.set(call.id, call.function.name);
-    }
-  }
-  return names;
-}
 
 function parseHits(content: string): SearchHit[] | null {
   try {
@@ -268,7 +258,6 @@ export type ChatPaneProps = {
 
 const ChatPane: React.FC<ChatPaneProps> = ({ messages, draft }) => {
   const styles = useStyles();
-  const names = React.useMemo(() => toolNameById(messages), [messages]);
   const bottomRef = React.useRef<HTMLDivElement>(null);
   const streaming = Boolean(draft);
 
@@ -292,7 +281,7 @@ const ChatPane: React.FC<ChatPaneProps> = ({ messages, draft }) => {
 
   return (
     <div className={styles.root} data-guri="chat">
-      {messages.map((message) => {
+      {messages.map((message, index) => {
         if (message.role === "user") {
           return <UserMessage key={message.id} content={message.content} />;
         }
@@ -310,7 +299,7 @@ const ChatPane: React.FC<ChatPaneProps> = ({ messages, draft }) => {
           <ToolMessage
             key={message.id}
             message={message}
-            name={names.get(message.toolCallId) || ""}
+            name={toolNameForResult(messages, index)}
           />
         );
       })}

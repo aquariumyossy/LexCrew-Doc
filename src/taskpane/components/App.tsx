@@ -85,7 +85,14 @@ import { estimateTokens, messagesTokens, toChatMessages, toolSchemaTokens } from
 import { runTurn } from "../chat/runTurn";
 import { forgetThinkingBudget, readThinkingBudget } from "../chat/thinkingBudget";
 import { applyAdopt } from "../connectionState";
-import { FONT_CHOICES, Settings, clampTimeoutMs, loadSettings, saveSettings, setKeepConnectionInStorage } from "../settings";
+import {
+  FONT_CHOICES,
+  Settings,
+  clampTimeoutMs,
+  loadSettings,
+  saveSettings,
+  setKeepConnectionInStorage,
+} from "../settings";
 import { UiFontSize, applyUiFont, normalizeUiFontSize, readUiFontScale, uiPx } from "../uiFont";
 import {
   DocumentStats,
@@ -101,7 +108,7 @@ import {
 import { OcrRunner, useFileSources } from "../files/useFileSources";
 import { ocrFile } from "../files/ocr";
 import { aboutCopy } from "../about";
-import ChatPane, { ChatDraft, EditConfirm } from "./ChatPane";
+import ChatPane, { ChatDraft } from "./ChatPane";
 import { AboutDialog } from "./AboutDialog";
 import ArgosScopePicker from "./ArgosScopePicker";
 import { FileAttachButton, FileBadges } from "./FileAttachBar";
@@ -330,7 +337,6 @@ const App: React.FC = () => {
   const [attachedFiles, setAttachedFiles] = React.useState<CommittedFile[]>([]);
   const [dragging, setDragging] = React.useState(false);
   const [draft, setDraft] = React.useState<ChatDraft | null>(null);
-  const [editConfirm, setEditConfirm] = React.useState<EditConfirm | null>(null);
   const [selectionChars, setSelectionChars] = React.useState(0);
   const [stats, setStats] = React.useState<DocumentStats>({
     chars: 0,
@@ -472,15 +478,7 @@ const App: React.FC = () => {
       Math.ceil(
         (attachedDocChars + attachedFocusChars + markupChars + fileChars) / CHARS_PER_TOKEN
       ),
-    [
-      promptEstimate,
-      messages,
-      input,
-      attachedDocChars,
-      attachedFocusChars,
-      markupChars,
-      fileChars,
-    ]
+    [promptEstimate, messages, input, attachedDocChars, attachedFocusChars, markupChars, fileChars]
   );
 
   const attachLabel = describeAttachment({
@@ -912,43 +910,6 @@ const App: React.FC = () => {
         onMessage,
         onDelta: (snapshot) => setDraft(snapshot),
         argosPathPrefixes,
-        confirmDocumentEdit: () =>
-          new Promise<"allow" | "decline">((resolve, reject) => {
-            let settled = false;
-            const finish = (choice: "allow" | "decline") => {
-              if (settled) {
-                return;
-              }
-              settled = true;
-              ac.signal.removeEventListener("abort", onAbort);
-              setEditConfirm(null);
-              resolve(choice);
-            };
-            const onAbort = () => {
-              if (settled) {
-                return;
-              }
-              settled = true;
-              setEditConfirm(null);
-              const reason = ac.signal.reason;
-              if (reason instanceof Error && reason.name === "AbortError") {
-                reject(reason);
-                return;
-              }
-              const error = new Error("中止しました。");
-              error.name = "AbortError";
-              reject(error);
-            };
-            if (ac.signal.aborted) {
-              onAbort();
-              return;
-            }
-            ac.signal.addEventListener("abort", onAbort, { once: true });
-            setEditConfirm({
-              onAllow: () => finish("allow"),
-              onDecline: () => finish("decline"),
-            });
-          }),
       });
       await refreshConversations();
     } catch (error) {
@@ -969,7 +930,6 @@ const App: React.FC = () => {
       setBusy(false);
       setBusyLabel("");
       setDraft(null);
-      setEditConfirm(null);
       // The turn probably edited the document, so the meter needs the new size.
       refreshStats();
     }
@@ -1073,16 +1033,11 @@ const App: React.FC = () => {
 
       {banner && <StatusBanner banner={banner} onDismiss={() => setBanner(null)} />}
 
-      <ChatPane messages={messages} draft={draft} editConfirm={editConfirm} />
+      <ChatPane messages={messages} draft={draft} />
 
       {busy && (
         <div className={styles.row}>
-          <Spinner
-            size="tiny"
-            label={
-              editConfirm ? "確認を待っています…" : draft ? "生成中…" : `${busyLabel}を待っています…`
-            }
-          />
+          <Spinner size="tiny" label={draft ? "生成中…" : `${busyLabel}を待っています…`} />
           <Button appearance="secondary" onClick={cancel}>
             キャンセル
           </Button>
@@ -1261,7 +1216,9 @@ const App: React.FC = () => {
                   <Input
                     size="small"
                     value={settings.llmBaseUrl}
-                    onChange={(_, d) => setSettings((current) => ({ ...current, llmBaseUrl: d.value }))}
+                    onChange={(_, d) =>
+                      setSettings((current) => ({ ...current, llmBaseUrl: d.value }))
+                    }
                     placeholder="http://192.168.x.x:8000/v1"
                   />
                 </Field>
@@ -1274,7 +1231,9 @@ const App: React.FC = () => {
                     size="small"
                     type="password"
                     value={settings.llmApiKey}
-                    onChange={(_, d) => setSettings((current) => ({ ...current, llmApiKey: d.value }))}
+                    onChange={(_, d) =>
+                      setSettings((current) => ({ ...current, llmApiKey: d.value }))
+                    }
                     placeholder="mtplx の API キー"
                   />
                 </Field>
@@ -1311,7 +1270,9 @@ const App: React.FC = () => {
                   <Input
                     size="small"
                     value={settings.searxngUrl}
-                    onChange={(_, d) => setSettings((current) => ({ ...current, searxngUrl: d.value }))}
+                    onChange={(_, d) =>
+                      setSettings((current) => ({ ...current, searxngUrl: d.value }))
+                    }
                     placeholder="http://192.168.x.x:8080"
                   />
                 </Field>

@@ -63,25 +63,6 @@ export function isDocumentSnapshotTool(name: string): boolean {
   return name === TOOL_READ_PARAGRAPHS || name === TOOL_FIND_IN_DOCUMENT;
 }
 
-/** Tools that do not modify the open Word document. A question turn may still call these. */
-const READ_ONLY_TOOLS = new Set<string>([
-  TOOL_SEARCH,
-  TOOL_SEARCH_INDEX,
-  TOOL_GET_SELECTION,
-  TOOL_READ_PARAGRAPHS,
-  TOOL_FIND_IN_DOCUMENT,
-  TOOL_READ_INDEXED_FILE,
-]);
-
-/** True when running the tool would change the document. Unknown names are treated as edits. */
-export function isDocumentEditTool(name: string): boolean {
-  return !READ_ONLY_TOOLS.has(name);
-}
-
-export function withoutDocumentEdits(tools: ToolDefinition[]): ToolDefinition[] {
-  return tools.filter((tool) => !isDocumentEditTool(tool.function.name));
-}
-
 /** Default rounds of tool calls before the task pane stops and tells the user. */
 export const MAX_TOOL_ROUNDS = 8;
 /** 0 means keep calling tools until the model answers or the user cancels. */

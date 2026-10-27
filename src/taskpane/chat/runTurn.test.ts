@@ -16,12 +16,10 @@ import {
 } from "../../shared/thinking";
 import { StoredMessage } from "../../shared/history";
 import { forgetThinkingBudget } from "./thinkingBudget";
-import { EDIT_DECLINED_TOOL_RESULT } from "../../shared/questionTurn";
 import { ABORTED_TOOL_RESULT } from "./context";
 import {
   MAX_TOOL_ROUNDS,
   TOOL_FORMAT_TEXT,
-  TOOL_READ_PARAGRAPHS,
   TOOL_SET_OUTLINE,
   UNLIMITED_TOOL_ROUNDS,
   toolRoundLimitNotice,
@@ -499,7 +497,11 @@ describe("runTurn", () => {
   });
 
   it("offers paragraph numbers from the next round once an insert handed some out", async () => {
-    executeToolCall.mockResolvedValue({ content: "3 段落を挿入しました。\n[2] 第1条", ok: true, numbered: true });
+    executeToolCall.mockResolvedValue({
+      content: "3 段落を挿入しました。\n[2] 第1条",
+      ok: true,
+      numbered: true,
+    });
     chatStream
       .mockResolvedValueOnce(
         completion({ toolCalls: [toolCall("c1", "insert_blocks")], finishReason: "tool_calls" })
@@ -510,9 +512,11 @@ describe("runTurn", () => {
     await run("ひな形を入れて");
 
     const properties = (callIndex: number) =>
-      ((chatStream.mock.calls[callIndex][0] as ChatBody).tools as {
-        function: { name: string; parameters: { properties: Record<string, unknown> } };
-      }[]).find((tool) => tool.function.name === "format_list")?.function.parameters.properties;
+      (
+        (chatStream.mock.calls[callIndex][0] as ChatBody).tools as {
+          function: { name: string; parameters: { properties: Record<string, unknown> } };
+        }[]
+      ).find((tool) => tool.function.name === "format_list")?.function.parameters.properties;
     expect(properties(0)?.paragraph).toBeUndefined();
     expect(properties(1)?.paragraph).toBeDefined();
   });
@@ -532,9 +536,11 @@ describe("runTurn", () => {
     await run("ひな形を見て");
 
     const properties = (callIndex: number) =>
-      ((chatStream.mock.calls[callIndex][0] as ChatBody).tools as {
-        function: { name: string; parameters: { properties: Record<string, unknown> } };
-      }[]).find((tool) => tool.function.name === "format_list")?.function.parameters.properties;
+      (
+        (chatStream.mock.calls[callIndex][0] as ChatBody).tools as {
+          function: { name: string; parameters: { properties: Record<string, unknown> } };
+        }[]
+      ).find((tool) => tool.function.name === "format_list")?.function.parameters.properties;
     expect(properties(0)?.paragraph).toBeUndefined();
     expect(properties(1)?.paragraph).toBeDefined();
   });
@@ -703,200 +709,98 @@ describe("runTurn", () => {
   });
 });
 
-describe("question turn edit guard", () => {
-  it("runs an edit on a normal instruction without asking", async () => {
-    const confirm = vi.fn(async () => "allow" as const);
-    chatStream
-      .mockResolvedValueOnce(
-        completion({
-          toolCalls: [toolCall("c1", TOOL_FORMAT_TEXT, '{"bold":true}')],
-          finishReason: "tool_calls",
-        })
-      )
-      .mockResolvedValueOnce(completion({ content: "直しました。" }));
-    await runTurn({
-      settings,
-      instruction: "見出しを直して",
-      attachment: attach(""),
-      history: [],
-      signal: new AbortController().signal,
-      onMessage: () => undefined,
-      confirmDocumentEdit: confirm,
-    });
-    expect(confirm).not.toHaveBeenCalled();
-    expect(executeToolCall).toHaveBeenCalledTimes(1);
-  });
+function priorTurn(id: string, result: string): StoredMessage[] {
+  return [
+    {
+      id: 1,
+      role: "assistant",
+      content: "",
+      reasoningContent: "",
+      toolCalls: [{ id, type: "function", function: { name: "format_text", arguments: "{}" } }],
+      toolCallId: "",
+      usage: null,
+      createdAt: "",
+    },
+    {
+      id: 2,
+      role: "tool",
+      content: result,
+      reasoningContent: "",
+      toolCalls: [],
+      toolCallId: id,
+      usage: null,
+      createdAt: "",
+    },
+  ];
+}
 
-  it("does not gate a read on a question", async () => {
-    const confirm = vi.fn(async () => "decline" as const);
-    chatStream
-      .mockResolvedValueOnce(
-        completion({
-          toolCalls: [toolCall("c1", TOOL_READ_PARAGRAPHS, '{"from":1}')],
-          finishReason: "tool_calls",
-        })
-      )
-      .mockResolvedValueOnce(completion({ content: "第1条は委託です。" }));
-    await runTurn({
-      settings,
-      instruction: "なぜこの条なの？",
-      attachment: attach(""),
-      history: [],
-      signal: new AbortController().signal,
-      onMessage: () => undefined,
-      confirmDocumentEdit: confirm,
-    });
-    expect(confirm).not.toHaveBeenCalled();
-    expect(executeToolCall).toHaveBeenCalledTimes(1);
-    expect(executeToolCall.mock.calls[0][0].function.name).toBe(TOOL_READ_PARAGRAPHS);
-  });
-
-  it("decline skips the edit and continues with no tools at all", async () => {
-    const confirm = vi.fn(async () => "decline" as const);
-    chatStream
-      .mockResolvedValueOnce(
-        completion({
-          toolCalls: [
-            toolCall("c1", TOOL_READ_PARAGRAPHS, '{"from":1}'),
-            toolCall("c2", TOOL_SET_OUTLINE, '{"level":1}'),
-          ],
-          finishReason: "tool_calls",
-        })
-      )
-      .mockResolvedValueOnce(completion({ content: "チャットで答えます。" }));
-    const sent: NewMessage[] = [];
-    await runTurn({
-      settings,
-      instruction: "なぜ？\n本文は修正しないでチャットで答えて",
-      attachment: attach(""),
-      history: [],
-      signal: new AbortController().signal,
-      onMessage: (message) => {
-        sent.push(message);
-      },
-      confirmDocumentEdit: confirm,
-    });
-    expect(confirm).toHaveBeenCalledTimes(1);
-    expect(executeToolCall).toHaveBeenCalledTimes(1);
-    expect(executeToolCall.mock.calls[0][0].function.name).toBe(TOOL_READ_PARAGRAPHS);
-    expect(sent.some((message) => message.content === EDIT_DECLINED_TOOL_RESULT)).toBe(true);
-    expect(chatStream).toHaveBeenCalledTimes(2);
-    const second = chatStream.mock.calls[1][0] as ChatBody;
-    expect(second.tools).toBeUndefined();
-    const declined = second.messages.find((message) => message.tool_call_id === "c2");
-    expect(declined?.content).toBe(EDIT_DECLINED_TOOL_RESULT);
-  });
-
-  it("allow runs every edit in the turn and does not ask again", async () => {
-    const confirm = vi.fn(async () => "allow" as const);
-    chatStream
-      .mockResolvedValueOnce(
-        completion({
-          toolCalls: [
-            toolCall("c1", TOOL_FORMAT_TEXT, '{"bold":true}'),
-            toolCall("c2", TOOL_FORMAT_TEXT, '{"bold":true}'),
-          ],
-          finishReason: "tool_calls",
-        })
-      )
-      .mockResolvedValueOnce(
-        completion({
-          toolCalls: [toolCall("c3", TOOL_SET_OUTLINE, '{"level":1}')],
-          finishReason: "tool_calls",
-        })
-      )
-      .mockResolvedValueOnce(completion({ content: "直しました。" }));
-    await runTurn({
-      settings,
-      instruction: "この見出しの理由は？",
-      attachment: attach(""),
-      history: [],
-      signal: new AbortController().signal,
-      onMessage: () => undefined,
-      confirmDocumentEdit: confirm,
-    });
-    expect(confirm).toHaveBeenCalledTimes(1);
-    expect(executeToolCall).toHaveBeenCalledTimes(3);
-    const third = chatStream.mock.calls[2][0] as ChatBody;
-    const names = (third.tools as { function: { name: string } }[]).map(
-      (tool) => tool.function.name
-    );
-    expect(names).toContain(TOOL_FORMAT_TEXT);
-    expect(names).toContain(TOOL_SET_OUTLINE);
-  });
-
-  it("writes 中止しました for every unfinished tool call when confirm is aborted", async () => {
+describe("abort during a tool round", () => {
+  it("writes 中止しました for this round's call_0 even when history already has call_0", async () => {
     const controller = new AbortController();
     chatStream.mockResolvedValueOnce(
       completion({
-        toolCalls: [
-          toolCall("c1", TOOL_READ_PARAGRAPHS, '{"from":1}'),
-          toolCall("c2", TOOL_FORMAT_TEXT, '{"bold":true}'),
-          toolCall("c3", TOOL_SET_OUTLINE, '{"level":1}'),
-        ],
+        toolCalls: [toolCall("call_0", TOOL_FORMAT_TEXT), toolCall("call_1", TOOL_SET_OUTLINE)],
         finishReason: "tool_calls",
       })
     );
+    executeToolCall.mockImplementation(async (call: { id: string }) => {
+      if (call.id === "call_0") {
+        controller.abort();
+        const error = new Error("The operation was aborted.");
+        error.name = "AbortError";
+        throw error;
+      }
+      return { content: "完了", ok: true };
+    });
     const sent: NewMessage[] = [];
     await expect(
       runTurn({
         settings,
-        instruction: "なぜこの条なの？",
+        instruction: "続けて直して",
         attachment: attach(""),
-        history: [],
+        history: priorTurn("call_0", "前のターンの結果"),
         signal: controller.signal,
         onMessage: (message) => {
           sent.push(message);
         },
-        confirmDocumentEdit: () => {
-          controller.abort();
-          const error = new Error("中止しました。");
-          error.name = "AbortError";
-          return Promise.reject(error);
-        },
       })
     ).rejects.toMatchObject({ name: "AbortError" });
-    expect(executeToolCall).toHaveBeenCalledTimes(1);
-    expect(executeToolCall.mock.calls[0][0].function.name).toBe(TOOL_READ_PARAGRAPHS);
     const tools = sent.filter((message) => message.role === "tool");
     expect(tools.map((message) => [message.toolCallId, message.content])).toEqual([
-      ["c1", "完了"],
-      ["c2", ABORTED_TOOL_RESULT],
-      ["c3", ABORTED_TOOL_RESULT],
+      ["call_0", ABORTED_TOOL_RESULT],
+      ["call_1", ABORTED_TOOL_RESULT],
     ]);
     expect(chatStream).toHaveBeenCalledTimes(1);
   });
 
-  it("closes every pending call when the abort happens before any tool runs", async () => {
+  it("closes every pending call when the signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
     chatStream.mockResolvedValueOnce(
       completion({
-        toolCalls: [
-          toolCall("c1", TOOL_FORMAT_TEXT, '{"bold":true}'),
-          toolCall("c2", TOOL_SET_OUTLINE, '{"level":1}'),
-        ],
+        toolCalls: [toolCall("call_0", TOOL_FORMAT_TEXT), toolCall("call_1", TOOL_SET_OUTLINE)],
         finishReason: "tool_calls",
       })
     );
     const sent: NewMessage[] = [];
-    const error = new Error("中止しました。");
-    error.name = "AbortError";
     await expect(
       runTurn({
         settings,
-        instruction: "なぜ？",
+        instruction: "直して",
         attachment: attach(""),
-        history: [],
-        signal: new AbortController().signal,
+        history: priorTurn("call_0", "前の結果"),
+        signal: controller.signal,
         onMessage: (message) => {
           sent.push(message);
         },
-        confirmDocumentEdit: () => Promise.reject(error),
       })
-    ).rejects.toBe(error);
+    ).rejects.toMatchObject({ name: "AbortError" });
     expect(executeToolCall).not.toHaveBeenCalled();
     const tools = sent.filter((message) => message.role === "tool");
-    expect(tools.map((message) => message.toolCallId)).toEqual(["c1", "c2"]);
-    expect(tools.every((message) => message.content === ABORTED_TOOL_RESULT)).toBe(true);
+    expect(tools.map((message) => [message.toolCallId, message.content])).toEqual([
+      ["call_0", ABORTED_TOOL_RESULT],
+      ["call_1", ABORTED_TOOL_RESULT],
+    ]);
   });
 
   it("does not invent a cancel result when a tool fails on its own", async () => {

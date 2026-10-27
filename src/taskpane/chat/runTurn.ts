@@ -8,10 +8,6 @@ import {
   userMessageForHistory,
   userMessageWithAttachment,
 } from "../../shared/prompts";
-import {
-  EDIT_DECLINED_TOOL_RESULT,
-  isQuestionInstruction,
-} from "../../shared/questionTurn";
 import { joinArgosScopes } from "../../shared/argos";
 import { Usage } from "../../shared/stripThinking";
 import {
@@ -22,7 +18,6 @@ import {
 import {
   UNLIMITED_TOOL_ROUNDS,
   buildTools,
-  isDocumentEditTool,
   isToolsUnsupportedError,
   toolRoundLimitNotice,
 } from "../../shared/tools";
@@ -63,13 +58,6 @@ export type RunTurnOptions = {
   onDelta?: (snapshot: { content: string; reasoningContent: string }) => void;
   /** Folder prefixes for Argos; empty means the whole index. */
   argosPathPrefixes?: string[];
-  /**
-   * Question turns call this before the first edit. 「allow」 runs it and does
-   * not ask again this turn. 「decline」 skips the edit and the next request
-   * omits tools, so the model answers in text and the turn ends. Absent is
-   * treated as decline.
-   */
-  confirmDocumentEdit?: () => Promise<"allow" | "decline">;
 };
 
 export type TurnResult = {
@@ -112,8 +100,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   // Numbers are only addresses if the model was handed them with the body.
   const numbered = Boolean(options.attachment.document.trim());
   const shown = attachmentShowsBody(options.attachment);
-  const hasBody =
-    shown !== null ? shown : isWordHost() ? await documentHasVisibleText() : false;
+  const hasBody = shown !== null ? shown : isWordHost() ? await documentHasVisibleText() : false;
   const promptBase = {
     fontName: settings.fontName,
     bodyPt: settings.bodyPt,
@@ -140,15 +127,16 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     selection: hasSelection,
     numbered,
     markup: options.attachment.markup,
-    reviewedBody: Boolean(options.attachment.document.trim()) || options.attachment.scope !== "none",
+    reviewedBody:
+      Boolean(options.attachment.document.trim()) || options.attachment.scope !== "none",
     reviewedFallback: options.attachment.reviewedFallback === true,
     inlineMarkup: options.attachment.inlineMarkup === true,
     listMarks: Boolean(options.attachment.listMarks),
     shapes: Boolean(
       options.attachment.shapes &&
-        (options.attachment.shapes.text ||
-          options.attachment.shapes.error ||
-          options.attachment.shapes.truncated)
+      (options.attachment.shapes.text ||
+        options.attachment.shapes.error ||
+        options.attachment.shapes.truncated)
     ),
     shapeNumbers: (options.attachment.shapes?.count ?? 0) > 0,
   });
@@ -173,9 +161,6 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   // An insert hands out numbers for its new paragraphs, so from that round on
   // the tools take a paragraph number even when the attachment had none.
   let numbersHandedOut = false;
-  const question = isQuestionInstruction(options.instruction);
-  let editsAllowed = !question;
-  let editsDeclined = false;
   const offeredTools = () =>
     buildTools({
       search: Boolean(settings.searxngUrl.trim()),
@@ -185,9 +170,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       insertedNumbers: numbersHandedOut,
       shapes: (options.attachment.shapes?.count ?? 0) > 0,
     });
-  // After 「変更せずに答えて」 the next request carries no tools at all.
-  const toolsFor = () => (editsDeclined ? undefined : offeredTools());
-  let tools = toolsFor();
+  let tools = offeredTools();
   let toolsSupported = true;
   let lastUsage: Usage | null = null;
   const started = Date.now();
@@ -369,34 +352,12 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       return end(lastUsage);
     }
 
+    // Ids are `call_${index}` when the server omits them, so they repeat across
+    // rounds. Only results written for this round count as answering this round.
+    const answeredThisRound = new Set<string>();
     try {
       for (const call of completion.toolCalls) {
         signal.throwIfAborted();
-        if (question && !editsAllowed && isDocumentEditTool(call.function.name) && !editsDeclined) {
-          const choice = options.confirmDocumentEdit
-            ? await options.confirmDocumentEdit()
-            : "decline";
-          signal.throwIfAborted();
-          if (choice === "allow") {
-            editsAllowed = true;
-          } else {
-            editsDeclined = true;
-            tools = toolsFor();
-          }
-        }
-        if (editsDeclined && isDocumentEditTool(call.function.name)) {
-          await options.onMessage({
-            role: "tool",
-            content: EDIT_DECLINED_TOOL_RESULT,
-            toolCallId: call.id,
-          });
-          messages.push({
-            role: "tool",
-            content: EDIT_DECLINED_TOOL_RESULT,
-            tool_call_id: call.id,
-          });
-          continue;
-        }
         const toolContents = messages
           .filter((message) => message.role === "tool")
           .map((message) => message.content || "");
@@ -408,10 +369,12 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
         });
         await options.onMessage({ role: "tool", content: outcome.content, toolCallId: call.id });
         messages.push({ role: "tool", content: outcome.content, tool_call_id: call.id });
+        answeredThisRound.add(call.id);
         if (outcome.numbered && !numbersHandedOut) {
           numbersHandedOut = true;
-          tools = toolsFor();
+          tools = offeredTools();
         }
+        signal.throwIfAborted();
       }
     } catch (error) {
       if (!isAbortError(error, signal)) {
@@ -420,7 +383,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       // The assistant turn is already stored with tool_calls. Close every call
       // that did not finish, or the next request is rejected.
       for (const call of completion.toolCalls) {
-        if (messages.some((message) => message.role === "tool" && message.tool_call_id === call.id)) {
+        if (answeredThisRound.has(call.id)) {
           continue;
         }
         await options.onMessage({
@@ -433,6 +396,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
           content: ABORTED_TOOL_RESULT,
           tool_call_id: call.id,
         });
+        answeredThisRound.add(call.id);
       }
       throw error;
     }

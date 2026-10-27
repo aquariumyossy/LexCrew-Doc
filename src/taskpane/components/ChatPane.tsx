@@ -1,13 +1,8 @@
 import * as React from "react";
-import { Badge, Button, Text, makeStyles, tokens } from "@fluentui/react-components";
+import { Badge, Text, makeStyles, tokens } from "@fluentui/react-components";
 import { StoredMessage } from "../../shared/history";
 import { foreignCharNoticeForAssistant } from "../../shared/japaneseHan";
 import { splitUserMessage } from "../../shared/prompts";
-import {
-  EDIT_CONFIRM_ALLOW,
-  EDIT_CONFIRM_DECLINE,
-  EDIT_CONFIRM_PROMPT,
-} from "../../shared/questionTurn";
 import { TOOL_SEARCH, TOOL_SEARCH_INDEX, describeToolCall } from "../../shared/tools";
 import { SearchHit } from "../../sidecar/types";
 import { uiPx } from "../uiFont";
@@ -106,22 +101,6 @@ const useStyles = makeStyles({
     color: tokens.colorPaletteDarkOrangeForeground1,
     fontSize: uiPx(12),
     marginTop: "6px",
-  },
-  confirm: {
-    alignSelf: "flex-start",
-    maxWidth: "100%",
-    backgroundColor: tokens.colorNeutralCardBackground,
-    border: `1px solid ${tokens.colorBrandStroke2}`,
-    borderRadius: "8px",
-    padding: "8px 10px",
-    display: "flex",
-    flexDirection: "column",
-    gap: "8px",
-  },
-  confirmActions: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: "8px",
   },
 });
 
@@ -282,36 +261,12 @@ export type ChatDraft = {
   reasoningContent: string;
 };
 
-export type EditConfirm = {
-  onAllow: () => void;
-  onDecline: () => void;
-};
-
-const EditConfirmCard: React.FC<EditConfirm> = ({ onAllow, onDecline }) => {
-  const styles = useStyles();
-  return (
-    <div className={styles.confirm} data-guri="edit-confirm">
-      <Text>{EDIT_CONFIRM_PROMPT}</Text>
-      <div className={styles.confirmActions}>
-        <Button appearance="primary" onClick={onAllow}>
-          {EDIT_CONFIRM_ALLOW}
-        </Button>
-        <Button appearance="secondary" onClick={onDecline}>
-          {EDIT_CONFIRM_DECLINE}
-        </Button>
-      </div>
-    </div>
-  );
-};
-
 export type ChatPaneProps = {
   messages: StoredMessage[];
   draft?: ChatDraft | null;
-  /** Set while a question turn is waiting before it edits the document. */
-  editConfirm?: EditConfirm | null;
 };
 
-const ChatPane: React.FC<ChatPaneProps> = ({ messages, draft, editConfirm }) => {
+const ChatPane: React.FC<ChatPaneProps> = ({ messages, draft }) => {
   const styles = useStyles();
   const names = React.useMemo(() => toolNameById(messages), [messages]);
   const bottomRef = React.useRef<HTMLDivElement>(null);
@@ -319,9 +274,9 @@ const ChatPane: React.FC<ChatPaneProps> = ({ messages, draft, editConfirm }) => 
 
   React.useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [messages, draft?.content, draft?.reasoningContent, editConfirm]);
+  }, [messages, draft?.content, draft?.reasoningContent]);
 
-  if (!messages.length && !streaming && !editConfirm) {
+  if (!messages.length && !streaming) {
     return (
       <div className={styles.root} data-guri="chat">
         <div className={styles.empty}>
@@ -365,9 +320,6 @@ const ChatPane: React.FC<ChatPaneProps> = ({ messages, draft, editConfirm }) => 
           reasoningContent={draft.reasoningContent}
           streaming
         />
-      ) : null}
-      {editConfirm ? (
-        <EditConfirmCard onAllow={editConfirm.onAllow} onDecline={editConfirm.onDecline} />
       ) : null}
       <div ref={bottomRef} />
     </div>

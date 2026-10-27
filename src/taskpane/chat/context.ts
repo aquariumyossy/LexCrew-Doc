@@ -39,10 +39,7 @@ export function toolSchemaTokens(tools: readonly unknown[] | null | undefined): 
 }
 
 /** Messages plus the tool schema the server also bills. */
-export function requestTokens(
-  messages: ChatMessage[],
-  tools?: readonly unknown[] | null
-): number {
+export function requestTokens(messages: ChatMessage[], tools?: readonly unknown[] | null): number {
   return messagesTokens(messages) + toolSchemaTokens(tools);
 }
 
@@ -77,10 +74,7 @@ export function toChatMessages(stored: StoredMessage[]): ChatMessage[] {
   const names = toolNameById(stored);
   const chat = stored.map((message) => {
     let content = message.role === "user" ? stripAttachment(message.content) : message.content;
-    if (
-      message.role === "tool" &&
-      isDocumentSnapshotTool(names.get(message.toolCallId) || "")
-    ) {
+    if (message.role === "tool" && isDocumentSnapshotTool(names.get(message.toolCallId) || "")) {
       content = STALE_DOCUMENT_READ;
     }
     const mapped: ChatMessage = { role: message.role, content };
@@ -96,33 +90,44 @@ export function toChatMessages(stored: StoredMessage[]): ChatMessage[] {
 }
 
 /**
- * A cancelled confirm used to leave an assistant `tool_calls` with no tool
- * result, and the server rejects that on the next turn. Insert one constant
- * result per missing call. A complete transcript is left as it was stored, so
- * the replayed prefix of a healthy conversation does not change.
+ * A cancelled turn can leave an assistant `tool_calls` with no tool result,
+ * and the server rejects that on the next request. `call_${index}` is reused
+ * whenever the server omits ids, so a call is answered only by a tool message
+ * with that id in the contiguous run immediately after that assistant message.
+ * A tool message with no matching call in that run is dropped. A complete
+ * transcript is left as it was stored.
  */
 function repairMissingToolResults(messages: ChatMessage[]): ChatMessage[] {
-  const answered = new Set<string>();
-  for (const message of messages) {
-    if (message.role === "tool" && message.tool_call_id) {
-      answered.add(message.tool_call_id);
-    }
-  }
   const out: ChatMessage[] = [];
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
+    if (message.role === "tool") {
+      continue;
+    }
     out.push(message);
     if (message.role !== "assistant" || !message.tool_calls?.length) {
       continue;
     }
+    const waiting = new Map<string, number>();
+    for (const call of message.tool_calls) {
+      waiting.set(call.id, (waiting.get(call.id) || 0) + 1);
+    }
     let follow = index + 1;
     while (follow < messages.length && messages[follow].role === "tool") {
-      out.push(messages[follow]);
+      const tool = messages[follow];
+      const id = tool.tool_call_id || "";
+      const left = waiting.get(id) || 0;
+      if (left > 0) {
+        out.push(tool);
+        waiting.set(id, left - 1);
+      }
       follow += 1;
     }
     for (const call of message.tool_calls) {
-      if (!answered.has(call.id)) {
+      const left = waiting.get(call.id) || 0;
+      if (left > 0) {
         out.push({ role: "tool", content: ABORTED_TOOL_RESULT, tool_call_id: call.id });
+        waiting.set(call.id, left - 1);
       }
     }
     index = follow - 1;

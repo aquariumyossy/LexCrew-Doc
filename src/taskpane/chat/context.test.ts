@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
+import { EMPTY_ATTACHMENT } from "../../shared/attachment";
 import { CHARS_PER_TOKEN, MAX_FILE_CHARS, TOOL_RESULT_BUDGET_RATIO } from "../../shared/constants";
 import { StoredMessage } from "../../shared/history";
-import { buildTools, STALE_DOCUMENT_READ } from "../../shared/tools";
+import {
+  stripAttachment,
+  userMessageForHistory,
+  userMessageWithAttachment,
+} from "../../shared/prompts";
+import { buildTools, isDocumentSnapshotTool, STALE_DOCUMENT_READ } from "../../shared/tools";
 import { ChatMessage } from "../../sidecar/types";
 import {
   ABORTED_TOOL_RESULT,
@@ -126,7 +132,11 @@ describe("toChatMessages", () => {
       stored({ role: "user", content: "つぎ" }),
     ]);
     expect(chat.map((message) => message.role)).toEqual(["assistant", "tool", "tool", "user"]);
-    expect(chat[1]).toMatchObject({ role: "tool", content: "太字にしました。", tool_call_id: "c1" });
+    expect(chat[1]).toMatchObject({
+      role: "tool",
+      content: "太字にしました。",
+      tool_call_id: "c1",
+    });
     expect(chat[2]).toEqual({
       role: "tool",
       content: ABORTED_TOOL_RESULT,
@@ -147,11 +157,182 @@ describe("toChatMessages", () => {
     expect(chat[1]).toEqual({ role: "tool", content: ABORTED_TOOL_RESULT, tool_call_id: "c1" });
   });
 
-  it("leaves assistant and tool messages as they are", () => {
+  it("keeps the body of a tool report that follows its call", () => {
     const chat = toChatMessages([
-      stored({ role: "tool", content: "第1条の後ろに入れました\n\n--- 文書全体 ---\n表示用" }),
+      stored({
+        role: "assistant",
+        toolCalls: [
+          { id: "c1", type: "function", function: { name: "insert_blocks", arguments: "{}" } },
+        ],
+      }),
+      stored({
+        role: "tool",
+        content: "第1条の後ろに入れました\n\n--- 文書全体 ---\n表示用",
+        toolCallId: "c1",
+      }),
     ]);
-    expect(chat[0].content).toContain("--- 文書全体 ---");
+    expect(chat[1].content).toContain("--- 文書全体 ---");
+  });
+
+  it("drops a tool message that has no call in the assistant just before it", () => {
+    const chat = toChatMessages([
+      stored({ role: "user", content: "点検して" }),
+      stored({ role: "tool", content: "呼び出しのない結果", toolCallId: "call_0" }),
+      stored({
+        role: "assistant",
+        toolCalls: [
+          { id: "call_0", type: "function", function: { name: "format_text", arguments: "{}" } },
+        ],
+      }),
+      stored({ role: "tool", content: "直しました。", toolCallId: "call_0" }),
+      stored({ role: "tool", content: "余った結果", toolCallId: "call_9" }),
+    ]);
+    expect(chat.map((message) => message.role)).toEqual(["user", "assistant", "tool"]);
+    expect(chat[2].content).toBe("直しました。");
+  });
+});
+
+function calls(ids: string[], name = "format_text"): StoredMessage {
+  return stored({
+    role: "assistant",
+    toolCalls: ids.map((id) => ({
+      id,
+      type: "function" as const,
+      function: { name, arguments: "{}" },
+    })),
+  });
+}
+
+function toolResult(id: string, content: string): StoredMessage {
+  return stored({ role: "tool", content, toolCallId: id });
+}
+
+/** Replay as of d0315ae, before missing tool results were repaired. */
+function replayAtD0315ae(storedMessages: StoredMessage[]): ChatMessage[] {
+  const names = new Map<string, string>();
+  for (const message of storedMessages) {
+    for (const call of message.toolCalls) {
+      names.set(call.id, call.function.name);
+    }
+  }
+  return storedMessages.map((message) => {
+    let content = message.role === "user" ? stripAttachment(message.content) : message.content;
+    if (message.role === "tool" && isDocumentSnapshotTool(names.get(message.toolCallId) || "")) {
+      content = STALE_DOCUMENT_READ;
+    }
+    const chat: ChatMessage = { role: message.role, content };
+    if (message.toolCalls.length) {
+      chat.tool_calls = message.toolCalls;
+    }
+    if (message.toolCallId) {
+      chat.tool_call_id = message.toolCallId;
+    }
+    return chat;
+  });
+}
+
+function assertPaired(messages: ChatMessage[]): void {
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message.role === "tool") {
+      let previous = index - 1;
+      while (previous >= 0 && messages[previous].role === "tool") {
+        previous -= 1;
+      }
+      const assistant = messages[previous];
+      expect(assistant?.role).toBe("assistant");
+      const ids = (assistant?.tool_calls || []).map((call) => call.id);
+      expect(ids).toContain(message.tool_call_id);
+    }
+    if (message.role !== "assistant" || !message.tool_calls?.length) {
+      continue;
+    }
+    const want = message.tool_calls.map((call) => call.id).sort();
+    const got: string[] = [];
+    let follow = index + 1;
+    while (follow < messages.length && messages[follow].role === "tool") {
+      got.push(messages[follow].tool_call_id || "");
+      follow += 1;
+    }
+    expect([...got].sort()).toEqual(want);
+  }
+}
+
+describe("tool call ids repeat across turns", () => {
+  it("repairs deleted results by the assistant they follow, then still pairs after trimming", () => {
+    const transcript: StoredMessage[] = [
+      stored({ role: "user", content: "あ".repeat(400) }),
+      calls(["call_0", "call_1"], "read_paragraphs"),
+      toolResult("call_1", "第2条だけ残った"),
+      stored({ role: "tool", content: "どの呼び出しでもない", toolCallId: "call_9" }),
+      stored({ role: "user", content: "つぎ" }),
+      calls(["call_0", "call_1"]),
+      stored({ role: "user", content: "いまの指示" }),
+      calls(["call_0", "call_1"]),
+      toolResult("call_0", "直しました。"),
+      toolResult("call_0", "同じ id の余分な結果"),
+      toolResult("call_7", "後ろに紛れた結果"),
+    ];
+    const chat = toChatMessages(transcript);
+    assertPaired(chat);
+    expect(
+      chat.map((message) => [message.role, message.tool_call_id || "", message.content])
+    ).toEqual([
+      ["user", "", "あ".repeat(400)],
+      ["assistant", "", ""],
+      ["tool", "call_1", "第2条だけ残った"],
+      ["tool", "call_0", ABORTED_TOOL_RESULT],
+      ["user", "", "つぎ"],
+      ["assistant", "", ""],
+      ["tool", "call_0", ABORTED_TOOL_RESULT],
+      ["tool", "call_1", ABORTED_TOOL_RESULT],
+      ["user", "", "いまの指示"],
+      ["assistant", "", ""],
+      ["tool", "call_0", "直しました。"],
+      ["tool", "call_1", ABORTED_TOOL_RESULT],
+    ]);
+
+    const fitted = dropOldest([{ role: "system", content: "ルール" }, ...chat], 80);
+    assertPaired(fitted);
+    expect(fitted[0].role).toBe("system");
+    expect(fitted.some((message) => message.content === "あ".repeat(400))).toBe(false);
+    expect(fitted.at(-1)?.tool_call_id).toBe("call_1");
+  });
+
+  it("replays a complete conversation the way d0315ae did", () => {
+    const storedUser = userMessageForHistory("点検して", {
+      ...EMPTY_ATTACHMENT,
+      scope: "document",
+      document: "第1条（目的）\n第2条（報酬）",
+      paragraphs: 2,
+      focus: "第2条（報酬）",
+    });
+    const outbound = userMessageWithAttachment("点検して", {
+      ...EMPTY_ATTACHMENT,
+      scope: "document",
+      document: "第1条（目的）\n第2条（報酬）",
+      paragraphs: 2,
+      focus: "第2条（報酬）",
+    });
+    // The live request puts the instruction last and is never stored.
+    expect(outbound.endsWith("点検して")).toBe(true);
+    expect(storedUser.startsWith("点検して")).toBe(true);
+    expect(outbound).not.toBe(storedUser);
+
+    const transcript: StoredMessage[] = [
+      stored({ role: "user", content: storedUser }),
+      calls(["call_0"], "read_paragraphs"),
+      toolResult("call_0", "[1] 第1条 甲は乙に委託する。"),
+      calls(["call_1"], "format_text"),
+      toolResult("call_1", "太字にしました。"),
+      stored({ role: "user", content: "続けて" }),
+      calls(["call_1"], "format_text"),
+      toolResult("call_1", "次のターンでも call_1 です。"),
+      stored({ role: "assistant", content: "直しました。" }),
+    ];
+    const replayed = toChatMessages(transcript);
+    expect(JSON.stringify(replayed)).toBe(JSON.stringify(replayAtD0315ae(transcript)));
+    expect(replayed[2].content).toBe(STALE_DOCUMENT_READ);
   });
 });
 
@@ -210,7 +391,12 @@ describe("dropOldest", () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     try {
       const trimmed = dropOldest(messages, 10);
-      expect(trimmed.map((message) => message.role)).toEqual(["system", "user", "assistant", "tool"]);
+      expect(trimmed.map((message) => message.role)).toEqual([
+        "system",
+        "user",
+        "assistant",
+        "tool",
+      ]);
       expect(trimmed[1].content?.startsWith("いまの指示")).toBe(true);
       expect(trimmed.some((message) => message.content === "古い指示")).toBe(false);
       expect(info.mock.calls.some((call) => call[1] === "context trim")).toBe(true);

@@ -1,6 +1,6 @@
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { FluentProvider } from "@fluentui/react-components";
+import { Button, FluentProvider } from "@fluentui/react-components";
 import { describe, expect, it } from "vitest";
 import { StoredMessage } from "../../shared/history";
 import { guriLightTheme } from "../theme";
@@ -34,8 +34,23 @@ function html(
   );
 }
 
+function buttonClass(appearance: "primary" | "secondary"): string {
+  const markup = renderToStaticMarkup(
+    React.createElement(
+      FluentProvider,
+      { theme: guriLightTheme },
+      React.createElement(Button, { appearance }, "見本")
+    )
+  );
+  const found = markup.match(/<button[^>]*class="([^"]*)"/);
+  if (!found) {
+    throw new Error(markup);
+  }
+  return found[1];
+}
+
 describe("ChatPane edit confirmation", () => {
-  it("shows the question-turn prompt and both buttons", () => {
+  it("shows the question-turn prompt and emphasizes 変更してよい", () => {
     const markup = html([message({ role: "user", content: "なぜ？" })], undefined, {
       onAllow: () => undefined,
       onDecline: () => undefined,
@@ -43,6 +58,11 @@ describe("ChatPane edit confirmation", () => {
     expect(markup).toContain("質問への回答として文書を変えようとしています");
     expect(markup).toContain("変更してよい");
     expect(markup).toContain("変更せずに答えて");
+    const buttons = markup.match(/<button\b[^>]*>[\s\S]*?<\/button>/g) || [];
+    const classOf = (label: string) =>
+      buttons.find((button) => button.includes(label))?.match(/class="([^"]*)"/)?.[1];
+    expect(classOf("変更してよい")).toBe(buttonClass("primary"));
+    expect(classOf("変更せずに答えて")).toBe(buttonClass("secondary"));
   });
 });
 

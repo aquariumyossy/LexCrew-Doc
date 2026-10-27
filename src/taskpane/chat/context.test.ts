@@ -4,6 +4,7 @@ import { StoredMessage } from "../../shared/history";
 import { buildTools, STALE_DOCUMENT_READ } from "../../shared/tools";
 import { ChatMessage } from "../../sidecar/types";
 import {
+  ABORTED_TOOL_RESULT,
   capToolResults,
   dropOldest,
   estimateTokens,
@@ -110,6 +111,40 @@ describe("toChatMessages", () => {
     expect(chat[1].content).not.toContain("第1条");
     expect(chat[3].content).toBe("段落 4 を削除しました。");
     expect(chat[4].content).toBe("みなし合格とする。");
+  });
+
+  it("closes a tool call that was stored without a result", () => {
+    const chat = toChatMessages([
+      stored({
+        role: "assistant",
+        toolCalls: [
+          { id: "c1", type: "function", function: { name: "format_text", arguments: "{}" } },
+          { id: "c2", type: "function", function: { name: "set_outline_level", arguments: "{}" } },
+        ],
+      }),
+      stored({ role: "tool", content: "太字にしました。", toolCallId: "c1" }),
+      stored({ role: "user", content: "つぎ" }),
+    ]);
+    expect(chat.map((message) => message.role)).toEqual(["assistant", "tool", "tool", "user"]);
+    expect(chat[1]).toMatchObject({ role: "tool", content: "太字にしました。", tool_call_id: "c1" });
+    expect(chat[2]).toEqual({
+      role: "tool",
+      content: ABORTED_TOOL_RESULT,
+      tool_call_id: "c2",
+    });
+    expect(chat[3].content).toBe("つぎ");
+  });
+
+  it("closes every call when a cancelled turn saved none of the results", () => {
+    const chat = toChatMessages([
+      stored({
+        role: "assistant",
+        toolCalls: [
+          { id: "c1", type: "function", function: { name: "format_text", arguments: "{}" } },
+        ],
+      }),
+    ]);
+    expect(chat[1]).toEqual({ role: "tool", content: ABORTED_TOOL_RESULT, tool_call_id: "c1" });
   });
 
   it("leaves assistant and tool messages as they are", () => {

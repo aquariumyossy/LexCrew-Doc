@@ -454,8 +454,9 @@ const App: React.FC = () => {
     stats.chars,
   ]);
 
-  // Mirrors the reservation in `runTurn`: files are sized from the stable
-  // prompt, not from this turn's document, so the meter matches the prefix.
+  // The file budget does not yield to the document. Same reservation as
+  // `runTurn`: files are sized from the stable prompt only, so the meter
+  // matches the prefix.
   const fileChars = React.useMemo(() => {
     const budget = fileCharBudget(settings.contextLimit, promptEstimate.stableChars);
     return filesChars(clampFiles(turnFiles, budget));

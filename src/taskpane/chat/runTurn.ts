@@ -25,14 +25,19 @@ import {
   isDocumentEditTool,
   isToolsUnsupportedError,
   toolRoundLimitNotice,
-  withoutDocumentEdits,
 } from "../../shared/tools";
 import { logInfo } from "../../sidecar/logger";
 import { ChatMessage } from "../../sidecar/types";
 import { ChatBody, chatStream } from "../api";
 import { Settings } from "../settings";
 import { documentHasVisibleText, isWordHost } from "../word";
-import { fitContext, indexedReadCharLimit, requestTokens, toChatMessages } from "./context";
+import {
+  ABORTED_TOOL_RESULT,
+  fitContext,
+  indexedReadCharLimit,
+  requestTokens,
+  toChatMessages,
+} from "./context";
 import { beginToolTurn, executeToolCall } from "./execute";
 import { knownThinkingBudget, readThinkingBudget } from "./thinkingBudget";
 
@@ -60,8 +65,9 @@ export type RunTurnOptions = {
   argosPathPrefixes?: string[];
   /**
    * Question turns call this before the first edit. 「allow」 runs it and does
-   * not ask again this turn. 「decline」 skips the edit and withholds editing
-   * tools for the rest of the turn. Absent is treated as decline.
+   * not ask again this turn. 「decline」 skips the edit and the next request
+   * omits tools, so the model answers in text and the turn ends. Absent is
+   * treated as decline.
    */
   confirmDocumentEdit?: () => Promise<"allow" | "decline">;
 };
@@ -76,6 +82,13 @@ type Streamed = Awaited<ReturnType<typeof chatStream>>;
 
 function withFinishReason(done: Streamed): Streamed {
   return done.usage ? { ...done, usage: { ...done.usage, finishReason: done.finishReason } } : done;
+}
+
+function isAbortError(error: unknown, signal: AbortSignal): boolean {
+  if (signal.aborted) {
+    return true;
+  }
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function silentEndNotice(finishReason: string): string {
@@ -111,9 +124,10 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     argosPathPrefix: joinArgosScopes(options.argosPathPrefixes || []),
   };
   /*
-   * Files are clamped from the stable prompt only. The document and the
-   * instruction change every turn; folding them into the budget would resize
-   * the file text and invalidate the prefix cache from the system message on.
+   * The file budget does not yield to the document. Files are clamped from
+   * the stable prompt only. The document and the instruction change every
+   * turn; folding them into the budget would resize the file text and
+   * invalidate the prefix cache from the system message on.
    */
   const stable = stableSystemPrompt({
     ...promptBase,
@@ -171,7 +185,8 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       insertedNumbers: numbersHandedOut,
       shapes: (options.attachment.shapes?.count ?? 0) > 0,
     });
-  const toolsFor = () => (editsDeclined ? withoutDocumentEdits(offeredTools()) : offeredTools());
+  // After 「変更せずに答えて」 the next request carries no tools at all.
+  const toolsFor = () => (editsDeclined ? undefined : offeredTools());
   let tools = toolsFor();
   let toolsSupported = true;
   let lastUsage: Usage | null = null;
@@ -354,48 +369,72 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       return end(lastUsage);
     }
 
-    for (const call of completion.toolCalls) {
-      signal.throwIfAborted();
-      if (question && !editsAllowed && isDocumentEditTool(call.function.name) && !editsDeclined) {
-        const choice = options.confirmDocumentEdit
-          ? await options.confirmDocumentEdit()
-          : "decline";
+    try {
+      for (const call of completion.toolCalls) {
         signal.throwIfAborted();
-        if (choice === "allow") {
-          editsAllowed = true;
-        } else {
-          editsDeclined = true;
+        if (question && !editsAllowed && isDocumentEditTool(call.function.name) && !editsDeclined) {
+          const choice = options.confirmDocumentEdit
+            ? await options.confirmDocumentEdit()
+            : "decline";
+          signal.throwIfAborted();
+          if (choice === "allow") {
+            editsAllowed = true;
+          } else {
+            editsDeclined = true;
+            tools = toolsFor();
+          }
+        }
+        if (editsDeclined && isDocumentEditTool(call.function.name)) {
+          await options.onMessage({
+            role: "tool",
+            content: EDIT_DECLINED_TOOL_RESULT,
+            toolCallId: call.id,
+          });
+          messages.push({
+            role: "tool",
+            content: EDIT_DECLINED_TOOL_RESULT,
+            tool_call_id: call.id,
+          });
+          continue;
+        }
+        const toolContents = messages
+          .filter((message) => message.role === "tool")
+          .map((message) => message.content || "");
+        const outcome = await executeToolCall(call, settings, signal, {
+          argosPathPrefixes: options.argosPathPrefixes,
+          indexedReadChars: indexedReadCharLimit(limit, toolContents),
+          hasBody,
+          userMessagesText,
+        });
+        await options.onMessage({ role: "tool", content: outcome.content, toolCallId: call.id });
+        messages.push({ role: "tool", content: outcome.content, tool_call_id: call.id });
+        if (outcome.numbered && !numbersHandedOut) {
+          numbersHandedOut = true;
           tools = toolsFor();
         }
       }
-      if (editsDeclined && isDocumentEditTool(call.function.name)) {
+    } catch (error) {
+      if (!isAbortError(error, signal)) {
+        throw error;
+      }
+      // The assistant turn is already stored with tool_calls. Close every call
+      // that did not finish, or the next request is rejected.
+      for (const call of completion.toolCalls) {
+        if (messages.some((message) => message.role === "tool" && message.tool_call_id === call.id)) {
+          continue;
+        }
         await options.onMessage({
           role: "tool",
-          content: EDIT_DECLINED_TOOL_RESULT,
+          content: ABORTED_TOOL_RESULT,
           toolCallId: call.id,
         });
         messages.push({
           role: "tool",
-          content: EDIT_DECLINED_TOOL_RESULT,
+          content: ABORTED_TOOL_RESULT,
           tool_call_id: call.id,
         });
-        continue;
       }
-      const toolContents = messages
-        .filter((message) => message.role === "tool")
-        .map((message) => message.content || "");
-      const outcome = await executeToolCall(call, settings, signal, {
-        argosPathPrefixes: options.argosPathPrefixes,
-        indexedReadChars: indexedReadCharLimit(limit, toolContents),
-        hasBody,
-        userMessagesText,
-      });
-      await options.onMessage({ role: "tool", content: outcome.content, toolCallId: call.id });
-      messages.push({ role: "tool", content: outcome.content, tool_call_id: call.id });
-      if (outcome.numbered && !numbersHandedOut) {
-        numbersHandedOut = true;
-        tools = toolsFor();
-      }
+      throw error;
     }
     round += 1;
   }

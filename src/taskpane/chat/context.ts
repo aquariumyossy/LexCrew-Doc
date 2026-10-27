@@ -5,6 +5,9 @@ import { isDocumentSnapshotTool, STALE_DOCUMENT_READ } from "../../shared/tools"
 import { logInfo } from "../../sidecar/logger";
 import { ChatMessage } from "../../sidecar/types";
 
+/** Tool result written when a turn is cancelled before the call runs. Replay uses the same text to close an orphan already stored. */
+export const ABORTED_TOOL_RESULT = "中止しました";
+
 /** Rough count used for the header readout and for trimming. */
 export function estimateTokens(text: string): number {
   return Math.ceil((text || "").length / CHARS_PER_TOKEN);
@@ -72,7 +75,7 @@ function toolNameById(stored: StoredMessage[]): Map<string, string> {
 
 export function toChatMessages(stored: StoredMessage[]): ChatMessage[] {
   const names = toolNameById(stored);
-  return stored.map((message) => {
+  const chat = stored.map((message) => {
     let content = message.role === "user" ? stripAttachment(message.content) : message.content;
     if (
       message.role === "tool" &&
@@ -80,15 +83,51 @@ export function toChatMessages(stored: StoredMessage[]): ChatMessage[] {
     ) {
       content = STALE_DOCUMENT_READ;
     }
-    const chat: ChatMessage = { role: message.role, content };
+    const mapped: ChatMessage = { role: message.role, content };
     if (message.toolCalls.length) {
-      chat.tool_calls = message.toolCalls;
+      mapped.tool_calls = message.toolCalls;
     }
     if (message.toolCallId) {
-      chat.tool_call_id = message.toolCallId;
+      mapped.tool_call_id = message.toolCallId;
     }
-    return chat;
+    return mapped;
   });
+  return repairMissingToolResults(chat);
+}
+
+/**
+ * A cancelled confirm used to leave an assistant `tool_calls` with no tool
+ * result, and the server rejects that on the next turn. Insert one constant
+ * result per missing call. A complete transcript is left as it was stored, so
+ * the replayed prefix of a healthy conversation does not change.
+ */
+function repairMissingToolResults(messages: ChatMessage[]): ChatMessage[] {
+  const answered = new Set<string>();
+  for (const message of messages) {
+    if (message.role === "tool" && message.tool_call_id) {
+      answered.add(message.tool_call_id);
+    }
+  }
+  const out: ChatMessage[] = [];
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    out.push(message);
+    if (message.role !== "assistant" || !message.tool_calls?.length) {
+      continue;
+    }
+    let follow = index + 1;
+    while (follow < messages.length && messages[follow].role === "tool") {
+      out.push(messages[follow]);
+      follow += 1;
+    }
+    for (const call of message.tool_calls) {
+      if (!answered.has(call.id)) {
+        out.push({ role: "tool", content: ABORTED_TOOL_RESULT, tool_call_id: call.id });
+      }
+    }
+    index = follow - 1;
+  }
+  return out;
 }
 
 function truncate(text: string, maxTokens: number): string {

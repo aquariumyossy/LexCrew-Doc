@@ -420,6 +420,10 @@ export const INSTRUCTION_MARKER = "--- 指示 ---";
  * and the selection come first; the user's instruction is last, so it is not
  * buried under the attachment. Committed files are not included: they live in
  * the system message, where they stay byte-identical across turns.
+ *
+ * This string is the outbound request only. It is never written to history.
+ * The transcript stores `userMessageForHistory` (instruction first).
+ * `splitUserMessage` parses that stored shape and would mis-read this one.
  */
 export function userMessageWithAttachment(
   instruction: string,
@@ -553,6 +557,11 @@ const SECTIONS: { marker: string; key: keyof Omit<UserMessageParts, "instruction
   { marker: SELECTION_MARKER, key: "selection" },
 ];
 
+/**
+ * Parses the stored transcript, where the instruction comes first and the
+ * markers follow. The outbound instruction-last message is never stored, and
+ * this function is not used on it.
+ */
 export function splitUserMessage(content: string): UserMessageParts {
   const found = SECTIONS.map((entry) => ({
     ...entry,

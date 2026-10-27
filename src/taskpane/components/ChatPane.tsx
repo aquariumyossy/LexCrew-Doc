@@ -293,10 +293,10 @@ const EditConfirmCard: React.FC<EditConfirm> = ({ onAllow, onDecline }) => {
     <div className={styles.confirm} data-guri="edit-confirm">
       <Text>{EDIT_CONFIRM_PROMPT}</Text>
       <div className={styles.confirmActions}>
-        <Button appearance="secondary" onClick={onAllow}>
+        <Button appearance="primary" onClick={onAllow}>
           {EDIT_CONFIRM_ALLOW}
         </Button>
-        <Button appearance="primary" onClick={onDecline}>
+        <Button appearance="secondary" onClick={onDecline}>
           {EDIT_CONFIRM_DECLINE}
         </Button>
       </div>

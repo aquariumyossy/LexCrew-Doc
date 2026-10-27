@@ -503,6 +503,20 @@ describe("splitUserMessage", () => {
     expect(parts.selection).toBe("甲は乙に委託する。");
   });
 
+  it("reads the stored instruction-first transcript and not the outbound instruction-last message", () => {
+    const sample = attachment({ focus: "第2条（報酬）" });
+    const outbound = userMessageWithAttachment("点検して", sample);
+    const stored = userMessageForHistory("点検して", sample);
+    expect(stored.startsWith("点検して")).toBe(true);
+    expect(outbound.endsWith("点検して")).toBe(true);
+    expect(outbound).not.toBe(stored);
+    expect(splitUserMessage(stored).instruction).toBe("点検して");
+    // Outbound text is never persisted. Parsing it with the stored grammar
+    // takes the pointer, not the instruction, as the instruction.
+    expect(splitUserMessage(outbound).instruction.startsWith("指示は末尾にあります。")).toBe(true);
+    expect(splitUserMessage(outbound).instruction).not.toBe("点検して");
+  });
+
   it("leaves a message without markers alone", () => {
     expect(splitUserMessage("骨子を作って")).toEqual({
       instruction: "骨子を作って",

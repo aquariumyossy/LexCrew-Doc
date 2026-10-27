@@ -36,4 +36,25 @@ describe("isQuestionInstruction", () => {
     expect(isQuestionInstruction("  ")).toBe(false);
     expect(isQuestionInstruction("")).toBe(false);
   });
+
+  it("does not treat an edit that mentions しないで, 理由, or a request form as a question", () => {
+    expect(isQuestionInstruction("書式は変更しないで文言だけ直して")).toBe(false);
+    expect(isQuestionInstruction("解除理由を追記して")).toBe(false);
+    expect(isQuestionInstruction("理由を本文に書いて")).toBe(false);
+    expect(isQuestionInstruction("見出しを太字にしてくれる？")).toBe(false);
+    expect(isQuestionInstruction("この条を直してもらえますか？")).toBe(false);
+    expect(isQuestionInstruction("対応してもらえますか？")).toBe(false);
+    expect(isQuestionInstruction("見出しを整えてくれますか？")).toBe(false);
+    expect(isQuestionInstruction("見出しを直してください")).toBe(false);
+  });
+
+  it("catches a request to explain unless the main request is an edit", () => {
+    expect(isQuestionInstruction("趣旨を教えて")).toBe(true);
+    expect(isQuestionInstruction("どういう意味ですか")).toBe(true);
+    expect(isQuestionInstruction("説明して")).toBe(true);
+    expect(isQuestionInstruction("なんで")).toBe(true);
+    expect(isQuestionInstruction("なぜ直してないの？")).toBe(true);
+    expect(isQuestionInstruction("説明してから見出しを直して")).toBe(false);
+    expect(isQuestionInstruction("趣旨を教えて、文言を直して")).toBe(false);
+  });
 });

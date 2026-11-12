@@ -2,6 +2,7 @@ import {
   ChangeNote,
   CommentNote,
   MarkupList,
+  attachmentCharBudget,
   changeChars,
   commentChars,
   markupCharBudget,
@@ -12,6 +13,7 @@ import {
   FILE_BUDGET_RATIO,
   MAX_ATTACHED_FILES,
   MAX_FILE_CHARS,
+  messageRoomTokens,
 } from "./constants";
 
 /** Whether the text came from the file's own text layer or from a vision read. */
@@ -128,20 +130,22 @@ export function mergeFiles(kept: CommittedFile[], incoming: CommittedFile[]): Co
 }
 
 /**
- * How many characters of attached file may ride along. `reservedChars` is what
- * the rest of this request already takes — the system prompt and the Word
- * attachment — so a narrow window does not leave the conversation with no room.
+ * How many characters of attached file may ride along. The base is the room
+ * left after the tool schema and the reply reserve. `reservedChars` is the
+ * stable system prompt, and the document's own share is set aside first, so
+ * the conversation's share survives a narrow window. The schema tokens must
+ * not depend on this turn's document, or the file text would change every turn.
  */
-export function fileCharBudget(contextLimit: number, reservedChars = 0): number {
-  if (!Number.isFinite(contextLimit) || contextLimit <= 0) {
+export function fileCharBudget(contextLimit: number, schemaTokens = 0, reservedChars = 0): number {
+  const room = messageRoomTokens(contextLimit, schemaTokens);
+  if (room <= 0) {
     return 0;
   }
-  const fromLimit = Math.floor(contextLimit * FILE_BUDGET_RATIO * CHARS_PER_TOKEN);
-  const forAttachments = Math.floor(
-    contextLimit * (1 - CONVERSATION_BUDGET_RATIO) * CHARS_PER_TOKEN
-  );
-  const room = forAttachments - Math.max(0, reservedChars);
-  return Math.max(0, Math.min(MAX_FILE_CHARS, fromLimit, room));
+  const fromRoom = Math.floor(room * FILE_BUDGET_RATIO * CHARS_PER_TOKEN);
+  const pool = Math.floor(room * (1 - CONVERSATION_BUDGET_RATIO) * CHARS_PER_TOKEN);
+  const document = attachmentCharBudget(contextLimit, schemaTokens, reservedChars);
+  const left = pool - Math.max(0, reservedChars) - document;
+  return Math.max(0, Math.min(MAX_FILE_CHARS, fromRoom, left));
 }
 
 /**

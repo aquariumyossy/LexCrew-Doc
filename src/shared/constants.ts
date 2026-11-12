@@ -48,6 +48,37 @@ export const FILE_BUDGET_RATIO = 0.25;
 export const MAX_FILE_CHARS = 60_000;
 /** Share of the window kept for the conversation itself, whatever is attached. */
 export const CONVERSATION_BUDGET_RATIO = 0.2;
+/**
+ * Left unused so the reply is not packed out of the window.
+ * `fitContext` subtracts this share of the context limit on top of the tool schema.
+ */
+export const REPLY_RESERVE_RATIO = 0.1;
+/**
+ * Once a request no longer fits, drop history down to this share of the room
+ * in one go. The headroom keeps the next few turns from moving the prefix.
+ */
+export const DROP_TARGET_RATIO = 0.85;
+
+/** Tokens held back so the reply has room. Ten percent of the context limit. */
+export function replyReserveTokens(limit: number): number {
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return 0;
+  }
+  return Math.floor(limit * REPLY_RESERVE_RATIO);
+}
+
+/**
+ * Tokens left for messages after the tool schema and the reply reserve.
+ * `schemaTokens` must come from settings, not from this turn's document, so a
+ * file clamped with this room stays the same bytes next turn.
+ */
+export function messageRoomTokens(limit: number, schemaTokens = 0): number {
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return 0;
+  }
+  const schema = Number.isFinite(schemaTokens) ? Math.max(0, schemaTokens) : 0;
+  return Math.max(0, limit - schema - replyReserveTokens(limit));
+}
 /** Pending and committed files together. */
 export const MAX_ATTACHED_FILES = 10;
 /** Pages of a scanned PDF worth reading. Matches Argos. */

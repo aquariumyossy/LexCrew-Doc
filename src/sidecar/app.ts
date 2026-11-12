@@ -12,6 +12,10 @@ import { canReadIndexedPath, noteIndexedHits } from "./indexedPaths";
 import {
   checkLlmHealth,
   chatCompletions,
+  isContextTooLongMessage,
+  OCR_PAGE_TOO_LONG,
+  OCR_SERVER_MEMORY,
+  SERVER_MEMORY,
   pipeChatStream,
   readImageText,
   readThinkingBudget,
@@ -107,11 +111,13 @@ export function createApp(options: { connectionFile?: string } = {}): express.Ex
         }
         const detail = error instanceof Error ? error.message : "画像の読み取りに失敗しました。";
         const vision = visionUnsupportedMessage(detail);
+        const tooLong = !vision && isContextTooLongMessage(detail);
+        const outOfMemory = !vision && !tooLong && detail === SERVER_MEMORY;
         sendError(
           res,
           502,
-          vision || detail,
-          vision ? undefined : (error as { hint?: string }).hint
+          vision || (tooLong ? OCR_PAGE_TOO_LONG : outOfMemory ? OCR_SERVER_MEMORY : detail),
+          vision || tooLong || outOfMemory ? undefined : (error as { hint?: string }).hint
         );
       }
     }

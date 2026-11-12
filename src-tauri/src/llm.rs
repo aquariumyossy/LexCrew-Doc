@@ -101,6 +101,115 @@ fn is_network(err: &reqwest::Error) -> bool {
     re.is_match(&text)
 }
 
+/// Same wording as the Node sidecar.
+pub const CONTEXT_TOO_LONG_NEW_CHAT: &str = "会話が長すぎます。新しい会話に切り替えてください。";
+pub const CONTEXT_TOO_LONG_ATTACHMENT: &str =
+    "会話が長すぎます。添付を減らすか、指示を分けてください。";
+pub const OCR_PAGE_TOO_LONG: &str = "このページは大きすぎて読めません。";
+pub const OCR_SERVER_MEMORY: &str = "このページは推論サーバーのメモリに収まりません。";
+pub const SERVER_MEMORY: &str =
+    "推論サーバーのメモリに収まりません。設定のコンテキスト上限を、サーバーが報告する値以下にしてください。";
+
+pub fn is_context_too_long_message(message: &str) -> bool {
+    message == CONTEXT_TOO_LONG_NEW_CHAT || message == CONTEXT_TOO_LONG_ATTACHMENT
+}
+
+fn push_text(out: &mut Vec<String>, value: Option<&Value>) {
+    if let Some(text) = value.and_then(|item| item.as_str()) {
+        if !text.is_empty() {
+            out.push(text.to_string());
+        }
+    }
+}
+
+/// Only `error.code`, `error.type` and `error.message` (plus the same fields
+/// at the top). A prompt echoed elsewhere in the body must not count.
+fn context_error_fields(raw: &str) -> Vec<String> {
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+        if raw.chars().count() <= 400 {
+            return vec![raw.to_string()];
+        }
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    push_text(&mut out, parsed.get("message"));
+    push_text(&mut out, parsed.get("code"));
+    push_text(&mut out, parsed.get("type"));
+    if let Some(error) = parsed.get("error") {
+        if error.is_string() {
+            push_text(&mut out, Some(error));
+        } else {
+            push_text(&mut out, error.get("message"));
+            push_text(&mut out, error.get("code"));
+            push_text(&mut out, error.get("type"));
+        }
+    }
+    out
+}
+
+fn field_says_context_length(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "context_length_exceeded",
+        "exceed_context_size",
+        "maximum context length",
+        "longer than the maximum model length",
+        "longer than the model's context length",
+        "prompt too long",
+        "context length exceeded",
+        "available context size",
+        "context overflow",
+        "greater than the context length",
+        "exceed the context length",
+        "exceeds the context length",
+        // LM Studio's own wording, typo included.
+        "context the overflows",
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+fn is_context_length_exceeded(raw: &str) -> bool {
+    context_error_fields(raw)
+        .iter()
+        .any(|field| field_says_context_length(field))
+}
+
+fn role_of(message: &Value) -> Option<&str> {
+    message.get("role").and_then(|role| role.as_str())
+}
+
+/// History before the latest user message. A request that is only the current
+/// turn cannot be shortened by starting over with the same attachment.
+fn has_replayable_history(messages: &[Value]) -> bool {
+    let mut last_user = None;
+    for (index, message) in messages.iter().enumerate() {
+        if role_of(message) == Some("user") {
+            last_user = Some(index);
+        }
+    }
+    let Some(last_user) = last_user else {
+        return false;
+    };
+    let pinned = if messages.first().and_then(role_of) == Some("system") {
+        1
+    } else {
+        0
+    };
+    last_user > pinned
+}
+
+fn context_too_long_message(messages: &[Value]) -> &'static str {
+    if has_replayable_history(messages) {
+        CONTEXT_TOO_LONG_NEW_CHAT
+    } else {
+        CONTEXT_TOO_LONG_ATTACHMENT
+    }
+}
+
+fn context_too_long(messages: &[Value]) -> ChatError {
+    ChatError::new(context_too_long_message(messages), None)
+}
+
 fn excerpt_error(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
@@ -436,7 +545,19 @@ pub async fn post_chat(
         .await
         .map_err(|error| connection_error(&error))?;
 
+    // 507: the request will not fit in the server's memory. Retrying does not help.
+    if res.status() == StatusCode::INSUFFICIENT_STORAGE {
+        return Err(ChatError::new(SERVER_MEMORY, None));
+    }
+
     if res.status() == StatusCode::BAD_REQUEST {
+        let raw = res.text().await.unwrap_or_default();
+        // A full window will not fit by dropping the thinking fields. Retrying
+        // would only send the same prompt again.
+        if is_context_length_exceeded(&raw) {
+            log::info_status("llm chat context length exceeded", 400);
+            return Err(context_too_long(options.messages));
+        }
         // Servers without the Qwen thinking controls reject the extra fields.
         log::info_status("llm chat retry without thinking fields", 400);
         res = post(build_payload(&options, false, stream))
@@ -448,6 +569,12 @@ pub async fn post_chat(
     if !res.status().is_success() {
         let status = res.status().as_u16();
         let raw = res.text().await.unwrap_or_default();
+        if status == 507 {
+            return Err(ChatError::new(SERVER_MEMORY, None));
+        }
+        if status == 400 && is_context_length_exceeded(&raw) {
+            return Err(context_too_long(options.messages));
+        }
         let detail = excerpt_error(&raw);
         return Err(ChatError::new(
             if detail.is_empty() {
@@ -473,6 +600,40 @@ pub async fn chat_completions(options: ChatOptions<'_>) -> Result<Completion, Ch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_length_errors_are_not_ordinary_bad_requests() {
+        assert!(is_context_length_exceeded(
+            r#"{"error":{"message":"too long","code":"context_length_exceeded"}}"#
+        ));
+        assert!(is_context_length_exceeded(
+            "This model's maximum context length is 262144 tokens. However, you requested 270000."
+        ));
+        assert!(is_context_length_exceeded(
+            r#"{"error":{"message":"request exceeds the available context size","type":"exceed_context_size_error"}}"#
+        ));
+        assert!(is_context_length_exceeded(
+            r#"{"error":{"message":"decoder prompt (length 9000) is longer than the maximum model length of 8192"}}"#
+        ));
+        assert!(is_context_length_exceeded(
+            r#"{"error":{"message":"Input length (9000) is longer than the model's context length (8192)."}}"#
+        ));
+        assert!(is_context_length_exceeded(r#"{"error":{"message":"Prompt too long"}}"#));
+        assert!(is_context_length_exceeded(
+            r#"{"error":"The number of tokens to keep from the initial prompt is greater than the context length."}"#
+        ));
+        assert!(is_context_length_exceeded(
+            r#"{"error":{"message":"context the overflows"}}"#
+        ));
+        assert!(!is_context_length_exceeded(
+            r#"{"error":{"message":"unknown field","prompt":"maximum context length"}}"#
+        ));
+        assert!(!is_context_length_exceeded(
+            r#"{"error":{"message":"unknown field"}}"#
+        ));
+        assert!(!is_context_length_exceeded(""));
+        assert!(!is_context_length_exceeded("too long"));
+    }
 
     #[test]
     fn pick_default_model_matches_punctuation_drift() {

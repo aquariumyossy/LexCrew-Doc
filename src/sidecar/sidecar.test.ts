@@ -6,7 +6,15 @@ import path from "path";
 import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "./app";
-import { pickDefaultModel } from "./llm";
+import {
+  CONTEXT_TOO_LONG_ATTACHMENT,
+  CONTEXT_TOO_LONG_NEW_CHAT,
+  isContextLengthExceeded,
+  OCR_PAGE_TOO_LONG,
+  OCR_SERVER_MEMORY,
+  pickDefaultModel,
+  SERVER_MEMORY,
+} from "./llm";
 
 const absentConnection = path.join(os.tmpdir(), `guri-sidecar-absent-${process.pid}`, "connection.json");
 
@@ -299,6 +307,165 @@ describe("sidecar", () => {
     expect(sawRetry).toBe(true);
     expect(res.body.content).toBe("コメントを付けました。");
     expect(res.body.toolCalls).toEqual([]);
+  });
+
+  it("does not retry when the context is too long", async () => {
+    expect(isContextLengthExceeded('{"error":{"code":"context_length_exceeded"}}')).toBe(true);
+    expect(
+      isContextLengthExceeded(
+        '{"error":{"message":"decoder prompt is longer than the maximum model length"}}'
+      )
+    ).toBe(true);
+    expect(isContextLengthExceeded('{"error":{"message":"Prompt too long"},"prompt":"本文"}')).toBe(
+      true
+    );
+    expect(
+      isContextLengthExceeded(
+        '{"error":{"message":"unknown field","prompt":"maximum context length"}}'
+      )
+    ).toBe(false);
+    expect(isContextLengthExceeded('{"error":{"message":"context the overflows"}}')).toBe(true);
+    expect(isContextLengthExceeded('{"error":{"message":"unknown field"}}')).toBe(false);
+
+    let hits = 0;
+    const mtplx = await listen((req, res) => {
+      readJsonBody(req, () => {
+        hits += 1;
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: { message: "request exceeds the available context size" },
+          })
+        );
+      });
+    });
+    servers.push(mtplx);
+
+    const app = createApp({ connectionFile: absentConnection });
+    const res = await request(app)
+      .post("/api/chat")
+      .send({
+        llmBaseUrl: `${mtplx.url}/v1`,
+        llmApiKey: "test-key",
+        messages: [{ role: "user", content: "点検して" }],
+      });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe(CONTEXT_TOO_LONG_ATTACHMENT);
+    expect(hits).toBe(1);
+  });
+
+  it("maps a context-length 400 that arrives only on the retry", async () => {
+    let hits = 0;
+    const mtplx = await listen((req, res) => {
+      readJsonBody(req, (body) => {
+        hits += 1;
+        res.writeHead(400, { "Content-Type": "application/json" });
+        if (body.chat_template_kwargs) {
+          res.end(JSON.stringify({ error: { message: "unknown field" } }));
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            error: {
+              message: "Input length (9000) is longer than the model's context length (8192).",
+            },
+          })
+        );
+      });
+    });
+    servers.push(mtplx);
+
+    const app = createApp({ connectionFile: absentConnection });
+    const res = await request(app)
+      .post("/api/chat")
+      .send({
+        llmBaseUrl: `${mtplx.url}/v1`,
+        llmApiKey: "test-key",
+        messages: [
+          { role: "system", content: "ルール" },
+          { role: "user", content: "前" },
+          { role: "user", content: "いま" },
+        ],
+      });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe(CONTEXT_TOO_LONG_NEW_CHAT);
+    expect(hits).toBe(2);
+  });
+
+  it("tells an OCR caller the page is too big, not to start a new chat", async () => {
+    const mtplx = await listen((req, res) => {
+      readJsonBody(req, () => {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({ error: { code: "context_length_exceeded", message: "too long" } })
+        );
+      });
+    });
+    servers.push(mtplx);
+
+    const app = createApp({ connectionFile: absentConnection });
+    const res = await request(app)
+      .post("/api/ocr")
+      .send({
+        llmBaseUrl: `${mtplx.url}/v1`,
+        llmApiKey: "test-key",
+        image: "data:image/png;base64,aaaa",
+      });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe(OCR_PAGE_TOO_LONG);
+  });
+
+  it("tells an OCR caller the page does not fit in memory", async () => {
+    let hits = 0;
+    const mtplx = await listen((req, res) => {
+      readJsonBody(req, () => {
+        hits += 1;
+        res.writeHead(507, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "insufficient memory" } }));
+      });
+    });
+    servers.push(mtplx);
+
+    const app = createApp({ connectionFile: absentConnection });
+    const res = await request(app)
+      .post("/api/ocr")
+      .send({
+        llmBaseUrl: `${mtplx.url}/v1`,
+        llmApiKey: "test-key",
+        image: "data:image/png;base64,aaaa",
+      });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe(OCR_SERVER_MEMORY);
+    expect(hits).toBe(1);
+  });
+
+  it("does not retry when the server is out of memory", async () => {
+    let hits = 0;
+    const mtplx = await listen((req, res) => {
+      readJsonBody(req, () => {
+        hits += 1;
+        res.writeHead(507, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "insufficient memory" } }));
+      });
+    });
+    servers.push(mtplx);
+
+    const app = createApp({ connectionFile: absentConnection });
+    const res = await request(app)
+      .post("/api/chat")
+      .send({
+        llmBaseUrl: `${mtplx.url}/v1`,
+        llmApiKey: "test-key",
+        messages: [{ role: "user", content: "点検して" }],
+      });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe(SERVER_MEMORY);
+    expect(hits).toBe(1);
   });
 
   it("wraps a JSON chat reply as SSE when stream is requested", async () => {

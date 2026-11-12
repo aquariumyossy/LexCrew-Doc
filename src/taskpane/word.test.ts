@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { assembleMeterAttachment } from "./chat/meterSession";
 import { mapBlocks } from "../shared/blocks";
 import { SHAPE_NOTE } from "../shared/extract/shapeText";
-import { SHAPES_MARKER } from "../shared/prompts";
+import { SHAPES_MARKER, userMessageWithAttachment } from "../shared/prompts";
 import {
   applyFormat,
   copyFormat,
@@ -17,6 +18,10 @@ import {
   insertComment,
   insertDraftParagraphs,
   readAttachment,
+  readAttachmentForMeter,
+  readMeterSource,
+  turnBinding,
+  watchParagraphEdits,
   setOutlineLevel,
   deleteMatching,
   deleteParagraphs,
@@ -1319,6 +1324,13 @@ describe("readDocumentText", () => {
       truncated: false,
       listMarks: false,
       shapes: { text: "", truncated: false, error: "" },
+      reviewedFallback: false,
+      inlineMarkup: false,
+      inlineCommentCount: 0,
+      inlineChanges: [],
+      inlineChangesTruncated: false,
+      inlineAppendixComments: [],
+      paragraphTexts: new Map(),
     });
   });
 
@@ -1810,6 +1822,45 @@ describe("replaceParagraphs", () => {
 describe("readAttachment", () => {
   const paragraphs = ["第1条（目的）", "第2条（代金）"];
 
+  it("reads the meter without moving the turn's paragraph map or shapes", async () => {
+    installWord({ selection: "第2条（代金）", body: "", paragraphs });
+    const sent = await readAttachment("document", 1_000, false);
+    const before = turnBinding();
+    expect(before.paragraphs.length).toBeGreaterThan(0);
+    expect(before.source).toBeTruthy();
+
+    const meter = await readAttachmentForMeter("document", 1_000, false);
+    expect(meter).toEqual(sent);
+    expect(turnBinding()).toEqual(before);
+
+    const emptied = await readAttachmentForMeter("document", 0, false);
+    expect(emptied.document).toBe("");
+    expect(turnBinding()).toEqual(before);
+
+    const selectionOnly = await readAttachmentForMeter("selection", 1_000, false);
+    expect(selectionOnly.document).toBe("");
+    expect(selectionOnly.focus).toContain("第2条");
+    expect(turnBinding()).toEqual(before);
+  });
+
+  it("leaves a spent shape number in place when the meter reads during the turn", async () => {
+    installWord({
+      selection: "前文",
+      body: "",
+      paragraphs: ["前文"],
+      ooxml: BOX("当事者目録"),
+      shapes: [{ text: "当事者目録\r" }],
+    });
+    await readAttachment("document", 1_000, false);
+    await deleteShape({ shapes: [1] });
+    const before = turnBinding();
+    expect(before.source).toBeTruthy();
+    expect(before.spentShapes).toEqual([1]);
+
+    await readAttachmentForMeter("document", 1_000, false);
+    expect(turnBinding()).toEqual(before);
+  });
+
   it("sends the body and the selection together, so the model knows where to look", async () => {
     installWord({ selection: "第2条（代金）", body: "", paragraphs });
     const attachment = await readAttachment("document", 1_000, false);
@@ -1895,6 +1946,28 @@ describe("reading comments and tracked changes", () => {
       text: "無催告で",
     });
     expect(attachment.changes.items[0].where).toBe("[段落 2]");
+  });
+
+  it("resolves tracked changes the same way for the meter and the send", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["別の条文"],
+      markupChanges: [{ ...change, where: "別の条文" }],
+    });
+    await readAttachment("document", 10_000, true);
+
+    installWord({ selection: "第2条（代金）", body: "", paragraphs, markupChanges: [change] });
+    const meter = await readAttachmentForMeter("document", 10_000, true);
+    const sent = await readAttachment("document", 10_000, true);
+    expect(meter.changes.items[0].where).toBe("[段落 2]");
+    expect(sent.changes.items[0].where).toBe("[段落 2]");
+    expect(userMessageWithAttachment("見て", meter)).toBe(userMessageWithAttachment("見て", sent));
+
+    const source = await readMeterSource("document", 10_000, true);
+    const assembled = assembleMeterAttachment(source, source.selection, 10_000);
+    expect(assembled.changes.items[0].where).toBe("[段落 2]");
+    expect(assembled.focus).toBe(sent.focus);
   });
 
   it("maps every tracked change type Word reports", async () => {
@@ -3493,6 +3566,73 @@ describe("bulk formatting", () => {
     expect(paragraphs[1].alignment).toBe("Centered");
     expect(paragraphs[1].firstLineIndent).toBe(12);
     expect(paragraphs[2].font.bold).toBe(true);
+  });
+});
+
+describe("watchParagraphEdits", () => {
+  function installEvents(wordApi16: boolean) {
+    const calls: string[] = [];
+    const removed: string[] = [];
+    const listeners: Record<string, Array<() => Promise<void>>> = {
+      added: [],
+      changed: [],
+      deleted: [],
+    };
+    const make = (name: string) => ({
+      add: (handler: () => Promise<void>) => {
+        calls.push(name);
+        listeners[name].push(handler);
+        return { remove: () => removed.push(name) };
+      },
+    });
+    const document = {
+      track: () => undefined,
+      untrack: () => undefined,
+      onParagraphAdded: make("added"),
+      onParagraphChanged: make("changed"),
+      onParagraphDeleted: make("deleted"),
+    };
+    const context = { document, sync: async () => undefined };
+    (globalThis as unknown as { Word: unknown }).Word = {
+      run: (first: unknown, second?: (ctx: typeof context) => Promise<unknown>) => {
+        const batch = typeof first === "function" ? (first as (ctx: typeof context) => Promise<unknown>) : second;
+        return batch?.(context);
+      },
+    };
+    (globalThis as unknown as { Office: unknown }).Office = {
+      context: {
+        host: "Word",
+        requirements: {
+          isSetSupported: (name: string, version: string) =>
+            name === "WordApi" && version === "1.6" ? wordApi16 : true,
+        },
+      },
+      HostType: { Word: "Word" },
+    };
+    return {
+      calls,
+      removed,
+      fire: (name: string) => Promise.all(listeners[name].map((handler) => handler())),
+    };
+  }
+
+  it("forwards each paragraph edit and skips the subscription on older Word", async () => {
+    const old = installEvents(false);
+    const skipped = await watchParagraphEdits(() => undefined);
+    expect(old.calls).toEqual([]);
+    await skipped();
+
+    const events = installEvents(true);
+    let edits = 0;
+    const cleanup = await watchParagraphEdits(() => {
+      edits += 1;
+    });
+    expect(events.calls).toEqual(["added", "changed", "deleted"]);
+    await events.fire("changed");
+    await events.fire("added");
+    expect(edits).toBe(2);
+    await cleanup();
+    expect(events.removed).toEqual(["added", "changed", "deleted"]);
   });
 });
 

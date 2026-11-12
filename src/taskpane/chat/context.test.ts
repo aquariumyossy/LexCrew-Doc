@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { EMPTY_ATTACHMENT } from "../../shared/attachment";
-import { CHARS_PER_TOKEN, MAX_FILE_CHARS, TOOL_RESULT_BUDGET_RATIO } from "../../shared/constants";
+import { EMPTY_ATTACHMENT, attachmentCharBudget } from "../../shared/attachment";
+import { fileCharBudget } from "../../shared/fileSource";
+import {
+  CHARS_PER_TOKEN,
+  CONVERSATION_BUDGET_RATIO,
+  DROP_TARGET_RATIO,
+  MAX_FILE_CHARS,
+  TOOL_RESULT_BUDGET_RATIO,
+  messageRoomTokens,
+} from "../../shared/constants";
 import { StoredMessage } from "../../shared/history";
 import {
   stripAttachment,
@@ -11,12 +19,17 @@ import { buildTools, isDocumentSnapshotTool, STALE_DOCUMENT_READ } from "../../s
 import { ChatMessage } from "../../sidecar/types";
 import {
   ABORTED_TOOL_RESULT,
+  budgetSchemaTokens,
   capToolResults,
+  contextRoom,
   dropOldest,
   estimateTokens,
   fitContext,
   indexedReadCharLimit,
+  messageTokens,
   messagesTokens,
+  prepareRequest,
+  replyReserveTokens,
   requestTokens,
   toChatMessages,
   toolSchemaTokens,
@@ -372,12 +385,25 @@ describe("tool call ids repeat across turns", () => {
 });
 
 describe("indexedReadCharLimit", () => {
-  it("stays inside the tool-result share, and never past the file cap", () => {
+  it("stays inside the tool-result share of the fit room, and never past the file cap", () => {
     const limit = 131_072;
-    const chars = indexedReadCharLimit(limit, []);
+    const tools = buildTools({
+      search: true,
+      argos: true,
+      selection: true,
+      numbered: true,
+      shapes: true,
+    });
+    const chars = indexedReadCharLimit(limit, [], tools);
     expect(chars).toBeLessThanOrEqual(MAX_FILE_CHARS);
     const tokens = Math.ceil(chars / CHARS_PER_TOKEN) + 4;
-    expect(tokens).toBeLessThanOrEqual(Math.floor(limit * TOOL_RESULT_BUDGET_RATIO));
+    const room = contextRoom(limit, tools);
+    expect(tokens).toBeLessThanOrEqual(Math.floor(room * TOOL_RESULT_BUDGET_RATIO));
+    const capped = capToolResults(
+      [{ role: "tool", content: "あ".repeat(chars), tool_call_id: "c1" }],
+      room
+    );
+    expect(capped[0].content).toBe("あ".repeat(chars));
   });
 
   it("shrinks by what earlier tool results already use", () => {
@@ -440,6 +466,117 @@ describe("dropOldest", () => {
     }
   });
 
+  function firstKeptUser(messages: ChatMessage[]): string {
+    const found = messages.find((message, index) => index > 0 && message.role === "user");
+    return found?.content || "";
+  }
+
+  it("keeps the same cut when the full history is replayed", () => {
+    const limit = 2_000;
+    const band = Math.max(1, limit - Math.floor(limit * DROP_TARGET_RATIO));
+    const history: ChatMessage[] = [{ role: "system", content: "s" }];
+    let n = 0;
+    const pushTurn = () => {
+      history.push({ role: "user", content: `u${n}${"あ".repeat(40)}` });
+      history.push({ role: "assistant", content: `a${n}${"い".repeat(40)}` });
+      n += 1;
+    };
+    while (messagesTokens(history) <= limit) {
+      pushTurn();
+    }
+    const quantum = (total: number) => Math.ceil((total - limit) / band);
+    const q0 = quantum(messagesTokens(history));
+    const kept = firstKeptUser(dropOldest(history, limit));
+    expect(kept).not.toBe("");
+
+    const withToolRound: ChatMessage[] = [
+      ...history,
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "c1", type: "function", function: { name: "search", arguments: "{}" } }],
+      },
+      { role: "tool", content: "結果", tool_call_id: "c1" },
+    ];
+    expect(quantum(messagesTokens(withToolRound))).toBe(q0);
+    expect(firstKeptUser(dropOldest(withToolRound, limit))).toBe(kept);
+
+    let replayed = 0;
+    while (replayed < 4) {
+      pushTurn();
+      if (quantum(messagesTokens(history)) !== q0) {
+        break;
+      }
+      expect(firstKeptUser(dropOldest(history, limit))).toBe(kept);
+      replayed += 1;
+    }
+    expect(replayed).toBeGreaterThan(0);
+  });
+
+  it("keeps history that still fits beside a large pinned turn", () => {
+    const limit = 1_000;
+    const target = Math.floor(limit * DROP_TARGET_RATIO);
+    const history: ChatMessage[] = [{ role: "system", content: "s" }];
+    for (let index = 0; index < 12; index += 1) {
+      history.push({ role: "user", content: `古い${index}${"あ".repeat(40)}` });
+      history.push({ role: "assistant", content: `返事${index}${"い".repeat(20)}` });
+    }
+    // About 77% of the room: under the 85% line, but a full hysteresis step
+    // would throw away most of the history that still fits.
+    const pinned = "あ".repeat(Math.ceil(limit * 0.77 * CHARS_PER_TOKEN));
+    history.push({ role: "user", content: pinned });
+    const pinnedTokens = messageTokens(history[0]) + messageTokens(history.at(-1) as ChatMessage);
+    expect(pinnedTokens).toBeLessThan(target);
+    expect(pinnedTokens).toBeGreaterThan(limit * 0.7);
+    expect(messagesTokens(history)).toBeGreaterThan(limit);
+
+    const trimmed = dropOldest(history, limit);
+    const keptHistory = messagesTokens(trimmed) - pinnedTokens;
+    expect(messagesTokens(trimmed)).toBeLessThanOrEqual(limit);
+    expect(trimmed.at(-1)?.content).toBe(pinned);
+    expect(keptHistory).toBeGreaterThan(target - pinnedTokens);
+    expect(trimmed.some((message) => message.content?.startsWith("古い"))).toBe(true);
+
+    const withTools: ChatMessage[] = [
+      ...history,
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "c1", type: "function", function: { name: "search", arguments: "{}" } }],
+      },
+      {
+        role: "tool",
+        content: "あ".repeat(Math.ceil(limit * 0.12 * CHARS_PER_TOKEN)),
+        tool_call_id: "c1",
+      },
+    ];
+    const pinnedAfter =
+      pinnedTokens +
+      messageTokens(withTools.at(-2) as ChatMessage) +
+      messageTokens(withTools.at(-1) as ChatMessage);
+    expect(pinnedAfter).toBeGreaterThan(target);
+    const afterTools = dropOldest(withTools, limit);
+    expect(messagesTokens(afterTools)).toBeLessThanOrEqual(limit);
+    expect(afterTools.at(-1)?.role).toBe("tool");
+    expect(messagesTokens(afterTools) - pinnedAfter).toBeGreaterThan(0);
+    expect(afterTools.some((message) => message.content?.startsWith("古い"))).toBe(true);
+  });
+
+  it("trims a long transcript in one pass", () => {
+    const messages: ChatMessage[] = [{ role: "system", content: "s" }];
+    for (let index = 0; index < 1_500; index += 1) {
+      messages.push({
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `${index}${"あ".repeat(400)}`,
+      });
+    }
+    const started = Date.now();
+    const trimmed = dropOldest(messages, 4_000);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(messagesTokens(trimmed)).toBeLessThanOrEqual(4_000);
+    expect(trimmed.at(-1)?.content).toBe(messages.at(-1)?.content);
+  });
+
   it("never leaves a tool reply without its call", () => {
     const trimmed = dropOldest(conversation, 240);
     const orphan = trimmed.some(
@@ -476,6 +613,100 @@ describe("tool schema in the meter", () => {
     expect(fitted.map((message) => message.content)).toEqual(["s", current]);
     expect(requestTokens(fitted, tools)).toBeLessThanOrEqual(limit);
     expect(fitContext(messages, limit).length).toBe(messages.length);
+  });
+});
+
+describe("reply reserve", () => {
+  it("holds back 10% of the context limit", () => {
+    expect(replyReserveTokens(1_000)).toBe(100);
+    expect(replyReserveTokens(0)).toBe(0);
+    expect(replyReserveTokens(Number.NaN)).toBe(0);
+  });
+
+  it("drops older turns so the reply reserve stays free, and keeps the current turn", () => {
+    const tools = buildTools({ search: false, selection: false, numbered: false });
+    const schema = toolSchemaTokens(tools);
+    const limit = Math.ceil((schema + 2_000) / 0.9);
+    const reserve = replyReserveTokens(limit);
+    const oldRoom = limit - schema;
+    const room = contextRoom(limit, tools);
+    expect(room).toBe(oldRoom - reserve);
+    expect(room).toBeGreaterThan(500);
+
+    const kept: ChatMessage[] = [
+      { role: "system", content: "s" },
+      { role: "user", content: "いま" },
+    ];
+    const keptTokens = messagesTokens(kept);
+    const target = room - keptTokens + 1;
+    let body = "あ".repeat(Math.max(0, Math.round((target - 4) * CHARS_PER_TOKEN)));
+    while (messageTokens({ role: "user", content: body }) < target) {
+      body += "あ";
+    }
+    const messages: ChatMessage[] = [kept[0], { role: "user", content: body }, kept[1]];
+    const full = messagesTokens(messages);
+    expect(full).toBeGreaterThan(room);
+    expect(full).toBeLessThanOrEqual(oldRoom);
+    // Without the reserve this conversation still fits.
+    expect(dropOldest(messages, oldRoom)).toEqual(messages);
+
+    const fitted = fitContext(messages, limit, tools);
+    expect(fitted.map((message) => message.content)).toEqual(["s", "いま"]);
+    expect(requestTokens(fitted, tools)).toBeLessThanOrEqual(limit - reserve);
+    expect(fitted.at(-1)?.content).toBe("いま");
+
+    const huge: ChatMessage[] = [
+      { role: "system", content: "s" },
+      { role: "user", content: "あ".repeat(CHARS_PER_TOKEN * limit) },
+    ];
+    const pinned = fitContext(huge, limit, tools);
+    expect(pinned.map((message) => message.role)).toEqual(["system", "user"]);
+    expect(messagesTokens(pinned)).toBeGreaterThan(room);
+  });
+
+  it("keeps the reply reserve and the conversation share at narrow windows", () => {
+    const schema = budgetSchemaTokens(true, true);
+    const reserved = 8_000;
+    for (const limit of [32_768, 65_536, 131_072]) {
+      const room = messageRoomTokens(limit, schema);
+      const pool = Math.floor(room * (1 - CONVERSATION_BUDGET_RATIO) * CHARS_PER_TOKEN);
+      const document = attachmentCharBudget(limit, schema, reserved);
+      const files = fileCharBudget(limit, schema, reserved);
+      expect(document + files + reserved).toBeLessThanOrEqual(pool);
+      expect(room + schema + replyReserveTokens(limit)).toBe(limit);
+    }
+  });
+});
+
+describe("reasoning in the estimate", () => {
+  it("counts reasoning on a live turn and drops it when the turn is replayed", () => {
+    const reasoning = "考".repeat(160);
+    const live: ChatMessage = { role: "assistant", content: "答え", reasoning_content: reasoning };
+    const quiet: ChatMessage = { role: "assistant", content: "答え" };
+    expect(messageTokens(live)).toBe(messageTokens(quiet) + estimateTokens(reasoning));
+
+    const replay = toChatMessages([
+      stored({ role: "user", content: "質問" }),
+      stored({ role: "assistant", content: "答え", reasoningContent: reasoning }),
+    ]);
+    expect(replay[1].reasoning_content).toBeUndefined();
+    expect(messagesTokens(replay)).toBe(
+      messagesTokens([
+        { role: "user", content: "質問" },
+        { role: "assistant", content: "答え" },
+      ])
+    );
+
+    const limit = 100_000;
+    const withThought = prepareRequest([live], limit).tokens;
+    const withoutThought = prepareRequest([quiet], limit).tokens;
+    expect(withThought).toBe(withoutThought + estimateTokens(reasoning));
+    expect(prepareRequest(replay, limit).tokens).toBe(
+      prepareRequest(
+        replay.map((message) => ({ ...message, reasoning_content: undefined })),
+        limit
+      ).tokens
+    );
   });
 });
 

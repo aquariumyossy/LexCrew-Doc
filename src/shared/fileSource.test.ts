@@ -33,18 +33,15 @@ function file(name: string, body: string, over: Partial<CommittedFile> = {}): Co
 }
 
 describe("fileCharBudget", () => {
-  it("gives files their own share rather than a slice of the document's", () => {
-    // 131,072 tokens * 0.25 * 1.6 chars stays under the ceiling now that the
-    // characters-per-token estimate matches what the server actually counts.
+  it("gives files their own share of the room after the reply reserve", () => {
     expect(fileCharBudget(131_072)).toBeLessThan(MAX_FILE_CHARS);
-    expect(fileCharBudget(131_072)).toBe(52_428);
-    expect(fileCharBudget(32_768)).toBe(13_107);
+    expect(fileCharBudget(131_072)).toBe(47_186);
+    expect(fileCharBudget(32_768)).toBe(11_796);
   });
 
-  it("yields to what the rest of the request already takes", () => {
-    // A narrow window with a full document attached leaves no room for files.
-    expect(fileCharBudget(4_096, 6_600)).toBe(0);
-    expect(fileCharBudget(32_768, 40_000)).toBe(1_943);
+  it("yields to the system prompt and the document share", () => {
+    expect(fileCharBudget(4_096, 0, 6_600)).toBe(0);
+    expect(fileCharBudget(32_768, 0, 40_000)).toBe(0);
   });
 
   it("is zero for a window that makes no sense", () => {

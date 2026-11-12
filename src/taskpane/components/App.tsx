@@ -39,7 +39,6 @@ import {
   markupCharBudget,
 } from "../../shared/attachment";
 import {
-  CHARS_PER_TOKEN,
   DOCUMENT_KEY_SETTING,
   LINE_SPACING_CHARS,
   MAX_TIMEOUT_MS,
@@ -47,10 +46,7 @@ import {
 } from "../../shared/constants";
 import {
   CommittedFile,
-  clampFiles,
   commit,
-  fileCharBudget,
-  filesChars,
   isPendingRead,
   isReady,
   mergeFiles,
@@ -59,10 +55,9 @@ import { assertChatInput } from "../../shared/guards";
 import { REMOTE_OCR_NOTICE, isLoopbackUrl } from "../../shared/ocr";
 import { ConversationSummary, NewMessage, StoredMessage } from "../../shared/history";
 import { joinArgosScopes, parseArgosScopes } from "../../shared/argos";
-import { stableSystemPrompt, turnAttachmentNotes } from "../../shared/prompts";
+import { stableSystemPrompt } from "../../shared/prompts";
 import {
   TOOL_ROUND_PRESETS,
-  buildTools,
   normalizeMaxToolRounds,
   toolRoundPresetLabel,
 } from "../../shared/tools";
@@ -81,8 +76,8 @@ import {
   saveStoredConnection,
   setConversationFiles as saveConversationFiles,
 } from "../api";
-import { estimateTokens, messagesTokens, toChatMessages, toolSchemaTokens } from "../chat/context";
-import { runTurn } from "../chat/runTurn";
+import { budgetSchemaTokens } from "../chat/context";
+import { outgoingTokens, runTurn } from "../chat/runTurn";
 import { forgetThinkingBudget, readThinkingBudget } from "../chat/thinkingBudget";
 import { applyAdopt } from "../connectionState";
 import {
@@ -103,8 +98,17 @@ import {
   getDocumentStats,
   getSelectionText,
   isWordHost,
+  canReadChanges,
   readAttachment,
+  readMeterSource,
+  readSelectionForMeter,
+  watchParagraphEdits,
 } from "../word";
+import {
+  createDocumentEditRefresh,
+  createMeterSession,
+  selectionNeedsBodyRead,
+} from "../chat/meterSession";
 import { OcrRunner, useFileSources } from "../files/useFileSources";
 import { ocrFile } from "../files/ocr";
 import { aboutCopy } from "../about";
@@ -333,11 +337,20 @@ const App: React.FC = () => {
   const [argosPathPrefix, setArgosPathPrefix] = React.useState("");
 
   const [input, setInput] = React.useState("");
+  /**
+   * Fitted size of the transcript runTurn last prepared. Shown while that
+   * measurement still matches the composer; a new draft recounts the next send.
+   */
+  const [fittedTokens, setFittedTokens] = React.useState<number | null>(null);
   /** Read once and kept by the conversation; rides along on every turn. */
   const [attachedFiles, setAttachedFiles] = React.useState<CommittedFile[]>([]);
   const [dragging, setDragging] = React.useState(false);
   const [draft, setDraft] = React.useState<ChatDraft | null>(null);
   const [selectionChars, setSelectionChars] = React.useState(0);
+  const [selectionText, setSelectionText] = React.useState("");
+  /** Last document read. The meter reuses it instead of inventing a body. */
+  const [cachedAttachment, setCachedAttachment] = React.useState<Attachment | null>(null);
+  const [readGeneration, setReadGeneration] = React.useState(0);
   const [stats, setStats] = React.useState<DocumentStats>({
     chars: 0,
     attachChars: 0,
@@ -390,7 +403,50 @@ const App: React.FC = () => {
     ocr: runOcr,
   });
 
-  const attachBudget = attachmentCharBudget(settings.contextLimit);
+  /** What the next send would carry: the conversation's files plus ready badges. */
+  const turnFiles = React.useMemo(
+    () => mergeFiles(attachedFiles, pendingFiles.filter(isReady).map(commit)),
+    [attachedFiles, pendingFiles]
+  );
+  const readingFiles = pendingFiles.some(isPendingRead);
+  const argosPathPrefixes = React.useMemo(
+    () => parseArgosScopes(argosPathPrefix),
+    [argosPathPrefix]
+  );
+  // Settings only. The document's selection and shapes must not resize this,
+  // or the file text on the cached prefix would change every turn.
+  const schemaTokens = React.useMemo(
+    () =>
+      budgetSchemaTokens(
+        Boolean(settings.searxngUrl.trim()),
+        Boolean(settings.argosBaseUrl.trim())
+      ),
+    [settings.searxngUrl, settings.argosBaseUrl]
+  );
+  const stableChars = React.useMemo(
+    () =>
+      stableSystemPrompt({
+        fontName: settings.fontName,
+        bodyPt: settings.bodyPt,
+        titlePt: settings.titlePt,
+        lineSpacingChars: settings.lineSpacingChars,
+        search: Boolean(settings.searxngUrl.trim()),
+        argos: Boolean(settings.argosBaseUrl.trim()),
+        argosPathPrefix: joinArgosScopes(argosPathPrefixes),
+        files: turnFiles.length > 0,
+      }).length,
+    [
+      settings.fontName,
+      settings.bodyPt,
+      settings.titlePt,
+      settings.lineSpacingChars,
+      settings.searxngUrl,
+      settings.argosBaseUrl,
+      argosPathPrefixes,
+      turnFiles.length,
+    ]
+  );
+  const attachBudget = attachmentCharBudget(settings.contextLimit, schemaTokens, stableChars);
   const attachedFocusChars = scope === "none" ? 0 : Math.min(selectionChars, attachBudget);
   const withMarkup = markup && scope !== "none";
   // Only a document that has markup gives up body characters for it. The slice is
@@ -406,80 +462,34 @@ const App: React.FC = () => {
       ? Math.max(0, Math.min(stats.attachChars, attachBudget - attachedFocusChars - markupChars))
       : 0;
 
-  /** What the next send would carry: the conversation's files plus ready badges. */
-  const turnFiles = React.useMemo(
-    () => mergeFiles(attachedFiles, pendingFiles.filter(isReady).map(commit)),
-    [attachedFiles, pendingFiles]
-  );
-  const readingFiles = pendingFiles.some(isPendingRead);
+  const previewAttachment =
+    cachedAttachment && cachedAttachment.scope === scope && cachedAttachment.markup === withMarkup
+      ? cachedAttachment
+      : { ...EMPTY_ATTACHMENT, scope, markup: withMarkup };
+  const previewHasBody =
+    previewAttachment.scope === "document"
+      ? Boolean(previewAttachment.document.trim() || previewAttachment.truncated)
+      : stats.chars > 0;
 
-  const promptEstimate = React.useMemo(() => {
-    const base = {
-      fontName: settings.fontName,
-      bodyPt: settings.bodyPt,
-      titlePt: settings.titlePt,
-      lineSpacingChars: settings.lineSpacingChars,
-      search: Boolean(settings.searxngUrl.trim()),
-      argos: Boolean(settings.argosBaseUrl.trim()),
-      argosPathPrefix,
-    };
-    const stable = stableSystemPrompt({ ...base, files: turnFiles.length > 0 });
-    const notes = turnAttachmentNotes({
-      ...base,
-      selection: selectionChars > 0,
-      numbered: scope === "document" && attachedDocChars > 0,
-      markup: withMarkup,
-      hasBody: stats.chars > 0,
-      reviewedBody: scope !== "none",
-    });
-    const tools = buildTools({
-      search: Boolean(settings.searxngUrl.trim()),
-      argos: Boolean(settings.argosBaseUrl.trim()),
-      selection: selectionChars > 0,
-      numbered: scope === "document" && attachedDocChars > 0,
-    });
-    return {
-      stableChars: stable.length,
-      stableTokens: estimateTokens(stable),
-      noteTokens: estimateTokens(notes),
-      toolTokens: toolSchemaTokens(tools),
-    };
-  }, [
-    settings.fontName,
-    settings.bodyPt,
-    settings.titlePt,
-    settings.lineSpacingChars,
-    settings.searxngUrl,
-    settings.argosBaseUrl,
-    argosPathPrefix,
-    turnFiles.length,
-    selectionChars,
-    scope,
-    attachedDocChars,
-    withMarkup,
-    stats.chars,
-  ]);
-
-  // The file budget does not yield to the document. Same reservation as
-  // `runTurn`: files are sized from the stable prompt only, so the meter
-  // matches the prefix.
-  const fileChars = React.useMemo(() => {
-    const budget = fileCharBudget(settings.contextLimit, promptEstimate.stableChars);
-    return filesChars(clampFiles(turnFiles, budget));
-  }, [turnFiles, settings.contextLimit, promptEstimate.stableChars]);
-
-  const estimated = React.useMemo(
+  // Next send: the cached read (shapes, list marks, markup) through the same
+  // fit the send uses. A keystroke only changes the instruction.
+  const preview = React.useMemo(
     () =>
-      promptEstimate.stableTokens +
-      promptEstimate.noteTokens +
-      promptEstimate.toolTokens +
-      messagesTokens(toChatMessages(messages)) +
-      estimateTokens(input) +
-      Math.ceil(
-        (attachedDocChars + attachedFocusChars + markupChars + fileChars) / CHARS_PER_TOKEN
-      ),
-    [promptEstimate, messages, input, attachedDocChars, attachedFocusChars, markupChars, fileChars]
+      outgoingTokens({
+        settings,
+        instruction: input,
+        attachment: previewAttachment,
+        files: turnFiles,
+        history: messages,
+        argosPathPrefixes,
+        hasBody: previewHasBody,
+      }),
+    [settings, input, previewAttachment, turnFiles, messages, argosPathPrefixes, previewHasBody]
   );
+
+  // While a turn is in flight this is the request just posted. Afterwards the
+  // meter shows the next send, which drops this turn's reads and reasoning.
+  const estimated = busy && fittedTokens != null ? fittedTokens : preview;
 
   const attachLabel = describeAttachment({
     scope,
@@ -705,9 +715,114 @@ const App: React.FC = () => {
       return;
     }
     void getDocumentStats()
-      .then(setStats)
+      .then((next) => {
+        setStats(next);
+        setReadGeneration((generation) => generation + 1);
+      })
       .catch(() => undefined);
   }, []);
+
+  const meterSession = React.useRef<ReturnType<typeof createMeterSession> | null>(null);
+  if (!meterSession.current) {
+    meterSession.current = createMeterSession({
+      readSource: readMeterSource,
+      readSelection: readSelectionForMeter,
+    });
+  }
+
+  React.useEffect(() => {
+    if (!inWord) {
+      setCachedAttachment(null);
+      return undefined;
+    }
+    // A turn owns the paragraph map and the shape list. The meter waits.
+    if (busy) {
+      return undefined;
+    }
+    let cancel = false;
+    const timer = window.setTimeout(() => {
+      void meterSession.current
+        .requestBody(scope, attachBudget, withMarkup)
+        .then((attachment) => {
+          if (!cancel) {
+            setCachedAttachment(attachment);
+          }
+        })
+        .catch(() => undefined);
+    }, 300);
+    return () => {
+      cancel = true;
+      window.clearTimeout(timer);
+    };
+  }, [inWord, busy, scope, attachBudget, withMarkup, readGeneration]);
+
+  React.useEffect(() => {
+    if (!inWord || busy) {
+      return undefined;
+    }
+    let cancel = false;
+    const timer = window.setTimeout(() => {
+      const session = meterSession.current;
+      if (!session) {
+        return;
+      }
+      const refreshBody = selectionNeedsBodyRead(scope, withMarkup, canReadChanges());
+      const read = refreshBody
+        ? session.requestBody(scope, attachBudget, withMarkup)
+        : session.selectionChanged();
+      void read
+        .then((attachment) => {
+          if (!cancel && attachment) {
+            setCachedAttachment(attachment);
+          }
+        })
+        .catch(() => undefined);
+    }, 300);
+    return () => {
+      cancel = true;
+      window.clearTimeout(timer);
+    };
+  }, [inWord, busy, selectionText, scope, withMarkup, attachBudget]);
+
+  const meterArgs = React.useRef({ scope, attachBudget, withMarkup, busy });
+  meterArgs.current = { scope, attachBudget, withMarkup, busy };
+
+  React.useEffect(() => {
+    if (!inWord || !canReadChanges()) {
+      return undefined;
+    }
+    let cancel = false;
+    let stop = () => Promise.resolve();
+    const refresh = createDocumentEditRefresh(() => {
+      if (cancel || meterArgs.current.busy) {
+        return undefined;
+      }
+      const session = meterSession.current;
+      if (!session) {
+        return undefined;
+      }
+      const args = meterArgs.current;
+      return session.requestBody(args.scope, args.attachBudget, args.withMarkup).then((attachment) => {
+        if (!cancel) {
+          setCachedAttachment(attachment);
+        }
+      });
+    });
+    void watchParagraphEdits(() => refresh.onEdit())
+      .then((cleanup) => {
+        if (cancel) {
+          void cleanup();
+          return;
+        }
+        stop = cleanup;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancel = true;
+      refresh.dispose();
+      void stop();
+    };
+  }, [inWord]);
 
   React.useEffect(() => {
     if (!inWord) {
@@ -717,6 +832,7 @@ const App: React.FC = () => {
     const readSelection = () => {
       void getSelectionText()
         .then((text) => {
+          setSelectionText(text);
           setSelectionChars(text.length);
           // 「選択範囲だけ」は生きた選択が前提。クリックひとつで選択は消えるので、
           // 残したままにすると本文も選択も無い添付を黙って送ることになる。
@@ -724,7 +840,10 @@ const App: React.FC = () => {
             setScope((current) => (current === "selection" ? "document" : current));
           }
         })
-        .catch(() => setSelectionChars(0));
+        .catch(() => {
+          setSelectionText("");
+          setSelectionChars(0);
+        });
     };
     readSelection();
     Office.context.document.addHandlerAsync(
@@ -839,6 +958,7 @@ const App: React.FC = () => {
     const ac = new AbortController();
     abortRef.current = ac;
     setBusy(true);
+    setFittedTokens(null);
     setBusyLabel("応答");
     setBanner(null);
     setDraft(null);
@@ -849,6 +969,7 @@ const App: React.FC = () => {
       if (inWord) {
         await assertDocumentReady();
         attachment = await readAttachment(scope, attachBudget, withMarkup);
+        setCachedAttachment(attachment);
       }
 
       let target = conversationId;
@@ -909,10 +1030,12 @@ const App: React.FC = () => {
         signal: ac.signal,
         onMessage,
         onDelta: (snapshot) => setDraft(snapshot),
+        onRequestTokens: (tokens) => setFittedTokens(tokens),
         argosPathPrefixes,
       });
       await refreshConversations();
     } catch (error) {
+      setFittedTokens(null);
       if (isAbort(error)) {
         setBanner({
           intent: "info",
@@ -927,6 +1050,7 @@ const App: React.FC = () => {
       }
     } finally {
       abortRef.current = null;
+      setFittedTokens(null);
       setBusy(false);
       setBusyLabel("");
       setDraft(null);

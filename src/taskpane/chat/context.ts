@@ -1,7 +1,14 @@
-import { CHARS_PER_TOKEN, MAX_FILE_CHARS, TOOL_RESULT_BUDGET_RATIO } from "../../shared/constants";
+import {
+  CHARS_PER_TOKEN,
+  DROP_TARGET_RATIO,
+  MAX_FILE_CHARS,
+  TOOL_RESULT_BUDGET_RATIO,
+  messageRoomTokens,
+  replyReserveTokens as reserveTokens,
+} from "../../shared/constants";
 import { StoredMessage } from "../../shared/history";
 import { stripAttachment } from "../../shared/prompts";
-import { isDocumentSnapshotTool, STALE_DOCUMENT_READ } from "../../shared/tools";
+import { buildTools, isDocumentSnapshotTool, STALE_DOCUMENT_READ } from "../../shared/tools";
 import { logInfo } from "../../sidecar/logger";
 import { ChatMessage } from "../../sidecar/types";
 
@@ -15,6 +22,11 @@ export function estimateTokens(text: string): number {
 
 export function messageTokens(message: ChatMessage): number {
   let total = estimateTokens(message.content || "");
+  // Sent back on the next round of this turn. Replay drops it first, so a
+  // later turn does not pay for it.
+  if (message.reasoning_content) {
+    total += estimateTokens(message.reasoning_content);
+  }
   for (const call of message.tool_calls || []) {
     total += estimateTokens(call.function.name) + estimateTokens(call.function.arguments);
   }
@@ -41,6 +53,37 @@ export function toolSchemaTokens(tools: readonly unknown[] | null | undefined): 
 /** Messages plus the tool schema the server also bills. */
 export function requestTokens(messages: ChatMessage[], tools?: readonly unknown[] | null): number {
   return messagesTokens(messages) + toolSchemaTokens(tools);
+}
+
+/** Tokens held back so the reply has room. Ten percent of the context limit. */
+export function replyReserveTokens(limit: number): number {
+  return reserveTokens(limit);
+}
+
+/**
+ * Tool-schema tokens used to size attachments and files. Selection, paragraph
+ * numbers and shapes are assumed present: they come and go with the document,
+ * and letting them resize the file text would move the cached prefix.
+ */
+export function budgetSchemaTokens(search: boolean, argos: boolean): number {
+  return toolSchemaTokens(
+    buildTools({
+      search,
+      argos,
+      selection: true,
+      numbered: true,
+      shapes: true,
+    })
+  );
+}
+
+export type FitOptions = {
+  /** Meter refreshes must not log a trim on every keystroke. Sends log. */
+  log?: boolean;
+};
+
+function trimLogged(options?: FitOptions): boolean {
+  return options?.log !== false;
 }
 
 /**
@@ -172,8 +215,14 @@ function truncate(text: string, maxTokens: number): string {
  * How much of an indexed file the next tool result can carry.
  * `capToolResults` shrinks a result, newest included, once the tool share is over.
  */
-export function indexedReadCharLimit(contextLimit: number, toolContents: string[]): number {
-  const budget = Math.floor(contextLimit * TOOL_RESULT_BUDGET_RATIO);
+export function indexedReadCharLimit(
+  contextLimit: number,
+  toolContents: string[],
+  tools?: readonly unknown[] | null
+): number {
+  // Same base as `capToolResults`: 25% of the fit room, so a full read is not
+  // stubbed on the next round.
+  const budget = Math.floor(contextRoom(contextLimit, tools) * TOOL_RESULT_BUDGET_RATIO);
   const used = toolContents.reduce(
     (total, content) => total + messageTokens({ role: "tool", content }),
     0
@@ -189,7 +238,11 @@ export function indexedReadCharLimit(contextLimit: number, toolContents: string[
  * Search hits and other tool output must not crowd out the conversation, so
  * they get their own share of the window; the oldest ones shrink first.
  */
-export function capToolResults(messages: ChatMessage[], limit: number): ChatMessage[] {
+export function capToolResults(
+  messages: ChatMessage[],
+  limit: number,
+  options?: FitOptions
+): ChatMessage[] {
   const budget = Math.floor(limit * TOOL_RESULT_BUDGET_RATIO);
   const toolIndexes = messages
     .map((m, index) => (m.role === "tool" ? index : -1))
@@ -218,7 +271,7 @@ export function capToolResults(messages: ChatMessage[], limit: number): ChatMess
     used -= before - messageTokens(shrunkMessage);
     shrunk += 1;
   }
-  if (shrunk > 0) {
+  if (shrunk > 0 && trimLogged(options)) {
     logInfo("context trim", { shrunkToolResults: shrunk, tokens: messagesTokens(out), limit });
   }
   return out;
@@ -240,41 +293,121 @@ function currentTurnStart(messages: ChatMessage[]): number {
 }
 
 /**
- * Drop whole exchanges from the front until the request fits. An assistant turn
- * with tool calls leaves with its tool replies: the server rejects an orphan of
+ * How many tokens to take off the front. A full replay every turn would
+ * otherwise slide the cut forward by one turn's growth. The amount is a
+ * multiple of the headroom (`1 - DROP_TARGET_RATIO`), counted from how far
+ * the whole conversation is over the room, so the same prefix survives
+ * several turns and tool rounds.
+ *
+ * When the pinned turn is already past that headroom, or it fills so much of
+ * the room that a whole step would erase the history that still fits, drop
+ * only what does not fit.
+ */
+function tokensToDrop(total: number, limit: number, pinnedTokens: number): number {
+  const excess = total - limit;
+  if (excess <= 0) {
+    return 0;
+  }
+  const target = Math.floor(limit * DROP_TARGET_RATIO);
+  const band = Math.max(1, limit - target);
+  // History that still fits beside the pinned turn. Rounding the drop up to a
+  // whole band keeps the cut still, but when that band is most of the slack
+  // the round-up throws the conversation away. Drop only the overflow then.
+  const fittable = limit - pinnedTokens;
+  if (pinnedTokens > target || fittable < band * 2) {
+    return excess;
+  }
+  return Math.ceil(excess / band) * band;
+}
+
+/**
+ * Drop history from the front until the request fits. An assistant turn with
+ * tool calls leaves with its tool replies: the server rejects an orphan of
  * either half.
  *
- * The system prompt (and the committed files inside it) stays. So does the
- * latest user message and everything after it: after a tool round the current
- * instruction is no longer the last message, and dropping it would send the
- * next call with no instruction.
+ * The system prompt stays. So does the latest user message and everything
+ * after it. Token weights are counted once. The result is always a new array:
+ * the caller keeps pushing onto the transcript after the send.
  */
-export function dropOldest(messages: ChatMessage[], limit: number): ChatMessage[] {
-  const pinnedFront = messages[0]?.role === "system" ? 1 : 0;
-  const out = [...messages];
-  let dropped = 0;
+export function dropOldest(
+  messages: ChatMessage[],
+  limit: number,
+  options?: FitOptions
+): ChatMessage[] {
+  const weights = messages.map((message) => messageTokens(message));
+  let total = 0;
+  for (const weight of weights) {
+    total += weight;
+  }
+  if (total <= limit) {
+    return messages.slice();
+  }
 
-  while (messagesTokens(out) > limit && currentTurnStart(out) > pinnedFront) {
-    const removed = out.splice(pinnedFront, 1)[0];
+  const pinnedFront = messages[0]?.role === "system" ? 1 : 0;
+  const turn = currentTurnStart(messages);
+  let pinnedTokens = 0;
+  for (let index = 0; index < pinnedFront; index += 1) {
+    pinnedTokens += weights[index];
+  }
+  for (let index = turn; index < weights.length; index += 1) {
+    pinnedTokens += weights[index];
+  }
+  const dropAtLeast = tokensToDrop(total, limit, pinnedTokens);
+  let index = pinnedFront;
+  let dropped = 0;
+  let droppedTokens = 0;
+  while (index < turn && droppedTokens < dropAtLeast) {
+    droppedTokens += weights[index];
+    const removed = messages[index];
+    index += 1;
     dropped += 1;
     if (removed.tool_calls?.length) {
-      while (out[pinnedFront]?.role === "tool" && pinnedFront < currentTurnStart(out)) {
-        out.splice(pinnedFront, 1);
+      while (index < turn && messages[index]?.role === "tool") {
+        droppedTokens += weights[index];
+        index += 1;
         dropped += 1;
       }
     }
   }
-  if (dropped > 0) {
-    logInfo("context trim", { dropped, tokens: messagesTokens(out), limit });
+  if (dropped === 0) {
+    return messages.slice();
+  }
+  const out = messages.slice(0, pinnedFront).concat(messages.slice(index));
+  if (trimLogged(options)) {
+    logInfo("context trim", { dropped, tokens: total - droppedTokens, limit });
   }
   return out;
+}
+
+/**
+ * Room for messages after the tool schema and the reply reserve.
+ * The current turn stays pinned even when it is larger than this.
+ */
+export function contextRoom(limit: number, tools?: readonly unknown[] | null): number {
+  return messageRoomTokens(limit, toolSchemaTokens(tools));
 }
 
 export function fitContext(
   messages: ChatMessage[],
   limit: number,
-  tools?: readonly unknown[] | null
+  tools?: readonly unknown[] | null,
+  options?: FitOptions
 ): ChatMessage[] {
-  const room = Math.max(0, limit - toolSchemaTokens(tools));
-  return dropOldest(capToolResults(messages, room), room);
+  const room = contextRoom(limit, tools);
+  return dropOldest(capToolResults(messages, room, options), room, options);
+}
+
+/**
+ * The messages a send posts, and the tokens that post costs.
+ * The meter and `runTurn` both go through here, after the same assembly,
+ * so a cap or a dropped turn cannot show up in one and not the other.
+ */
+export function prepareRequest(
+  messages: ChatMessage[],
+  limit: number,
+  tools?: readonly unknown[] | null,
+  options?: FitOptions
+): { messages: ChatMessage[]; tokens: number } {
+  const fitted = fitContext(messages, limit, tools, options);
+  return { messages: fitted, tokens: requestTokens(fitted, tools) };
 }

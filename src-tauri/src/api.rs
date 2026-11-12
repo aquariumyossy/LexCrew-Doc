@@ -503,7 +503,14 @@ async fn post_ocr(State(state): State<AppState>, Json(body): Json<OcrRequest>) -
             }
             match ocr::vision_unsupported_message(&error.message) {
                 Some(message) => json_error(StatusCode::BAD_GATEWAY, message, None),
-                None => json_error(StatusCode::BAD_GATEWAY, &error.message, error.hint.as_deref()),
+                None => {
+                    let message = if llm::is_context_too_long_message(&error.message) {
+                        llm::OCR_PAGE_TOO_LONG.to_string()
+                    } else {
+                        error.message.clone()
+                    };
+                    json_error(StatusCode::BAD_GATEWAY, &message, error.hint.as_deref())
+                }
             }
         }
     }
@@ -1095,7 +1102,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(
             body["error"],
-            "会話が長すぎます。新しい会話に切り替えてください"
+            "会話が長すぎます。添付を減らすか、指示を分けてください。"
         );
         assert_eq!(hits, 1);
     }
@@ -1109,9 +1116,126 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(
             body["error"],
-            "会話が長すぎます。新しい会話に切り替えてください"
+            "会話が長すぎます。添付を減らすか、指示を分けてください。"
         );
         assert_eq!(hits, 1);
+    }
+
+    #[tokio::test]
+    async fn chat_asks_for_a_new_conversation_when_history_is_still_in_the_request() {
+        let (status, body, hits) = chat_that_always_400s_with(
+            json!({
+                "error": { "code": "context_length_exceeded", "message": "too long" }
+            }),
+            json!({
+                "llmBaseUrl": "placeholder",
+                "llmApiKey": "test-key",
+                "messages": [
+                    { "role": "system", "content": "ルール" },
+                    { "role": "user", "content": "前の指示" },
+                    { "role": "assistant", "content": "前の返事" },
+                    { "role": "user", "content": "いま" }
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body["error"],
+            "会話が長すぎます。新しい会話に切り替えてください。"
+        );
+        assert_eq!(hits, 1);
+    }
+
+    struct RetryThenContextResponder {
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl wiremock::Respond for RetryThenContextResponder {
+        fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            if body.get("chat_template_kwargs").is_some() {
+                return ResponseTemplate::new(400)
+                    .set_body_json(json!({ "error": { "message": "unknown field" } }));
+            }
+            ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "message": "Input length (9000) is longer than the model's context length (8192).",
+                    "type": "BadRequestError"
+                }
+            }))
+        }
+    }
+
+    async fn chat_that_always_400s_with(body: Value, mut request: Value) -> (StatusCode, Value, usize) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mtplx = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                body,
+            })
+            .mount(&mtplx)
+            .await;
+        request["llmBaseUrl"] = json!(format!("{}/v1", mtplx.uri()));
+        let (status, json) = json_request(create_router(None), "POST", "/api/chat", request).await;
+        (status, json, hits.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn chat_maps_a_context_length_400_that_arrives_on_the_retry() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mtplx = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(RetryThenContextResponder { hits: hits.clone() })
+            .mount(&mtplx)
+            .await;
+        let (status, body) = json_request(
+            create_router(None),
+            "POST",
+            "/api/chat",
+            json!({
+                "llmBaseUrl": format!("{}/v1", mtplx.uri()),
+                "llmApiKey": "test-key",
+                "messages": [{ "role": "user", "content": "点検して" }],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body["error"],
+            "会話が長すぎます。添付を減らすか、指示を分けてください。"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn ocr_does_not_ask_the_user_to_start_a_new_conversation() {
+        let mtplx = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": { "code": "context_length_exceeded", "message": "too long" }
+            })))
+            .expect(1)
+            .mount(&mtplx)
+            .await;
+        let (status, body) = json_request(
+            create_router(None),
+            "POST",
+            "/api/ocr",
+            json!({
+                "llmBaseUrl": format!("{}/v1", mtplx.uri()),
+                "llmApiKey": "test-key",
+                "image": "data:image/png;base64,aaaa",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "このページは大きすぎて読めません。");
     }
 
     #[tokio::test]

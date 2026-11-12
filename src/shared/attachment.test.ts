@@ -11,13 +11,13 @@ import {
 import { DEFAULT_CONTEXT_LIMIT, MAX_ATTACHMENT_CHARS } from "./constants";
 
 describe("attachmentCharBudget", () => {
-  it("leaves half the window for the conversation and the reply", () => {
-    // 32,768 tokens at 1.6 characters each, halved.
-    expect(attachmentCharBudget(32_768)).toBe(26_214);
+  it("takes half the room left after the reply reserve", () => {
+    // 32,768 − 10% = 29,492 tokens, halved, at 1.6 characters each.
+    expect(attachmentCharBudget(32_768)).toBe(23_593);
   });
 
   it("stops at the ceiling however wide the window is", () => {
-    expect(attachmentCharBudget(DEFAULT_CONTEXT_LIMIT)).toBe(MAX_ATTACHMENT_CHARS);
+    expect(attachmentCharBudget(DEFAULT_CONTEXT_LIMIT)).toBe(94_372);
     expect(attachmentCharBudget(1_000_000)).toBe(MAX_ATTACHMENT_CHARS);
   });
 

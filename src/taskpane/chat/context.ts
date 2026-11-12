@@ -1,12 +1,14 @@
 import {
   CHARS_PER_TOKEN,
+  DROP_TARGET_RATIO,
   MAX_FILE_CHARS,
-  REPLY_RESERVE_RATIO,
   TOOL_RESULT_BUDGET_RATIO,
+  messageRoomTokens,
+  replyReserveTokens as reserveTokens,
 } from "../../shared/constants";
 import { StoredMessage } from "../../shared/history";
 import { stripAttachment } from "../../shared/prompts";
-import { isDocumentSnapshotTool, STALE_DOCUMENT_READ } from "../../shared/tools";
+import { buildTools, isDocumentSnapshotTool, STALE_DOCUMENT_READ } from "../../shared/tools";
 import { logInfo } from "../../sidecar/logger";
 import { ChatMessage } from "../../sidecar/types";
 
@@ -55,10 +57,24 @@ export function requestTokens(messages: ChatMessage[], tools?: readonly unknown[
 
 /** Tokens held back so the reply has room. Ten percent of the context limit. */
 export function replyReserveTokens(limit: number): number {
-  if (!Number.isFinite(limit) || limit <= 0) {
-    return 0;
-  }
-  return Math.floor(limit * REPLY_RESERVE_RATIO);
+  return reserveTokens(limit);
+}
+
+/**
+ * Tool-schema tokens used to size attachments and files. Selection, paragraph
+ * numbers and shapes are assumed present: they come and go with the document,
+ * and letting them resize the file text would move the cached prefix.
+ */
+export function budgetSchemaTokens(search: boolean, argos: boolean): number {
+  return toolSchemaTokens(
+    buildTools({
+      search,
+      argos,
+      selection: true,
+      numbered: true,
+      shapes: true,
+    })
+  );
 }
 
 export type FitOptions = {
@@ -199,8 +215,14 @@ function truncate(text: string, maxTokens: number): string {
  * How much of an indexed file the next tool result can carry.
  * `capToolResults` shrinks a result, newest included, once the tool share is over.
  */
-export function indexedReadCharLimit(contextLimit: number, toolContents: string[]): number {
-  const budget = Math.floor(contextLimit * TOOL_RESULT_BUDGET_RATIO);
+export function indexedReadCharLimit(
+  contextLimit: number,
+  toolContents: string[],
+  tools?: readonly unknown[] | null
+): number {
+  // Same base as `capToolResults`: 25% of the fit room, so a full read is not
+  // stubbed on the next round.
+  const budget = Math.floor(contextRoom(contextLimit, tools) * TOOL_RESULT_BUDGET_RATIO);
   const used = toolContents.reduce(
     (total, content) => total + messageTokens({ role: "tool", content }),
     0
@@ -271,36 +293,54 @@ function currentTurnStart(messages: ChatMessage[]): number {
 }
 
 /**
- * Drop whole exchanges from the front until the request fits. An assistant turn
- * with tool calls leaves with its tool replies: the server rejects an orphan of
+ * Drop history from the front until the request fits. An assistant turn with
+ * tool calls leaves with its tool replies: the server rejects an orphan of
  * either half.
  *
- * The system prompt (and the committed files inside it) stays. So does the
- * latest user message and everything after it: after a tool round the current
- * instruction is no longer the last message, and dropping it would send the
- * next call with no instruction.
+ * The system prompt stays. So does the latest user message and everything
+ * after it. When anything has to go, it goes in one pass down to
+ * `DROP_TARGET_RATIO` of the room, so the next few turns can grow without
+ * moving the prefix again. Token weights are counted once.
  */
 export function dropOldest(
   messages: ChatMessage[],
   limit: number,
   options?: FitOptions
 ): ChatMessage[] {
-  const pinnedFront = messages[0]?.role === "system" ? 1 : 0;
-  const out = [...messages];
-  let dropped = 0;
+  const weights = messages.map((message) => messageTokens(message));
+  let total = 0;
+  for (const weight of weights) {
+    total += weight;
+  }
+  if (total <= limit) {
+    // A copy: the caller keeps pushing onto its own array after the send.
+    return messages.slice();
+  }
 
-  while (messagesTokens(out) > limit && currentTurnStart(out) > pinnedFront) {
-    const removed = out.splice(pinnedFront, 1)[0];
+  const target = Math.floor(limit * DROP_TARGET_RATIO);
+  const pinnedFront = messages[0]?.role === "system" ? 1 : 0;
+  const turn = currentTurnStart(messages);
+  let index = pinnedFront;
+  let dropped = 0;
+  while (index < turn && total > target) {
+    total -= weights[index];
+    const removed = messages[index];
+    index += 1;
     dropped += 1;
     if (removed.tool_calls?.length) {
-      while (out[pinnedFront]?.role === "tool" && pinnedFront < currentTurnStart(out)) {
-        out.splice(pinnedFront, 1);
+      while (index < turn && messages[index]?.role === "tool") {
+        total -= weights[index];
+        index += 1;
         dropped += 1;
       }
     }
   }
-  if (dropped > 0 && trimLogged(options)) {
-    logInfo("context trim", { dropped, tokens: messagesTokens(out), limit });
+  if (dropped === 0) {
+    return messages;
+  }
+  const out = messages.slice(0, pinnedFront).concat(messages.slice(index));
+  if (trimLogged(options)) {
+    logInfo("context trim", { dropped, tokens: total, limit });
   }
   return out;
 }
@@ -310,7 +350,7 @@ export function dropOldest(
  * The current turn stays pinned even when it is larger than this.
  */
 export function contextRoom(limit: number, tools?: readonly unknown[] | null): number {
-  return Math.max(0, limit - toolSchemaTokens(tools) - replyReserveTokens(limit));
+  return messageRoomTokens(limit, toolSchemaTokens(tools));
 }
 
 export function fitContext(

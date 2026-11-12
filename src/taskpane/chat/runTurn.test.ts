@@ -16,7 +16,12 @@ import {
 } from "../../shared/thinking";
 import { StoredMessage } from "../../shared/history";
 import { forgetThinkingBudget } from "./thinkingBudget";
-import { ABORTED_TOOL_RESULT, prepareRequest, requestTokens } from "./context";
+import {
+  ABORTED_TOOL_RESULT,
+  indexedReadCharLimit,
+  prepareRequest,
+  requestTokens,
+} from "./context";
 import {
   MAX_TOOL_ROUNDS,
   STALE_DOCUMENT_READ,
@@ -26,7 +31,7 @@ import {
   toolRoundLimitNotice,
 } from "../../shared/tools";
 import { DEFAULT_SETTINGS } from "../settings";
-import { openTurn, outgoingTokens, runTurn } from "./runTurn";
+import { meterAttachment, openTurn, outgoingTokens, previewTokens, runTurn } from "./runTurn";
 
 const chatStream = vi.hoisted(() => vi.fn());
 const fetchThinkingBudget = vi.hoisted(() => vi.fn());
@@ -680,7 +685,10 @@ describe("runTurn", () => {
       expect.anything(),
       expect.anything(),
       expect.anything(),
-      expect.objectContaining({ argosPathPrefixes: ["C:\\案件A"], indexedReadChars: 52422 })
+      expect.objectContaining({
+        argosPathPrefixes: ["C:\\案件A"],
+        indexedReadChars: indexedReadCharLimit(settings.contextLimit, [], first.tools),
+      })
     );
   });
 
@@ -969,7 +977,7 @@ describe("runTurn with attached files", () => {
   it("shares a tight budget between files instead of starving the later ones", async () => {
     const { body } = await runWithFiles(
       [attachedFile("小.txt", "い".repeat(50)), attachedFile("大.txt", "う".repeat(50_000))],
-      { contextLimit: 4_096 }
+      { contextLimit: 32_768 }
     );
     const system = body.messages[0].content || "";
     expect(system).toContain("[1] 小.txt");
@@ -1054,6 +1062,44 @@ describe("meter and send share one fit", () => {
     expect(tool?.content).toContain("省略");
     expect((tool?.content || "").length).toBeLessThan(huge.length);
     expect(prepared.tokens).toBeLessThan(requestTokens(opened.messages, opened.tools));
+  });
+
+  it("counts a cached attachment with shapes the same way the send does", () => {
+    const cached: Attachment = {
+      ...EMPTY_ATTACHMENT,
+      scope: "document",
+      document: "[1] 〔第１条〕甲は乙に委託する。",
+      listMarks: true,
+      shapes: { text: "[図1]\n別紙の図", truncated: false, error: "", count: 1 },
+    };
+    const shown = meterAttachment(cached, {
+      scope: "document",
+      markup: false,
+      selection: "甲",
+      budget: 1_000,
+    });
+    expect(shown?.shapes?.text).toContain("別紙の図");
+    expect(shown?.listMarks).toBe(true);
+    expect(shown?.focus).toBe("甲");
+    const input = {
+      settings,
+      instruction: "見て",
+      attachment: shown as Attachment,
+      history: [] as StoredMessage[],
+      hasBody: true,
+    };
+    const opened = openTurn(input);
+    expect(previewTokens(input)).toBe(outgoingTokens(input));
+    expect(previewTokens(input)).toBe(
+      prepareRequest(opened.messages, settings.contextLimit, opened.tools).tokens
+    );
+    const user = opened.messages.at(-1)?.content || "";
+    expect(user).toContain("別紙の図");
+    expect(user).toContain("Word の項番号");
+    expect(opened.tools.map((tool) => tool.function.name)).toContain("delete_shape");
+    expect(
+      meterAttachment(cached, { scope: "selection", markup: false, selection: "", budget: 10 })
+    ).toBe(null);
   });
 
   it("counts reasoning on the next round of this turn and not on a later turn", async () => {

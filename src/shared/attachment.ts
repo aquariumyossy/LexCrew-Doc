@@ -1,8 +1,10 @@
 import {
   ATTACHMENT_BUDGET_RATIO,
   CHARS_PER_TOKEN,
+  CONVERSATION_BUDGET_RATIO,
   MARKUP_BUDGET_RATIO,
   MAX_ATTACHMENT_CHARS,
+  messageRoomTokens,
 } from "./constants";
 
 /** What rides along with the instruction. The user picks this per turn. */
@@ -125,15 +127,23 @@ export const EMPTY_ATTACHMENT: Attachment = {
 };
 
 /**
- * How many characters of document may ride along. Derived from the window the
- * user set, so a narrow window does not silently blow the request.
+ * How many characters of document may ride along. Sized from the room left
+ * after the tool schema and the reply reserve, and kept inside the share that
+ * is not the conversation's. `reservedChars` is the stable system prompt.
  */
-export function attachmentCharBudget(contextLimit: number): number {
-  if (!Number.isFinite(contextLimit) || contextLimit <= 0) {
+export function attachmentCharBudget(
+  contextLimit: number,
+  schemaTokens = 0,
+  reservedChars = 0
+): number {
+  const room = messageRoomTokens(contextLimit, schemaTokens);
+  if (room <= 0) {
     return 0;
   }
-  const fromLimit = Math.floor(contextLimit * ATTACHMENT_BUDGET_RATIO * CHARS_PER_TOKEN);
-  return Math.max(0, Math.min(MAX_ATTACHMENT_CHARS, fromLimit));
+  const pool = Math.floor(room * (1 - CONVERSATION_BUDGET_RATIO) * CHARS_PER_TOKEN);
+  const wanted = Math.floor(room * ATTACHMENT_BUDGET_RATIO * CHARS_PER_TOKEN);
+  const afterPrompt = pool - Math.max(0, reservedChars);
+  return Math.max(0, Math.min(MAX_ATTACHMENT_CHARS, wanted, afterPrompt));
 }
 
 /**

@@ -55,6 +55,7 @@ import { assertChatInput } from "../../shared/guards";
 import { REMOTE_OCR_NOTICE, isLoopbackUrl } from "../../shared/ocr";
 import { ConversationSummary, NewMessage, StoredMessage } from "../../shared/history";
 import { joinArgosScopes, parseArgosScopes } from "../../shared/argos";
+import { stableSystemPrompt } from "../../shared/prompts";
 import {
   TOOL_ROUND_PRESETS,
   normalizeMaxToolRounds,
@@ -75,7 +76,8 @@ import {
   saveStoredConnection,
   setConversationFiles as saveConversationFiles,
 } from "../api";
-import { outgoingTokens, runTurn } from "../chat/runTurn";
+import { budgetSchemaTokens } from "../chat/context";
+import { meterAttachment, previewTokens, runTurn } from "../chat/runTurn";
 import { forgetThinkingBudget, readThinkingBudget } from "../chat/thinkingBudget";
 import { applyAdopt } from "../connectionState";
 import {
@@ -336,6 +338,10 @@ const App: React.FC = () => {
   const [dragging, setDragging] = React.useState(false);
   const [draft, setDraft] = React.useState<ChatDraft | null>(null);
   const [selectionChars, setSelectionChars] = React.useState(0);
+  const [selectionText, setSelectionText] = React.useState("");
+  /** Last document read. The meter reuses it instead of inventing a body. */
+  const [cachedAttachment, setCachedAttachment] = React.useState<Attachment | null>(null);
+  const [readGeneration, setReadGeneration] = React.useState(0);
   const [stats, setStats] = React.useState<DocumentStats>({
     chars: 0,
     attachChars: 0,
@@ -388,7 +394,50 @@ const App: React.FC = () => {
     ocr: runOcr,
   });
 
-  const attachBudget = attachmentCharBudget(settings.contextLimit);
+  /** What the next send would carry: the conversation's files plus ready badges. */
+  const turnFiles = React.useMemo(
+    () => mergeFiles(attachedFiles, pendingFiles.filter(isReady).map(commit)),
+    [attachedFiles, pendingFiles]
+  );
+  const readingFiles = pendingFiles.some(isPendingRead);
+  const argosPathPrefixes = React.useMemo(
+    () => parseArgosScopes(argosPathPrefix),
+    [argosPathPrefix]
+  );
+  // Settings only. The document's selection and shapes must not resize this,
+  // or the file text on the cached prefix would change every turn.
+  const schemaTokens = React.useMemo(
+    () =>
+      budgetSchemaTokens(
+        Boolean(settings.searxngUrl.trim()),
+        Boolean(settings.argosBaseUrl.trim())
+      ),
+    [settings.searxngUrl, settings.argosBaseUrl]
+  );
+  const stableChars = React.useMemo(
+    () =>
+      stableSystemPrompt({
+        fontName: settings.fontName,
+        bodyPt: settings.bodyPt,
+        titlePt: settings.titlePt,
+        lineSpacingChars: settings.lineSpacingChars,
+        search: Boolean(settings.searxngUrl.trim()),
+        argos: Boolean(settings.argosBaseUrl.trim()),
+        argosPathPrefix: joinArgosScopes(argosPathPrefixes),
+        files: turnFiles.length > 0,
+      }).length,
+    [
+      settings.fontName,
+      settings.bodyPt,
+      settings.titlePt,
+      settings.lineSpacingChars,
+      settings.searxngUrl,
+      settings.argosBaseUrl,
+      argosPathPrefixes,
+      turnFiles.length,
+    ]
+  );
+  const attachBudget = attachmentCharBudget(settings.contextLimit, schemaTokens, stableChars);
   const attachedFocusChars = scope === "none" ? 0 : Math.min(selectionChars, attachBudget);
   const withMarkup = markup && scope !== "none";
   // Only a document that has markup gives up body characters for it. The slice is
@@ -404,94 +453,40 @@ const App: React.FC = () => {
       ? Math.max(0, Math.min(stats.attachChars, attachBudget - attachedFocusChars - markupChars))
       : 0;
 
-  /** What the next send would carry: the conversation's files plus ready badges. */
-  const turnFiles = React.useMemo(
-    () => mergeFiles(attachedFiles, pendingFiles.filter(isReady).map(commit)),
-    [attachedFiles, pendingFiles]
+  const previewAttachment = React.useMemo(
+    () =>
+      meterAttachment(cachedAttachment, {
+        scope,
+        markup: withMarkup,
+        selection: selectionText,
+        budget: attachBudget,
+      }) ?? { ...EMPTY_ATTACHMENT, scope, markup: withMarkup },
+    [cachedAttachment, scope, withMarkup, selectionText, attachBudget]
   );
-  const readingFiles = pendingFiles.some(isPendingRead);
+  const previewHasBody =
+    previewAttachment.scope === "document"
+      ? Boolean(previewAttachment.document.trim() || previewAttachment.truncated)
+      : stats.chars > 0;
 
-  // Same assembly as send: system, replayed history, this turn's user message,
-  // then fitContext (capped tool results, oldest turns dropped, reply reserve).
+  // Next send: the cached read (shapes, list marks, markup) through the same
+  // fit the send uses. A keystroke only changes the instruction.
   const preview = React.useMemo(
     () =>
-      outgoingTokens({
+      previewTokens({
         settings,
         instruction: input,
-        attachment: {
-          ...EMPTY_ATTACHMENT,
-          scope,
-          document:
-            scope === "document" && attachedDocChars > 0 ? "あ".repeat(attachedDocChars) : "",
-          truncated: scope === "document" && attachedDocChars < stats.attachChars,
-          focus: attachedFocusChars > 0 ? "あ".repeat(attachedFocusChars) : "",
-          markup: withMarkup,
-          comments:
-            markupChars > 0
-              ? {
-                  items: [
-                    {
-                      author: "",
-                      date: "",
-                      resolved: false,
-                      anchor: "",
-                      content: "あ".repeat(markupChars),
-                      replies: [],
-                    },
-                  ],
-                  truncated: false,
-                  error: "",
-                }
-              : EMPTY_ATTACHMENT.comments,
-        },
+        attachment: previewAttachment,
         files: turnFiles,
         history: messages,
-        argosPathPrefixes: parseArgosScopes(argosPathPrefix),
-        hasBody: stats.chars > 0,
+        argosPathPrefixes,
+        hasBody: previewHasBody,
       }),
-    [
-      settings,
-      input,
-      scope,
-      attachedDocChars,
-      stats.attachChars,
-      stats.chars,
-      attachedFocusChars,
-      withMarkup,
-      markupChars,
-      turnFiles,
-      messages,
-      argosPathPrefix,
-    ]
+    [settings, input, previewAttachment, turnFiles, messages, argosPathPrefixes, previewHasBody]
   );
 
-  // A change of attachment or settings makes the held in-turn count stale.
-  const meterHoldKey = [
-    conversationId ?? "",
-    scope,
-    markup ? "1" : "0",
-    String(settings.contextLimit),
-    settings.fontName,
-    String(settings.bodyPt),
-    String(settings.titlePt),
-    String(settings.lineSpacingChars),
-    settings.searxngUrl,
-    settings.argosBaseUrl,
-    argosPathPrefix,
-    turnFiles.map((file) => file.id).join("\n"),
-    String(stats.attachChars),
-    String(stats.chars),
-    String(stats.comments),
-    String(stats.changes),
-    String(selectionChars),
-  ].join("|");
-  React.useEffect(() => {
-    setFittedTokens(null);
-  }, [meterHoldKey]);
-
-  // Empty composer: the transcript runTurn just fitted (this turn's reasoning
-  // included). A new draft: the next send, which drops that reasoning.
-  const estimated = fittedTokens != null && (busy || input === "") ? fittedTokens : preview;
+  // While a turn is in flight this is the request just posted. Afterwards the
+  // meter shows the next send, which drops this turn's reads and reasoning.
+  const estimated = busy && fittedTokens != null ? fittedTokens : preview;
 
   const attachLabel = describeAttachment({
     scope,
@@ -717,9 +712,30 @@ const App: React.FC = () => {
       return;
     }
     void getDocumentStats()
-      .then(setStats)
+      .then((next) => {
+        setStats(next);
+        setReadGeneration((generation) => generation + 1);
+      })
       .catch(() => undefined);
   }, []);
+
+  React.useEffect(() => {
+    if (!inWord) {
+      setCachedAttachment(null);
+      return undefined;
+    }
+    let cancel = false;
+    void readAttachment(scope, attachBudget, withMarkup)
+      .then((attachment) => {
+        if (!cancel) {
+          setCachedAttachment(attachment);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancel = true;
+    };
+  }, [inWord, scope, attachBudget, withMarkup, readGeneration]);
 
   React.useEffect(() => {
     if (!inWord) {
@@ -729,6 +745,7 @@ const App: React.FC = () => {
     const readSelection = () => {
       void getSelectionText()
         .then((text) => {
+          setSelectionText(text);
           setSelectionChars(text.length);
           // 「選択範囲だけ」は生きた選択が前提。クリックひとつで選択は消えるので、
           // 残したままにすると本文も選択も無い添付を黙って送ることになる。
@@ -736,7 +753,10 @@ const App: React.FC = () => {
             setScope((current) => (current === "selection" ? "document" : current));
           }
         })
-        .catch(() => setSelectionChars(0));
+        .catch(() => {
+          setSelectionText("");
+          setSelectionChars(0);
+        });
     };
     readSelection();
     Office.context.document.addHandlerAsync(
@@ -862,6 +882,7 @@ const App: React.FC = () => {
       if (inWord) {
         await assertDocumentReady();
         attachment = await readAttachment(scope, attachBudget, withMarkup);
+        setCachedAttachment(attachment);
       }
 
       let target = conversationId;
@@ -913,7 +934,7 @@ const App: React.FC = () => {
         }
       };
 
-      const result = await runTurn({
+      await runTurn({
         settings,
         instruction,
         attachment,
@@ -925,9 +946,9 @@ const App: React.FC = () => {
         onRequestTokens: (tokens) => setFittedTokens(tokens),
         argosPathPrefixes,
       });
-      setFittedTokens(result.nextRequestTokens);
       await refreshConversations();
     } catch (error) {
+      setFittedTokens(null);
       if (isAbort(error)) {
         setBanner({
           intent: "info",
@@ -942,6 +963,7 @@ const App: React.FC = () => {
       }
     } finally {
       abortRef.current = null;
+      setFittedTokens(null);
       setBusy(false);
       setBusyLabel("");
       setDraft(null);

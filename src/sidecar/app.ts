@@ -12,6 +12,8 @@ import { canReadIndexedPath, noteIndexedHits } from "./indexedPaths";
 import {
   checkLlmHealth,
   chatCompletions,
+  isContextTooLongMessage,
+  OCR_PAGE_TOO_LONG,
   pipeChatStream,
   readImageText,
   readThinkingBudget,
@@ -107,11 +109,12 @@ export function createApp(options: { connectionFile?: string } = {}): express.Ex
         }
         const detail = error instanceof Error ? error.message : "画像の読み取りに失敗しました。";
         const vision = visionUnsupportedMessage(detail);
+        const tooLong = !vision && isContextTooLongMessage(detail);
         sendError(
           res,
           502,
-          vision || detail,
-          vision ? undefined : (error as { hint?: string }).hint
+          vision || (tooLong ? OCR_PAGE_TOO_LONG : detail),
+          vision || tooLong ? undefined : (error as { hint?: string }).hint
         );
       }
     }

@@ -68,28 +68,94 @@ async function readBody(res: Response): Promise<string> {
   }
 }
 
-/** Shown instead of MTPLX's English context-length body. Same wording as llm.rs. */
-export const CONTEXT_TOO_LONG_MESSAGE = "会話が長すぎます。新しい会話に切り替えてください";
+/** Same wording as llm.rs. */
+export const CONTEXT_TOO_LONG_NEW_CHAT = "会話が長すぎます。新しい会話に切り替えてください。";
+export const CONTEXT_TOO_LONG_ATTACHMENT =
+  "会話が長すぎます。添付を減らすか、指示を分けてください。";
+export const OCR_PAGE_TOO_LONG = "このページは大きすぎて読めません。";
+
+export function isContextTooLongMessage(message: string): boolean {
+  return message === CONTEXT_TOO_LONG_NEW_CHAT || message === CONTEXT_TOO_LONG_ATTACHMENT;
+}
+
+const CONTEXT_LENGTH_MARKERS = [
+  "context_length_exceeded",
+  "exceed_context_size",
+  "maximum context length",
+  "longer than the maximum model length",
+  "longer than the model's context length",
+  "prompt too long",
+  "context length exceeded",
+  "available context size",
+  "context overflow",
+  "greater than the context length",
+  "exceed the context length",
+  "exceeds the context length",
+];
+
+function pushText(out: string[], value: unknown): void {
+  if (typeof value === "string" && value) {
+    out.push(value);
+  }
+}
+
+/** Only code, type and message. A prompt echoed in another field must not count. */
+function contextErrorFields(raw: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return raw.length <= 400 ? [raw] : [];
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return [];
+  }
+  const record = parsed as Record<string, unknown>;
+  const out: string[] = [];
+  pushText(out, record.message);
+  pushText(out, record.code);
+  pushText(out, record.type);
+  const error = record.error;
+  if (typeof error === "string") {
+    pushText(out, error);
+  } else if (error && typeof error === "object") {
+    const body = error as Record<string, unknown>;
+    pushText(out, body.message);
+    pushText(out, body.code);
+    pushText(out, body.type);
+  }
+  return out;
+}
+
+function fieldSaysContextLength(text: string): boolean {
+  const lower = text.toLowerCase();
+  return CONTEXT_LENGTH_MARKERS.some((marker) => lower.includes(marker));
+}
 
 /**
- * OpenAI's `context_length_exceeded`, and servers that describe the same
- * refusal without that code. Other 400s (unknown thinking fields) must not match.
+ * OpenAI's `context_length_exceeded`, and the same refusal from vLLM, SGLang
+ * and LM Studio. Other 400s (unknown thinking fields) must not match.
  */
 export function isContextLengthExceeded(raw: string): boolean {
-  const lower = (raw || "").toLowerCase();
-  if (lower.includes("context_length_exceeded") || lower.includes("exceed_context_size")) {
-    return true;
+  return contextErrorFields(raw || "").some((field) => fieldSaysContextLength(field));
+}
+
+function hasReplayableHistory(messages: { role?: string }[]): boolean {
+  let lastUser = -1;
+  messages.forEach((message, index) => {
+    if (message.role === "user") {
+      lastUser = index;
+    }
+  });
+  if (lastUser < 0) {
+    return false;
   }
-  if (lower.includes("maximum context length")) {
-    return true;
-  }
-  const aboutContext =
-    lower.includes("context length") ||
-    lower.includes("context size") ||
-    lower.includes("context window");
-  const over =
-    lower.includes("exceed") || lower.includes("too long") || lower.includes("too many token");
-  return aboutContext && over;
+  const pinned = messages[0]?.role === "system" ? 1 : 0;
+  return lastUser > pinned;
+}
+
+export function contextTooLongMessage(messages: { role?: string }[]): string {
+  return hasReplayableHistory(messages) ? CONTEXT_TOO_LONG_NEW_CHAT : CONTEXT_TOO_LONG_ATTACHMENT;
 }
 
 function excerptError(raw: string): string {
@@ -366,7 +432,7 @@ async function postWithThinkingFallback(options: ChatCallOptions): Promise<Respo
     // A full window will not fit by dropping the thinking fields.
     if (isContextLengthExceeded(raw)) {
       logInfo("llm chat context length exceeded", { status: 400 });
-      throw new Error(CONTEXT_TOO_LONG_MESSAGE);
+      throw new Error(contextTooLongMessage(options.messages));
     }
     // Servers without the Qwen thinking controls reject the extra fields.
     logInfo("llm chat retry without thinking fields", { status: 400 });
@@ -381,7 +447,7 @@ async function postWithThinkingFallback(options: ChatCallOptions): Promise<Respo
   if (!res.ok) {
     const raw = await readBody(res);
     if (res.status === 400 && isContextLengthExceeded(raw)) {
-      throw new Error(CONTEXT_TOO_LONG_MESSAGE);
+      throw new Error(contextTooLongMessage(options.messages));
     }
     const detail = excerptError(raw);
     const err = new Error(detail || `MTPLX が ${res.status} を返しました。`);

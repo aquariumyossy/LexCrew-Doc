@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { EMPTY_ATTACHMENT } from "../../shared/attachment";
-import { CHARS_PER_TOKEN, MAX_FILE_CHARS, TOOL_RESULT_BUDGET_RATIO } from "../../shared/constants";
+import { EMPTY_ATTACHMENT, attachmentCharBudget } from "../../shared/attachment";
+import { fileCharBudget } from "../../shared/fileSource";
+import {
+  CHARS_PER_TOKEN,
+  CONVERSATION_BUDGET_RATIO,
+  DROP_TARGET_RATIO,
+  MAX_FILE_CHARS,
+  TOOL_RESULT_BUDGET_RATIO,
+  messageRoomTokens,
+} from "../../shared/constants";
 import { StoredMessage } from "../../shared/history";
 import {
   stripAttachment,
@@ -11,6 +19,7 @@ import { buildTools, isDocumentSnapshotTool, STALE_DOCUMENT_READ } from "../../s
 import { ChatMessage } from "../../sidecar/types";
 import {
   ABORTED_TOOL_RESULT,
+  budgetSchemaTokens,
   capToolResults,
   contextRoom,
   dropOldest,
@@ -376,12 +385,25 @@ describe("tool call ids repeat across turns", () => {
 });
 
 describe("indexedReadCharLimit", () => {
-  it("stays inside the tool-result share, and never past the file cap", () => {
+  it("stays inside the tool-result share of the fit room, and never past the file cap", () => {
     const limit = 131_072;
-    const chars = indexedReadCharLimit(limit, []);
+    const tools = buildTools({
+      search: true,
+      argos: true,
+      selection: true,
+      numbered: true,
+      shapes: true,
+    });
+    const chars = indexedReadCharLimit(limit, [], tools);
     expect(chars).toBeLessThanOrEqual(MAX_FILE_CHARS);
     const tokens = Math.ceil(chars / CHARS_PER_TOKEN) + 4;
-    expect(tokens).toBeLessThanOrEqual(Math.floor(limit * TOOL_RESULT_BUDGET_RATIO));
+    const room = contextRoom(limit, tools);
+    expect(tokens).toBeLessThanOrEqual(Math.floor(room * TOOL_RESULT_BUDGET_RATIO));
+    const capped = capToolResults(
+      [{ role: "tool", content: "あ".repeat(chars), tool_call_id: "c1" }],
+      room
+    );
+    expect(capped[0].content).toBe("あ".repeat(chars));
   });
 
   it("shrinks by what earlier tool results already use", () => {
@@ -442,6 +464,48 @@ describe("dropOldest", () => {
     } finally {
       info.mockRestore();
     }
+  });
+
+  it("drops down to 85% in one pass, then keeps that prefix", () => {
+    const limit = 2_000;
+    const target = Math.floor(limit * DROP_TARGET_RATIO);
+    const history: ChatMessage[] = [{ role: "system", content: "s" }];
+    for (let index = 0; index < 20; index += 1) {
+      history.push({ role: "user", content: `古い${index}${"あ".repeat(120)}` });
+      history.push({ role: "assistant", content: `返事${index}${"い".repeat(120)}` });
+    }
+    history.push({ role: "user", content: "いま" });
+    expect(messagesTokens(history)).toBeGreaterThan(limit);
+
+    const trimmed = dropOldest(history, limit);
+    const kept = messagesTokens(trimmed);
+    expect(kept).toBeLessThanOrEqual(target);
+    expect(trimmed[0]).toEqual(history[0]);
+    expect(trimmed.at(-1)?.content).toBe("いま");
+    expect(trimmed.length).toBeLessThan(history.length - 2);
+
+    const grown: ChatMessage[] = [
+      ...trimmed.slice(0, -1),
+      { role: "assistant", content: "短い返事" },
+      { role: "user", content: "つぎ" },
+    ];
+    expect(messagesTokens(grown)).toBeLessThanOrEqual(limit);
+    expect(dropOldest(grown, limit)).toEqual(grown);
+  });
+
+  it("trims a long transcript in one pass", () => {
+    const messages: ChatMessage[] = [{ role: "system", content: "s" }];
+    for (let index = 0; index < 1_500; index += 1) {
+      messages.push({
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `${index}${"あ".repeat(400)}`,
+      });
+    }
+    const started = Date.now();
+    const trimmed = dropOldest(messages, 4_000);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(messagesTokens(trimmed)).toBeLessThanOrEqual(Math.floor(4_000 * DROP_TARGET_RATIO));
+    expect(trimmed.at(-1)?.content).toBe(messages.at(-1)?.content);
   });
 
   it("never leaves a tool reply without its call", () => {
@@ -529,6 +593,19 @@ describe("reply reserve", () => {
     const pinned = fitContext(huge, limit, tools);
     expect(pinned.map((message) => message.role)).toEqual(["system", "user"]);
     expect(messagesTokens(pinned)).toBeGreaterThan(room);
+  });
+
+  it("keeps the reply reserve and the conversation share at narrow windows", () => {
+    const schema = budgetSchemaTokens(true, true);
+    const reserved = 8_000;
+    for (const limit of [32_768, 65_536, 131_072]) {
+      const room = messageRoomTokens(limit, schema);
+      const pool = Math.floor(room * (1 - CONVERSATION_BUDGET_RATIO) * CHARS_PER_TOKEN);
+      const document = attachmentCharBudget(limit, schema, reserved);
+      const files = fileCharBudget(limit, reserved, schema);
+      expect(document + files + reserved).toBeLessThanOrEqual(pool);
+      expect(room + schema + replyReserveTokens(limit)).toBe(limit);
+    }
   });
 });
 

@@ -68,6 +68,30 @@ async function readBody(res: Response): Promise<string> {
   }
 }
 
+/** Shown instead of MTPLX's English context-length body. Same wording as llm.rs. */
+export const CONTEXT_TOO_LONG_MESSAGE = "会話が長すぎます。新しい会話に切り替えてください";
+
+/**
+ * OpenAI's `context_length_exceeded`, and servers that describe the same
+ * refusal without that code. Other 400s (unknown thinking fields) must not match.
+ */
+export function isContextLengthExceeded(raw: string): boolean {
+  const lower = (raw || "").toLowerCase();
+  if (lower.includes("context_length_exceeded") || lower.includes("exceed_context_size")) {
+    return true;
+  }
+  if (lower.includes("maximum context length")) {
+    return true;
+  }
+  const aboutContext =
+    lower.includes("context length") ||
+    lower.includes("context size") ||
+    lower.includes("context window");
+  const over =
+    lower.includes("exceed") || lower.includes("too long") || lower.includes("too many token");
+  return aboutContext && over;
+}
+
 function excerptError(raw: string): string {
   if (!raw) {
     return "";
@@ -317,30 +341,49 @@ function throwIfEmptyKey(options: ChatCallOptions): void {
   }
 }
 
+function connectionFailure(error: unknown): Error {
+  logError("llm chat failed", { name: error instanceof Error ? error.name : "error" });
+  const timeout = isTimeout(error);
+  const err = new Error(
+    timeout ? "MTPLX が時間内に応答しませんでした。" : "MTPLX に接続できませんでした。"
+  );
+  (err as Error & { hint?: string }).hint = hintForStatus(undefined, !timeout, timeout);
+  return err;
+}
+
 async function postWithThinkingFallback(options: ChatCallOptions): Promise<Response> {
   throwIfEmptyKey(options);
+  logInfo("llm chat", { status: "start" });
   let res: Response;
   try {
-    logInfo("llm chat", { status: "start" });
     res = await postChat(options, buildPayload(options, true));
-    if (res.status === 400) {
-      // Servers without the Qwen thinking controls reject the extra fields.
-      logInfo("llm chat retry without thinking fields", { status: 400 });
-      res = await postChat(options, buildPayload(options, false));
-    }
-    logInfo("llm chat", { status: res.status });
   } catch (error) {
-    logError("llm chat failed", { name: error instanceof Error ? error.name : "error" });
-    const timeout = isTimeout(error);
-    const err = new Error(
-      timeout ? "MTPLX が時間内に応答しませんでした。" : "MTPLX に接続できませんでした。"
-    );
-    (err as Error & { hint?: string }).hint = hintForStatus(undefined, !timeout, timeout);
-    throw err;
+    throw connectionFailure(error);
   }
 
+  if (res.status === 400) {
+    const raw = await readBody(res);
+    // A full window will not fit by dropping the thinking fields.
+    if (isContextLengthExceeded(raw)) {
+      logInfo("llm chat context length exceeded", { status: 400 });
+      throw new Error(CONTEXT_TOO_LONG_MESSAGE);
+    }
+    // Servers without the Qwen thinking controls reject the extra fields.
+    logInfo("llm chat retry without thinking fields", { status: 400 });
+    try {
+      res = await postChat(options, buildPayload(options, false));
+    } catch (error) {
+      throw connectionFailure(error);
+    }
+  }
+
+  logInfo("llm chat", { status: res.status });
   if (!res.ok) {
-    const detail = excerptError(await readBody(res));
+    const raw = await readBody(res);
+    if (res.status === 400 && isContextLengthExceeded(raw)) {
+      throw new Error(CONTEXT_TOO_LONG_MESSAGE);
+    }
+    const detail = excerptError(raw);
     const err = new Error(detail || `MTPLX が ${res.status} を返しました。`);
     (err as Error & { hint?: string }).hint = hintForStatus(res.status, false, false);
     throw err;

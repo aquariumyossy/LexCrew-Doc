@@ -101,6 +101,31 @@ fn is_network(err: &reqwest::Error) -> bool {
     re.is_match(&text)
 }
 
+/// Same wording as the Node sidecar (`CONTEXT_TOO_LONG_MESSAGE`).
+const CONTEXT_TOO_LONG: &str = "会話が長すぎます。新しい会話に切り替えてください";
+
+/// OpenAI's `context_length_exceeded`, and servers that describe the same
+/// refusal without that code. Other 400s (unknown thinking fields) must not match.
+fn is_context_length_exceeded(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("context_length_exceeded") || lower.contains("exceed_context_size") {
+        return true;
+    }
+    if lower.contains("maximum context length") {
+        return true;
+    }
+    let about_context = lower.contains("context length")
+        || lower.contains("context size")
+        || lower.contains("context window");
+    let over =
+        lower.contains("exceed") || lower.contains("too long") || lower.contains("too many token");
+    about_context && over
+}
+
+fn context_too_long() -> ChatError {
+    ChatError::new(CONTEXT_TOO_LONG, None)
+}
+
 fn excerpt_error(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
@@ -437,6 +462,13 @@ pub async fn post_chat(
         .map_err(|error| connection_error(&error))?;
 
     if res.status() == StatusCode::BAD_REQUEST {
+        let raw = res.text().await.unwrap_or_default();
+        // A full window will not fit by dropping the thinking fields. Retrying
+        // would only send the same prompt again.
+        if is_context_length_exceeded(&raw) {
+            log::info_status("llm chat context length exceeded", 400);
+            return Err(context_too_long());
+        }
         // Servers without the Qwen thinking controls reject the extra fields.
         log::info_status("llm chat retry without thinking fields", 400);
         res = post(build_payload(&options, false, stream))
@@ -448,6 +480,9 @@ pub async fn post_chat(
     if !res.status().is_success() {
         let status = res.status().as_u16();
         let raw = res.text().await.unwrap_or_default();
+        if status == 400 && is_context_length_exceeded(&raw) {
+            return Err(context_too_long());
+        }
         let detail = excerpt_error(&raw);
         return Err(ChatError::new(
             if detail.is_empty() {
@@ -473,6 +508,24 @@ pub async fn chat_completions(options: ChatOptions<'_>) -> Result<Completion, Ch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_length_errors_are_not_ordinary_bad_requests() {
+        assert!(is_context_length_exceeded(
+            r#"{"error":{"message":"too long","code":"context_length_exceeded"}}"#
+        ));
+        assert!(is_context_length_exceeded(
+            "This model's maximum context length is 262144 tokens. However, you requested 270000."
+        ));
+        assert!(is_context_length_exceeded(
+            r#"{"error":{"message":"request exceeds the available context size","type":"exceed_context_size_error"}}"#
+        ));
+        assert!(!is_context_length_exceeded(
+            r#"{"error":{"message":"unknown field"}}"#
+        ));
+        assert!(!is_context_length_exceeded(""));
+        assert!(!is_context_length_exceeded("too long"));
+    }
 
     #[test]
     fn pick_default_model_matches_punctuation_drift() {

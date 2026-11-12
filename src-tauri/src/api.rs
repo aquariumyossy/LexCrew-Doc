@@ -700,6 +700,8 @@ mod tests {
     use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tower::ServiceExt;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
@@ -1041,6 +1043,75 @@ mod tests {
         assert!(!content.contains("hidden"));
         assert_eq!(content, "コメントを付けました。");
         assert_eq!(body["toolCalls"].as_array().unwrap().len(), 0);
+    }
+
+    struct CountingResponder {
+        hits: Arc<AtomicUsize>,
+        body: Value,
+    }
+
+    impl wiremock::Respond for CountingResponder {
+        fn respond(&self, _request: &MockRequest) -> ResponseTemplate {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(400).set_body_json(self.body.clone())
+        }
+    }
+
+    async fn chat_that_always_400s(body: Value) -> (StatusCode, Value, usize) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mtplx = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(CountingResponder {
+                hits: hits.clone(),
+                body,
+            })
+            .mount(&mtplx)
+            .await;
+        let (status, json) = json_request(
+            create_router(None),
+            "POST",
+            "/api/chat",
+            json!({
+                "llmBaseUrl": format!("{}/v1", mtplx.uri()),
+                "llmApiKey": "test-key",
+                "messages": [{ "role": "user", "content": "点検して" }],
+            }),
+        )
+        .await;
+        (status, json, hits.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn chat_does_not_retry_context_length_exceeded() {
+        let (status, body, hits) = chat_that_always_400s(json!({
+            "error": {
+                "message": "This model's maximum context length is 262144 tokens. However, you requested 300000 tokens.",
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded"
+            }
+        }))
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body["error"],
+            "会話が長すぎます。新しい会話に切り替えてください"
+        );
+        assert_eq!(hits, 1);
+    }
+
+    #[tokio::test]
+    async fn chat_does_not_retry_a_context_length_body_without_the_code() {
+        let (status, body, hits) = chat_that_always_400s(json!({
+            "error": { "message": "request exceeds the available context size" }
+        }))
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body["error"],
+            "会話が長すぎます。新しい会話に切り替えてください"
+        );
+        assert_eq!(hits, 1);
     }
 
     #[tokio::test]

@@ -48,6 +48,11 @@ export const FILE_BUDGET_RATIO = 0.25;
 export const MAX_FILE_CHARS = 60_000;
 /** Share of the window kept for the conversation itself, whatever is attached. */
 export const CONVERSATION_BUDGET_RATIO = 0.2;
+/**
+ * Left unused so the reply is not packed out of the window.
+ * `fitContext` subtracts this share of the context limit on top of the tool schema.
+ */
+export const REPLY_RESERVE_RATIO = 0.1;
 /** Pending and committed files together. */
 export const MAX_ATTACHED_FILES = 10;
 /** Pages of a scanned PDF worth reading. Matches Argos. */

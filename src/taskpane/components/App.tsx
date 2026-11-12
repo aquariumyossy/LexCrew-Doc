@@ -39,7 +39,6 @@ import {
   markupCharBudget,
 } from "../../shared/attachment";
 import {
-  CHARS_PER_TOKEN,
   DOCUMENT_KEY_SETTING,
   LINE_SPACING_CHARS,
   MAX_TIMEOUT_MS,
@@ -47,10 +46,7 @@ import {
 } from "../../shared/constants";
 import {
   CommittedFile,
-  clampFiles,
   commit,
-  fileCharBudget,
-  filesChars,
   isPendingRead,
   isReady,
   mergeFiles,
@@ -59,10 +55,8 @@ import { assertChatInput } from "../../shared/guards";
 import { REMOTE_OCR_NOTICE, isLoopbackUrl } from "../../shared/ocr";
 import { ConversationSummary, NewMessage, StoredMessage } from "../../shared/history";
 import { joinArgosScopes, parseArgosScopes } from "../../shared/argos";
-import { stableSystemPrompt, turnAttachmentNotes } from "../../shared/prompts";
 import {
   TOOL_ROUND_PRESETS,
-  buildTools,
   normalizeMaxToolRounds,
   toolRoundPresetLabel,
 } from "../../shared/tools";
@@ -81,8 +75,7 @@ import {
   saveStoredConnection,
   setConversationFiles as saveConversationFiles,
 } from "../api";
-import { estimateTokens, messagesTokens, toChatMessages, toolSchemaTokens } from "../chat/context";
-import { runTurn } from "../chat/runTurn";
+import { outgoingTokens, runTurn } from "../chat/runTurn";
 import { forgetThinkingBudget, readThinkingBudget } from "../chat/thinkingBudget";
 import { applyAdopt } from "../connectionState";
 import {
@@ -333,6 +326,11 @@ const App: React.FC = () => {
   const [argosPathPrefix, setArgosPathPrefix] = React.useState("");
 
   const [input, setInput] = React.useState("");
+  /**
+   * Fitted size of the transcript runTurn last prepared. Shown while that
+   * measurement still matches the composer; a new draft recounts the next send.
+   */
+  const [fittedTokens, setFittedTokens] = React.useState<number | null>(null);
   /** Read once and kept by the conversation; rides along on every turn. */
   const [attachedFiles, setAttachedFiles] = React.useState<CommittedFile[]>([]);
   const [dragging, setDragging] = React.useState(false);
@@ -413,73 +411,87 @@ const App: React.FC = () => {
   );
   const readingFiles = pendingFiles.some(isPendingRead);
 
-  const promptEstimate = React.useMemo(() => {
-    const base = {
-      fontName: settings.fontName,
-      bodyPt: settings.bodyPt,
-      titlePt: settings.titlePt,
-      lineSpacingChars: settings.lineSpacingChars,
-      search: Boolean(settings.searxngUrl.trim()),
-      argos: Boolean(settings.argosBaseUrl.trim()),
+  // Same assembly as send: system, replayed history, this turn's user message,
+  // then fitContext (capped tool results, oldest turns dropped, reply reserve).
+  const preview = React.useMemo(
+    () =>
+      outgoingTokens({
+        settings,
+        instruction: input,
+        attachment: {
+          ...EMPTY_ATTACHMENT,
+          scope,
+          document:
+            scope === "document" && attachedDocChars > 0 ? "あ".repeat(attachedDocChars) : "",
+          truncated: scope === "document" && attachedDocChars < stats.attachChars,
+          focus: attachedFocusChars > 0 ? "あ".repeat(attachedFocusChars) : "",
+          markup: withMarkup,
+          comments:
+            markupChars > 0
+              ? {
+                  items: [
+                    {
+                      author: "",
+                      date: "",
+                      resolved: false,
+                      anchor: "",
+                      content: "あ".repeat(markupChars),
+                      replies: [],
+                    },
+                  ],
+                  truncated: false,
+                  error: "",
+                }
+              : EMPTY_ATTACHMENT.comments,
+        },
+        files: turnFiles,
+        history: messages,
+        argosPathPrefixes: parseArgosScopes(argosPathPrefix),
+        hasBody: stats.chars > 0,
+      }),
+    [
+      settings,
+      input,
+      scope,
+      attachedDocChars,
+      stats.attachChars,
+      stats.chars,
+      attachedFocusChars,
+      withMarkup,
+      markupChars,
+      turnFiles,
+      messages,
       argosPathPrefix,
-    };
-    const stable = stableSystemPrompt({ ...base, files: turnFiles.length > 0 });
-    const notes = turnAttachmentNotes({
-      ...base,
-      selection: selectionChars > 0,
-      numbered: scope === "document" && attachedDocChars > 0,
-      markup: withMarkup,
-      hasBody: stats.chars > 0,
-      reviewedBody: scope !== "none",
-    });
-    const tools = buildTools({
-      search: Boolean(settings.searxngUrl.trim()),
-      argos: Boolean(settings.argosBaseUrl.trim()),
-      selection: selectionChars > 0,
-      numbered: scope === "document" && attachedDocChars > 0,
-    });
-    return {
-      stableChars: stable.length,
-      stableTokens: estimateTokens(stable),
-      noteTokens: estimateTokens(notes),
-      toolTokens: toolSchemaTokens(tools),
-    };
-  }, [
+    ]
+  );
+
+  // A change of attachment or settings makes the held in-turn count stale.
+  const meterHoldKey = [
+    conversationId ?? "",
+    scope,
+    markup ? "1" : "0",
+    String(settings.contextLimit),
     settings.fontName,
-    settings.bodyPt,
-    settings.titlePt,
-    settings.lineSpacingChars,
+    String(settings.bodyPt),
+    String(settings.titlePt),
+    String(settings.lineSpacingChars),
     settings.searxngUrl,
     settings.argosBaseUrl,
     argosPathPrefix,
-    turnFiles.length,
-    selectionChars,
-    scope,
-    attachedDocChars,
-    withMarkup,
-    stats.chars,
-  ]);
+    turnFiles.map((file) => file.id).join("\n"),
+    String(stats.attachChars),
+    String(stats.chars),
+    String(stats.comments),
+    String(stats.changes),
+    String(selectionChars),
+  ].join("|");
+  React.useEffect(() => {
+    setFittedTokens(null);
+  }, [meterHoldKey]);
 
-  // The file budget does not yield to the document. Same reservation as
-  // `runTurn`: files are sized from the stable prompt only, so the meter
-  // matches the prefix.
-  const fileChars = React.useMemo(() => {
-    const budget = fileCharBudget(settings.contextLimit, promptEstimate.stableChars);
-    return filesChars(clampFiles(turnFiles, budget));
-  }, [turnFiles, settings.contextLimit, promptEstimate.stableChars]);
-
-  const estimated = React.useMemo(
-    () =>
-      promptEstimate.stableTokens +
-      promptEstimate.noteTokens +
-      promptEstimate.toolTokens +
-      messagesTokens(toChatMessages(messages)) +
-      estimateTokens(input) +
-      Math.ceil(
-        (attachedDocChars + attachedFocusChars + markupChars + fileChars) / CHARS_PER_TOKEN
-      ),
-    [promptEstimate, messages, input, attachedDocChars, attachedFocusChars, markupChars, fileChars]
-  );
+  // Empty composer: the transcript runTurn just fitted (this turn's reasoning
+  // included). A new draft: the next send, which drops that reasoning.
+  const estimated = fittedTokens != null && (busy || input === "") ? fittedTokens : preview;
 
   const attachLabel = describeAttachment({
     scope,
@@ -839,6 +851,7 @@ const App: React.FC = () => {
     const ac = new AbortController();
     abortRef.current = ac;
     setBusy(true);
+    setFittedTokens(null);
     setBusyLabel("応答");
     setBanner(null);
     setDraft(null);
@@ -900,7 +913,7 @@ const App: React.FC = () => {
         }
       };
 
-      await runTurn({
+      const result = await runTurn({
         settings,
         instruction,
         attachment,
@@ -909,8 +922,10 @@ const App: React.FC = () => {
         signal: ac.signal,
         onMessage,
         onDelta: (snapshot) => setDraft(snapshot),
+        onRequestTokens: (tokens) => setFittedTokens(tokens),
         argosPathPrefixes,
       });
+      setFittedTokens(result.nextRequestTokens);
       await refreshConversations();
     } catch (error) {
       if (isAbort(error)) {

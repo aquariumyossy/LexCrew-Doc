@@ -16,7 +16,7 @@ import {
 } from "../../shared/thinking";
 import { StoredMessage } from "../../shared/history";
 import { forgetThinkingBudget } from "./thinkingBudget";
-import { ABORTED_TOOL_RESULT } from "./context";
+import { ABORTED_TOOL_RESULT, prepareRequest, requestTokens } from "./context";
 import {
   MAX_TOOL_ROUNDS,
   STALE_DOCUMENT_READ,
@@ -26,7 +26,7 @@ import {
   toolRoundLimitNotice,
 } from "../../shared/tools";
 import { DEFAULT_SETTINGS } from "../settings";
-import { runTurn } from "./runTurn";
+import { openTurn, outgoingTokens, runTurn } from "./runTurn";
 
 const chatStream = vi.hoisted(() => vi.fn());
 const fetchThinkingBudget = vi.hoisted(() => vi.fn());
@@ -1011,5 +1011,118 @@ describe("runTurn with attached files", () => {
     expect(last).not.toContain("--- 添付ファイル ---");
     expect(last.endsWith("なぜこの建付けなの？")).toBe(true);
     expect(last.indexOf("--- 文書全体 ---")).toBeLessThan(last.lastIndexOf("--- 指示 ---"));
+  });
+});
+
+describe("meter and send share one fit", () => {
+  it("counts capped tool results at the size that is sent", async () => {
+    const huge = "条".repeat(100_000);
+    const history = [
+      storedTurn(1, "assistant", {
+        content: "直します。",
+        reasoningContent: "考".repeat(400),
+        toolCalls: [
+          { id: "c1", type: "function", function: { name: "format_text", arguments: "{}" } },
+        ],
+      }),
+      storedTurn(2, "tool", { content: huge, toolCallId: "c1" }),
+    ];
+    const attachment = attach("", "第1条（目的）");
+    const instruction = "点検して";
+    const input = {
+      settings,
+      instruction,
+      attachment,
+      history,
+      hasBody: true,
+    };
+    chatStream.mockResolvedValue(completion({ content: "はい。" }));
+    await runTurn({
+      ...input,
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+    });
+
+    const sent = chatStream.mock.calls[0][0] as ChatBody;
+    const opened = openTurn(input);
+    const prepared = prepareRequest(opened.messages, settings.contextLimit, opened.tools);
+    expect(sent.messages).toEqual(prepared.messages);
+    expect(requestTokens(sent.messages, sent.tools)).toBe(prepared.tokens);
+    expect(outgoingTokens(input)).toBe(prepared.tokens);
+    expect(sent.messages.some((message) => message.reasoning_content)).toBe(false);
+    const tool = sent.messages.find((message) => message.role === "tool");
+    expect(tool?.content).toContain("省略");
+    expect((tool?.content || "").length).toBeLessThan(huge.length);
+    expect(prepared.tokens).toBeLessThan(requestTokens(opened.messages, opened.tools));
+  });
+
+  it("counts reasoning on the next round of this turn and not on a later turn", async () => {
+    const reasoning = "考".repeat(400);
+    const seen: number[] = [];
+    chatStream
+      .mockResolvedValueOnce(
+        completion({
+          reasoningContent: reasoning,
+          toolCalls: [toolCall("c1", "format_text")],
+          finishReason: "tool_calls",
+        })
+      )
+      .mockResolvedValueOnce(completion({ content: "直しました。", reasoningContent: "締め" }));
+
+    const sent: NewMessage[] = [];
+    const result = await runTurn({
+      settings,
+      instruction: "太字にして",
+      attachment: attach("", "第1条"),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: (message) => {
+        sent.push(message);
+      },
+      onRequestTokens: (tokens) => seen.push(tokens),
+    });
+
+    const second = chatStream.mock.calls[1][0] as ChatBody;
+    const assistant = second.messages.find((message) => message.role === "assistant");
+    expect(assistant?.reasoning_content).toBe(reasoning);
+    const withReasoning = requestTokens(second.messages, second.tools);
+    const stripped = requestTokens(
+      second.messages.map((message) => ({ ...message, reasoning_content: undefined })),
+      second.tools
+    );
+    expect(withReasoning).toBeGreaterThan(stripped);
+    expect(seen).toContain(withReasoning);
+    expect(seen.at(-1)).toBe(result.nextRequestTokens);
+    expect(result.nextRequestTokens).toBeGreaterThan(withReasoning);
+
+    const history: StoredMessage[] = sent.map((message, index) => ({
+      id: index + 1,
+      role: message.role,
+      content: message.content || "",
+      reasoningContent: message.reasoningContent || "",
+      toolCalls: message.toolCalls || [],
+      toolCallId: message.toolCallId || "",
+      usage: message.usage ?? null,
+      createdAt: "",
+    }));
+    expect(history.some((message) => message.reasoningContent === reasoning)).toBe(true);
+
+    chatStream.mockClear();
+    chatStream.mockResolvedValue(completion({ content: "次です。" }));
+    const follow = {
+      settings,
+      instruction: "続き",
+      attachment: attach("", "第1条"),
+      history,
+      hasBody: true,
+    };
+    await runTurn({
+      ...follow,
+      signal: new AbortController().signal,
+      onMessage: () => undefined,
+    });
+    const next = chatStream.mock.calls[0][0] as ChatBody;
+    expect(next.messages.some((message) => message.reasoning_content)).toBe(false);
+    expect(outgoingTokens(follow)).toBe(requestTokens(next.messages, next.tools));
   });
 });

@@ -6,7 +6,7 @@ import path from "path";
 import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "./app";
-import { pickDefaultModel } from "./llm";
+import { CONTEXT_TOO_LONG_MESSAGE, isContextLengthExceeded, pickDefaultModel } from "./llm";
 
 const absentConnection = path.join(os.tmpdir(), `guri-sidecar-absent-${process.pid}`, "connection.json");
 
@@ -299,6 +299,38 @@ describe("sidecar", () => {
     expect(sawRetry).toBe(true);
     expect(res.body.content).toBe("コメントを付けました。");
     expect(res.body.toolCalls).toEqual([]);
+  });
+
+  it("does not retry when the context is too long", async () => {
+    expect(isContextLengthExceeded('{"error":{"code":"context_length_exceeded"}}')).toBe(true);
+    expect(isContextLengthExceeded('{"error":{"message":"unknown field"}}')).toBe(false);
+
+    let hits = 0;
+    const mtplx = await listen((req, res) => {
+      readJsonBody(req, () => {
+        hits += 1;
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: { message: "request exceeds the available context size" },
+          })
+        );
+      });
+    });
+    servers.push(mtplx);
+
+    const app = createApp({ connectionFile: absentConnection });
+    const res = await request(app)
+      .post("/api/chat")
+      .send({
+        llmBaseUrl: `${mtplx.url}/v1`,
+        llmApiKey: "test-key",
+        messages: [{ role: "user", content: "点検して" }],
+      });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe(CONTEXT_TOO_LONG_MESSAGE);
+    expect(hits).toBe(1);
   });
 
   it("wraps a JSON chat reply as SSE when stream is requested", async () => {

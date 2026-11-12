@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { AttachmentScope } from "../../shared/attachment";
+import { AttachmentScope, CommentNote } from "../../shared/attachment";
 import { MeterSelection, MeterSource } from "../word";
-import { assembleMeterAttachment, createMeterSession } from "./meterSession";
+import {
+  assembleMeterAttachment,
+  createMeterSession,
+  selectionNeedsBodyRead,
+} from "./meterSession";
 
 function source(document: string, budget = 1_000): MeterSource {
   return {
@@ -24,6 +28,26 @@ function selection(text: string): MeterSelection {
   return { text, listMarks: false, paragraphs: 1, reviewedFallback: false };
 }
 
+function comment(content: string): CommentNote {
+  return {
+    author: "甲",
+    date: "2026-01-01",
+    resolved: false,
+    anchor: "前文",
+    content,
+    replies: [],
+  };
+}
+
+describe("selectionNeedsBodyRead", () => {
+  it("re-reads the body for selection markup, and whenever paragraph events are missing", () => {
+    expect(selectionNeedsBodyRead("selection", true, true)).toBe(true);
+    expect(selectionNeedsBodyRead("selection", false, true)).toBe(false);
+    expect(selectionNeedsBodyRead("document", true, true)).toBe(false);
+    expect(selectionNeedsBodyRead("document", false, false)).toBe(true);
+  });
+});
+
 describe("assembleMeterAttachment", () => {
   it("gives the selection the budget first and keeps the rest of the cached body", () => {
     const lines = Array.from({ length: 20 }, (_, index) => `[${index + 1}] 本文${index}`);
@@ -35,6 +59,15 @@ describe("assembleMeterAttachment", () => {
     expect(focused.document.length).toBeLessThan(open.document.length);
     expect(focused.document).toContain("[1]");
     expect(focused.truncated).toBe(true);
+  });
+
+  it("marks comments truncated when one note is already over the leftover budget", () => {
+    const cached = source("[1] 本文", 80);
+    cached.markup = true;
+    cached.comments = { items: [comment("あ".repeat(200))], truncated: false, error: "" };
+    const fitted = assembleMeterAttachment(cached, selection("選".repeat(60)), 80);
+    expect(fitted.comments.items).toHaveLength(1);
+    expect(fitted.comments.truncated).toBe(true);
   });
 });
 

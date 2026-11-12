@@ -41,7 +41,7 @@ function takeItems<T>(
     items.push(item);
     used += weight;
   }
-  return { items, truncated: list.truncated, error: "" };
+  return { items, truncated: list.truncated || used > budget, error: "" };
 }
 
 function trimLines(text: string, budget: number): { text: string; truncated: boolean } {
@@ -168,6 +168,19 @@ export function assembleMeterAttachment(
     inlineCommentCount: source.inlineMarkup ? source.inlineCommentCount : undefined,
     shapes: body.shapes,
   };
+}
+
+/**
+ * Selection-scoped markup is read from the selection, so a new selection needs
+ * a fresh body read. Without paragraph events, a selection change is the only
+ * cheap sign that the document text moved.
+ */
+export function selectionNeedsBodyRead(
+  scope: AttachmentScope,
+  markup: boolean,
+  paragraphEvents: boolean
+): boolean {
+  return (scope === "selection" && markup) || !paragraphEvents;
 }
 
 type BodyRequest = { scope: AttachmentScope; budget: number; markup: boolean };

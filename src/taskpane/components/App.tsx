@@ -98,11 +98,13 @@ import {
   getDocumentStats,
   getSelectionText,
   isWordHost,
+  canReadChanges,
   readAttachment,
   readMeterSource,
   readSelectionForMeter,
+  watchParagraphEdits,
 } from "../word";
-import { createMeterSession } from "../chat/meterSession";
+import { createMeterSession, selectionNeedsBodyRead } from "../chat/meterSession";
 import { OcrRunner, useFileSources } from "../files/useFileSources";
 import { ocrFile } from "../files/ocr";
 import { aboutCopy } from "../about";
@@ -756,8 +758,15 @@ const App: React.FC = () => {
     }
     let cancel = false;
     const timer = window.setTimeout(() => {
-      void meterSession.current
-        .selectionChanged()
+      const session = meterSession.current;
+      if (!session) {
+        return;
+      }
+      const refreshBody = selectionNeedsBodyRead(scope, withMarkup, canReadChanges());
+      const read = refreshBody
+        ? session.requestBody(scope, attachBudget, withMarkup)
+        : session.selectionChanged();
+      void read
         .then((attachment) => {
           if (!cancel && attachment) {
             setCachedAttachment(attachment);
@@ -769,7 +778,32 @@ const App: React.FC = () => {
       cancel = true;
       window.clearTimeout(timer);
     };
-  }, [inWord, busy, selectionText]);
+  }, [inWord, busy, selectionText, scope, withMarkup, attachBudget]);
+
+  React.useEffect(() => {
+    if (!inWord || !canReadChanges()) {
+      return undefined;
+    }
+    let cancel = false;
+    let stop = () => Promise.resolve();
+    void watchParagraphEdits(() => {
+      if (!cancel) {
+        setReadGeneration((generation) => generation + 1);
+      }
+    })
+      .then((cleanup) => {
+        if (cancel) {
+          void cleanup();
+          return;
+        }
+        stop = cleanup;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancel = true;
+      void stop();
+    };
+  }, [inWord]);
 
   React.useEffect(() => {
     if (!inWord) {

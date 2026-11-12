@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { assembleMeterAttachment } from "./chat/meterSession";
 import { mapBlocks } from "../shared/blocks";
 import { SHAPE_NOTE } from "../shared/extract/shapeText";
@@ -21,6 +21,7 @@ import {
   readAttachmentForMeter,
   readMeterSource,
   turnBinding,
+  watchParagraphEdits,
   setOutlineLevel,
   deleteMatching,
   deleteParagraphs,
@@ -3565,6 +3566,80 @@ describe("bulk formatting", () => {
     expect(paragraphs[1].alignment).toBe("Centered");
     expect(paragraphs[1].firstLineIndent).toBe(12);
     expect(paragraphs[2].font.bold).toBe(true);
+  });
+});
+
+describe("watchParagraphEdits", () => {
+  function installEvents(wordApi16: boolean) {
+    const calls: string[] = [];
+    const removed: string[] = [];
+    const listeners: Record<string, Array<() => Promise<void>>> = {
+      added: [],
+      changed: [],
+      deleted: [],
+    };
+    const make = (name: string) => ({
+      add: (handler: () => Promise<void>) => {
+        calls.push(name);
+        listeners[name].push(handler);
+        return { remove: () => removed.push(name) };
+      },
+    });
+    const document = {
+      track: () => undefined,
+      untrack: () => undefined,
+      onParagraphAdded: make("added"),
+      onParagraphChanged: make("changed"),
+      onParagraphDeleted: make("deleted"),
+    };
+    const context = { document, sync: async () => undefined };
+    (globalThis as unknown as { Word: unknown }).Word = {
+      run: (first: unknown, second?: (ctx: typeof context) => Promise<unknown>) => {
+        const batch = typeof first === "function" ? (first as (ctx: typeof context) => Promise<unknown>) : second;
+        return batch?.(context);
+      },
+    };
+    (globalThis as unknown as { Office: unknown }).Office = {
+      context: {
+        host: "Word",
+        requirements: {
+          isSetSupported: (name: string, version: string) =>
+            name === "WordApi" && version === "1.6" ? wordApi16 : true,
+        },
+      },
+      HostType: { Word: "Word" },
+    };
+    return {
+      calls,
+      removed,
+      fire: (name: string) => Promise.all(listeners[name].map((handler) => handler())),
+    };
+  }
+
+  it("debounces paragraph edits and skips the subscription on older Word", async () => {
+    const old = installEvents(false);
+    const skipped = await watchParagraphEdits(() => undefined);
+    expect(old.calls).toEqual([]);
+    await skipped();
+
+    vi.useFakeTimers();
+    try {
+      const events = installEvents(true);
+      let edits = 0;
+      const cleanup = await watchParagraphEdits(() => {
+        edits += 1;
+      });
+      expect(events.calls).toEqual(["added", "changed", "deleted"]);
+      await events.fire("changed");
+      await events.fire("added");
+      expect(edits).toBe(0);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(edits).toBe(1);
+      await cleanup();
+      expect(events.removed).toEqual(["added", "changed", "deleted"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

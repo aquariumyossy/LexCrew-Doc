@@ -248,6 +248,56 @@ export function canReadChanges(): boolean {
   }
 }
 
+const PARAGRAPH_EDIT_DEBOUNCE_MS = 300;
+
+/**
+ * Tell `onEdit` after the user types, pastes, or deletes, once the burst settles.
+ * Paragraph events are WordApi 1.6. Older Word gets no subscription; the caller
+ * uses selection changes as the cheap signal instead.
+ */
+export async function watchParagraphEdits(onEdit: () => void): Promise<() => Promise<void>> {
+  if (!canReadChanges()) {
+    return async () => undefined;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const notify = () => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+    timer = setTimeout(onEdit, PARAGRAPH_EDIT_DEBOUNCE_MS);
+    return Promise.resolve();
+  };
+  let document: Word.Document | null = null;
+  const handlers: OfficeExtension.EventHandlerResult<unknown>[] = [];
+  await Word.run(async (context) => {
+    document = context.document;
+    document.track();
+    handlers.push(
+      context.document.onParagraphAdded.add(notify),
+      context.document.onParagraphChanged.add(notify),
+      context.document.onParagraphDeleted.add(notify)
+    );
+    await context.sync();
+  });
+  return async () => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+    const tracked = document;
+    if (!tracked) {
+      return;
+    }
+    document = null;
+    await Word.run(tracked, async (context) => {
+      for (const handler of handlers) {
+        handler.remove();
+      }
+      tracked.untrack();
+      await context.sync();
+    });
+  };
+}
+
 /** Reviewed body text is WordApi 1.4, the same floor as comments. */
 export function canReadReviewed(): boolean {
   try {

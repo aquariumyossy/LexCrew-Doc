@@ -17,6 +17,8 @@ import {
   insertComment,
   insertDraftParagraphs,
   readAttachment,
+  readAttachmentForMeter,
+  turnBinding,
   setOutlineLevel,
   deleteMatching,
   deleteParagraphs,
@@ -1319,6 +1321,12 @@ describe("readDocumentText", () => {
       truncated: false,
       listMarks: false,
       shapes: { text: "", truncated: false, error: "" },
+      reviewedFallback: false,
+      inlineMarkup: false,
+      inlineCommentCount: 0,
+      inlineChanges: [],
+      inlineChangesTruncated: false,
+      inlineAppendixComments: [],
     });
   });
 
@@ -1809,6 +1817,45 @@ describe("replaceParagraphs", () => {
 
 describe("readAttachment", () => {
   const paragraphs = ["第1条（目的）", "第2条（代金）"];
+
+  it("reads the meter without moving the turn's paragraph map or shapes", async () => {
+    installWord({ selection: "第2条（代金）", body: "", paragraphs });
+    const sent = await readAttachment("document", 1_000, false);
+    const before = turnBinding();
+    expect(before.paragraphs.length).toBeGreaterThan(0);
+    expect(before.source).toBeTruthy();
+
+    const meter = await readAttachmentForMeter("document", 1_000, false);
+    expect(meter).toEqual(sent);
+    expect(turnBinding()).toEqual(before);
+
+    const emptied = await readAttachmentForMeter("document", 0, false);
+    expect(emptied.document).toBe("");
+    expect(turnBinding()).toEqual(before);
+
+    const selectionOnly = await readAttachmentForMeter("selection", 1_000, false);
+    expect(selectionOnly.document).toBe("");
+    expect(selectionOnly.focus).toContain("第2条");
+    expect(turnBinding()).toEqual(before);
+  });
+
+  it("leaves a spent shape number in place when the meter reads during the turn", async () => {
+    installWord({
+      selection: "前文",
+      body: "",
+      paragraphs: ["前文"],
+      ooxml: BOX("当事者目録"),
+      shapes: [{ text: "当事者目録\r" }],
+    });
+    await readAttachment("document", 1_000, false);
+    await deleteShape({ shapes: [1] });
+    const before = turnBinding();
+    expect(before.source).toBeTruthy();
+    expect(before.spentShapes).toEqual([1]);
+
+    await readAttachmentForMeter("document", 1_000, false);
+    expect(turnBinding()).toEqual(before);
+  });
 
   it("sends the body and the selection together, so the model knows where to look", async () => {
     installWord({ selection: "第2条（代金）", body: "", paragraphs });

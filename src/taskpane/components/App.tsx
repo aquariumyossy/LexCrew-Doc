@@ -77,7 +77,7 @@ import {
   setConversationFiles as saveConversationFiles,
 } from "../api";
 import { budgetSchemaTokens } from "../chat/context";
-import { meterAttachment, previewTokens, runTurn } from "../chat/runTurn";
+import { outgoingTokens, runTurn } from "../chat/runTurn";
 import { forgetThinkingBudget, readThinkingBudget } from "../chat/thinkingBudget";
 import { applyAdopt } from "../connectionState";
 import {
@@ -99,6 +99,7 @@ import {
   getSelectionText,
   isWordHost,
   readAttachment,
+  readAttachmentForMeter,
 } from "../word";
 import { OcrRunner, useFileSources } from "../files/useFileSources";
 import { ocrFile } from "../files/ocr";
@@ -453,16 +454,10 @@ const App: React.FC = () => {
       ? Math.max(0, Math.min(stats.attachChars, attachBudget - attachedFocusChars - markupChars))
       : 0;
 
-  const previewAttachment = React.useMemo(
-    () =>
-      meterAttachment(cachedAttachment, {
-        scope,
-        markup: withMarkup,
-        selection: selectionText,
-        budget: attachBudget,
-      }) ?? { ...EMPTY_ATTACHMENT, scope, markup: withMarkup },
-    [cachedAttachment, scope, withMarkup, selectionText, attachBudget]
-  );
+  const previewAttachment =
+    cachedAttachment && cachedAttachment.scope === scope && cachedAttachment.markup === withMarkup
+      ? cachedAttachment
+      : { ...EMPTY_ATTACHMENT, scope, markup: withMarkup };
   const previewHasBody =
     previewAttachment.scope === "document"
       ? Boolean(previewAttachment.document.trim() || previewAttachment.truncated)
@@ -472,7 +467,7 @@ const App: React.FC = () => {
   // fit the send uses. A keystroke only changes the instruction.
   const preview = React.useMemo(
     () =>
-      previewTokens({
+      outgoingTokens({
         settings,
         instruction: input,
         attachment: previewAttachment,
@@ -724,18 +719,26 @@ const App: React.FC = () => {
       setCachedAttachment(null);
       return undefined;
     }
+    // A turn owns the paragraph map and the shape list. Reading for the meter
+    // waits, and the read itself does not commit that state.
+    if (busy) {
+      return undefined;
+    }
     let cancel = false;
-    void readAttachment(scope, attachBudget, withMarkup)
-      .then((attachment) => {
-        if (!cancel) {
-          setCachedAttachment(attachment);
-        }
-      })
-      .catch(() => undefined);
+    const timer = window.setTimeout(() => {
+      void readAttachmentForMeter(scope, attachBudget, withMarkup)
+        .then((attachment) => {
+          if (!cancel) {
+            setCachedAttachment(attachment);
+          }
+        })
+        .catch(() => undefined);
+    }, 300);
     return () => {
       cancel = true;
+      window.clearTimeout(timer);
     };
-  }, [inWord, scope, attachBudget, withMarkup, readGeneration]);
+  }, [inWord, busy, scope, attachBudget, withMarkup, readGeneration, selectionText]);
 
   React.useEffect(() => {
     if (!inWord) {

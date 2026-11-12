@@ -293,14 +293,41 @@ function currentTurnStart(messages: ChatMessage[]): number {
 }
 
 /**
+ * How many tokens to take off the front. A full replay every turn would
+ * otherwise slide the cut forward by one turn's growth. The amount is a
+ * multiple of the headroom (`1 - DROP_TARGET_RATIO`), counted from how far
+ * the whole conversation is over the room, so the same prefix survives
+ * several turns and tool rounds.
+ *
+ * When the pinned turn is already past that headroom, or it fills so much of
+ * the room that a whole step would erase the history that still fits, drop
+ * only what does not fit.
+ */
+function tokensToDrop(total: number, limit: number, pinnedTokens: number): number {
+  const excess = total - limit;
+  if (excess <= 0) {
+    return 0;
+  }
+  const target = Math.floor(limit * DROP_TARGET_RATIO);
+  const band = Math.max(1, limit - target);
+  // History that still fits beside the pinned turn. Rounding the drop up to a
+  // whole band keeps the cut still, but when that band is most of the slack
+  // the round-up throws the conversation away. Drop only the overflow then.
+  const fittable = limit - pinnedTokens;
+  if (pinnedTokens > target || fittable < band * 2) {
+    return excess;
+  }
+  return Math.ceil(excess / band) * band;
+}
+
+/**
  * Drop history from the front until the request fits. An assistant turn with
  * tool calls leaves with its tool replies: the server rejects an orphan of
  * either half.
  *
  * The system prompt stays. So does the latest user message and everything
- * after it. When anything has to go, it goes in one pass down to
- * `DROP_TARGET_RATIO` of the room, so the next few turns can grow without
- * moving the prefix again. Token weights are counted once.
+ * after it. Token weights are counted once. The result is always a new array:
+ * the caller keeps pushing onto the transcript after the send.
  */
 export function dropOldest(
   messages: ChatMessage[],
@@ -313,34 +340,41 @@ export function dropOldest(
     total += weight;
   }
   if (total <= limit) {
-    // A copy: the caller keeps pushing onto its own array after the send.
     return messages.slice();
   }
 
-  const target = Math.floor(limit * DROP_TARGET_RATIO);
   const pinnedFront = messages[0]?.role === "system" ? 1 : 0;
   const turn = currentTurnStart(messages);
+  let pinnedTokens = 0;
+  for (let index = 0; index < pinnedFront; index += 1) {
+    pinnedTokens += weights[index];
+  }
+  for (let index = turn; index < weights.length; index += 1) {
+    pinnedTokens += weights[index];
+  }
+  const dropAtLeast = tokensToDrop(total, limit, pinnedTokens);
   let index = pinnedFront;
   let dropped = 0;
-  while (index < turn && total > target) {
-    total -= weights[index];
+  let droppedTokens = 0;
+  while (index < turn && droppedTokens < dropAtLeast) {
+    droppedTokens += weights[index];
     const removed = messages[index];
     index += 1;
     dropped += 1;
     if (removed.tool_calls?.length) {
       while (index < turn && messages[index]?.role === "tool") {
-        total -= weights[index];
+        droppedTokens += weights[index];
         index += 1;
         dropped += 1;
       }
     }
   }
   if (dropped === 0) {
-    return messages;
+    return messages.slice();
   }
   const out = messages.slice(0, pinnedFront).concat(messages.slice(index));
   if (trimLogged(options)) {
-    logInfo("context trim", { dropped, tokens: total, limit });
+    logInfo("context trim", { dropped, tokens: total - droppedTokens, limit });
   }
   return out;
 }

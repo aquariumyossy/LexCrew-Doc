@@ -466,31 +466,100 @@ describe("dropOldest", () => {
     }
   });
 
-  it("drops down to 85% in one pass, then keeps that prefix", () => {
+  function firstKeptUser(messages: ChatMessage[]): string {
+    const found = messages.find((message, index) => index > 0 && message.role === "user");
+    return found?.content || "";
+  }
+
+  it("keeps the same cut when the full history is replayed", () => {
     const limit = 2_000;
+    const band = Math.max(1, limit - Math.floor(limit * DROP_TARGET_RATIO));
+    const history: ChatMessage[] = [{ role: "system", content: "s" }];
+    let n = 0;
+    const pushTurn = () => {
+      history.push({ role: "user", content: `u${n}${"あ".repeat(40)}` });
+      history.push({ role: "assistant", content: `a${n}${"い".repeat(40)}` });
+      n += 1;
+    };
+    while (messagesTokens(history) <= limit) {
+      pushTurn();
+    }
+    const quantum = (total: number) => Math.ceil((total - limit) / band);
+    const q0 = quantum(messagesTokens(history));
+    const kept = firstKeptUser(dropOldest(history, limit));
+    expect(kept).not.toBe("");
+
+    const withToolRound: ChatMessage[] = [
+      ...history,
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "c1", type: "function", function: { name: "search", arguments: "{}" } }],
+      },
+      { role: "tool", content: "結果", tool_call_id: "c1" },
+    ];
+    expect(quantum(messagesTokens(withToolRound))).toBe(q0);
+    expect(firstKeptUser(dropOldest(withToolRound, limit))).toBe(kept);
+
+    let replayed = 0;
+    while (replayed < 4) {
+      pushTurn();
+      if (quantum(messagesTokens(history)) !== q0) {
+        break;
+      }
+      expect(firstKeptUser(dropOldest(history, limit))).toBe(kept);
+      replayed += 1;
+    }
+    expect(replayed).toBeGreaterThan(0);
+  });
+
+  it("keeps history that still fits beside a large pinned turn", () => {
+    const limit = 1_000;
     const target = Math.floor(limit * DROP_TARGET_RATIO);
     const history: ChatMessage[] = [{ role: "system", content: "s" }];
-    for (let index = 0; index < 20; index += 1) {
-      history.push({ role: "user", content: `古い${index}${"あ".repeat(120)}` });
-      history.push({ role: "assistant", content: `返事${index}${"い".repeat(120)}` });
+    for (let index = 0; index < 12; index += 1) {
+      history.push({ role: "user", content: `古い${index}${"あ".repeat(40)}` });
+      history.push({ role: "assistant", content: `返事${index}${"い".repeat(20)}` });
     }
-    history.push({ role: "user", content: "いま" });
+    // About 77% of the room: under the 85% line, but a full hysteresis step
+    // would throw away most of the history that still fits.
+    const pinned = "あ".repeat(Math.ceil(limit * 0.77 * CHARS_PER_TOKEN));
+    history.push({ role: "user", content: pinned });
+    const pinnedTokens = messageTokens(history[0]) + messageTokens(history.at(-1) as ChatMessage);
+    expect(pinnedTokens).toBeLessThan(target);
+    expect(pinnedTokens).toBeGreaterThan(limit * 0.7);
     expect(messagesTokens(history)).toBeGreaterThan(limit);
 
     const trimmed = dropOldest(history, limit);
-    const kept = messagesTokens(trimmed);
-    expect(kept).toBeLessThanOrEqual(target);
-    expect(trimmed[0]).toEqual(history[0]);
-    expect(trimmed.at(-1)?.content).toBe("いま");
-    expect(trimmed.length).toBeLessThan(history.length - 2);
+    const keptHistory = messagesTokens(trimmed) - pinnedTokens;
+    expect(messagesTokens(trimmed)).toBeLessThanOrEqual(limit);
+    expect(trimmed.at(-1)?.content).toBe(pinned);
+    expect(keptHistory).toBeGreaterThan(target - pinnedTokens);
+    expect(trimmed.some((message) => message.content?.startsWith("古い"))).toBe(true);
 
-    const grown: ChatMessage[] = [
-      ...trimmed.slice(0, -1),
-      { role: "assistant", content: "短い返事" },
-      { role: "user", content: "つぎ" },
+    const withTools: ChatMessage[] = [
+      ...history,
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "c1", type: "function", function: { name: "search", arguments: "{}" } }],
+      },
+      {
+        role: "tool",
+        content: "あ".repeat(Math.ceil(limit * 0.12 * CHARS_PER_TOKEN)),
+        tool_call_id: "c1",
+      },
     ];
-    expect(messagesTokens(grown)).toBeLessThanOrEqual(limit);
-    expect(dropOldest(grown, limit)).toEqual(grown);
+    const pinnedAfter =
+      pinnedTokens +
+      messageTokens(withTools.at(-2) as ChatMessage) +
+      messageTokens(withTools.at(-1) as ChatMessage);
+    expect(pinnedAfter).toBeGreaterThan(target);
+    const afterTools = dropOldest(withTools, limit);
+    expect(messagesTokens(afterTools)).toBeLessThanOrEqual(limit);
+    expect(afterTools.at(-1)?.role).toBe("tool");
+    expect(messagesTokens(afterTools) - pinnedAfter).toBeGreaterThan(0);
+    expect(afterTools.some((message) => message.content?.startsWith("古い"))).toBe(true);
   });
 
   it("trims a long transcript in one pass", () => {
@@ -504,7 +573,7 @@ describe("dropOldest", () => {
     const started = Date.now();
     const trimmed = dropOldest(messages, 4_000);
     expect(Date.now() - started).toBeLessThan(500);
-    expect(messagesTokens(trimmed)).toBeLessThanOrEqual(Math.floor(4_000 * DROP_TARGET_RATIO));
+    expect(messagesTokens(trimmed)).toBeLessThanOrEqual(4_000);
     expect(trimmed.at(-1)?.content).toBe(messages.at(-1)?.content);
   });
 
@@ -602,7 +671,7 @@ describe("reply reserve", () => {
       const room = messageRoomTokens(limit, schema);
       const pool = Math.floor(room * (1 - CONVERSATION_BUDGET_RATIO) * CHARS_PER_TOKEN);
       const document = attachmentCharBudget(limit, schema, reserved);
-      const files = fileCharBudget(limit, reserved, schema);
+      const files = fileCharBudget(limit, schema, reserved);
       expect(document + files + reserved).toBeLessThanOrEqual(pool);
       expect(room + schema + replyReserveTokens(limit)).toBe(limit);
     }

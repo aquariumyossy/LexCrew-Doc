@@ -40,8 +40,8 @@ describe("fileCharBudget", () => {
   });
 
   it("yields to the system prompt and the document share", () => {
-    expect(fileCharBudget(4_096, 6_600)).toBe(0);
-    expect(fileCharBudget(32_768, 40_000)).toBe(0);
+    expect(fileCharBudget(4_096, 0, 6_600)).toBe(0);
+    expect(fileCharBudget(32_768, 0, 40_000)).toBe(0);
   });
 
   it("is zero for a window that makes no sense", () => {

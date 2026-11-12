@@ -136,7 +136,7 @@ export function mergeFiles(kept: CommittedFile[], incoming: CommittedFile[]): Co
  * the conversation's share survives a narrow window. The schema tokens must
  * not depend on this turn's document, or the file text would change every turn.
  */
-export function fileCharBudget(contextLimit: number, reservedChars = 0, schemaTokens = 0): number {
+export function fileCharBudget(contextLimit: number, schemaTokens = 0, reservedChars = 0): number {
   const room = messageRoomTokens(contextLimit, schemaTokens);
   if (room <= 0) {
     return 0;

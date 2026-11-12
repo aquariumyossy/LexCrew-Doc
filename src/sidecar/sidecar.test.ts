@@ -12,6 +12,7 @@ import {
   isContextLengthExceeded,
   OCR_PAGE_TOO_LONG,
   pickDefaultModel,
+  SERVER_MEMORY,
 } from "./llm";
 
 const absentConnection = path.join(os.tmpdir(), `guri-sidecar-absent-${process.pid}`, "connection.json");
@@ -322,6 +323,7 @@ describe("sidecar", () => {
         '{"error":{"message":"unknown field","prompt":"maximum context length"}}'
       )
     ).toBe(false);
+    expect(isContextLengthExceeded('{"error":{"message":"context the overflows"}}')).toBe(true);
     expect(isContextLengthExceeded('{"error":{"message":"unknown field"}}')).toBe(false);
 
     let hits = 0;
@@ -413,6 +415,31 @@ describe("sidecar", () => {
 
     expect(res.status).toBe(502);
     expect(res.body.error).toBe(OCR_PAGE_TOO_LONG);
+  });
+
+  it("does not retry when the server is out of memory", async () => {
+    let hits = 0;
+    const mtplx = await listen((req, res) => {
+      readJsonBody(req, () => {
+        hits += 1;
+        res.writeHead(507, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "insufficient memory" } }));
+      });
+    });
+    servers.push(mtplx);
+
+    const app = createApp({ connectionFile: absentConnection });
+    const res = await request(app)
+      .post("/api/chat")
+      .send({
+        llmBaseUrl: `${mtplx.url}/v1`,
+        llmApiKey: "test-key",
+        messages: [{ role: "user", content: "点検して" }],
+      });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe(SERVER_MEMORY);
+    expect(hits).toBe(1);
   });
 
   it("wraps a JSON chat reply as SSE when stream is requested", async () => {

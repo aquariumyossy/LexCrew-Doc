@@ -106,6 +106,8 @@ pub const CONTEXT_TOO_LONG_NEW_CHAT: &str = "会話が長すぎます。新し�
 pub const CONTEXT_TOO_LONG_ATTACHMENT: &str =
     "会話が長すぎます。添付を減らすか、指示を分けてください。";
 pub const OCR_PAGE_TOO_LONG: &str = "このページは大きすぎて読めません。";
+pub const SERVER_MEMORY: &str =
+    "推論サーバーのメモリに収まりません。設定のコンテキスト上限を、サーバーが報告する値以下にしてください。";
 
 pub fn is_context_too_long_message(message: &str) -> bool {
     message == CONTEXT_TOO_LONG_NEW_CHAT || message == CONTEXT_TOO_LONG_ATTACHMENT
@@ -159,6 +161,8 @@ fn field_says_context_length(text: &str) -> bool {
         "greater than the context length",
         "exceed the context length",
         "exceeds the context length",
+        // LM Studio's own wording, typo included.
+        "context the overflows",
     ];
     MARKERS.iter().any(|marker| lower.contains(marker))
 }
@@ -540,6 +544,11 @@ pub async fn post_chat(
         .await
         .map_err(|error| connection_error(&error))?;
 
+    // 507: the request will not fit in the server's memory. Retrying does not help.
+    if res.status() == StatusCode::INSUFFICIENT_STORAGE {
+        return Err(ChatError::new(SERVER_MEMORY, None));
+    }
+
     if res.status() == StatusCode::BAD_REQUEST {
         let raw = res.text().await.unwrap_or_default();
         // A full window will not fit by dropping the thinking fields. Retrying
@@ -559,6 +568,9 @@ pub async fn post_chat(
     if !res.status().is_success() {
         let status = res.status().as_u16();
         let raw = res.text().await.unwrap_or_default();
+        if status == 507 {
+            return Err(ChatError::new(SERVER_MEMORY, None));
+        }
         if status == 400 && is_context_length_exceeded(&raw) {
             return Err(context_too_long(options.messages));
         }
@@ -608,6 +620,9 @@ mod tests {
         assert!(is_context_length_exceeded(r#"{"error":{"message":"Prompt too long"}}"#));
         assert!(is_context_length_exceeded(
             r#"{"error":"The number of tokens to keep from the initial prompt is greater than the context length."}"#
+        ));
+        assert!(is_context_length_exceeded(
+            r#"{"error":{"message":"context the overflows"}}"#
         ));
         assert!(!is_context_length_exceeded(
             r#"{"error":{"message":"unknown field","prompt":"maximum context length"}}"#

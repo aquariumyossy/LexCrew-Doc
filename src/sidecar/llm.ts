@@ -73,6 +73,8 @@ export const CONTEXT_TOO_LONG_NEW_CHAT = "会話が長すぎます。新しい�
 export const CONTEXT_TOO_LONG_ATTACHMENT =
   "会話が長すぎます。添付を減らすか、指示を分けてください。";
 export const OCR_PAGE_TOO_LONG = "このページは大きすぎて読めません。";
+export const SERVER_MEMORY =
+  "推論サーバーのメモリに収まりません。設定のコンテキスト上限を、サーバーが報告する値以下にしてください。";
 
 export function isContextTooLongMessage(message: string): boolean {
   return message === CONTEXT_TOO_LONG_NEW_CHAT || message === CONTEXT_TOO_LONG_ATTACHMENT;
@@ -91,6 +93,8 @@ const CONTEXT_LENGTH_MARKERS = [
   "greater than the context length",
   "exceed the context length",
   "exceeds the context length",
+  // LM Studio's own wording, typo included.
+  "context the overflows",
 ];
 
 function pushText(out: string[], value: unknown): void {
@@ -134,7 +138,7 @@ function fieldSaysContextLength(text: string): boolean {
 
 /**
  * OpenAI's `context_length_exceeded`, and the same refusal from vLLM, SGLang
- * and LM Studio. Other 400s (unknown thinking fields) must not match.
+ * and LM Studio (`context the overflows`). Other 400s must not match.
  */
 export function isContextLengthExceeded(raw: string): boolean {
   return contextErrorFields(raw || "").some((field) => fieldSaysContextLength(field));
@@ -427,6 +431,10 @@ async function postWithThinkingFallback(options: ChatCallOptions): Promise<Respo
     throw connectionFailure(error);
   }
 
+  if (res.status === 507) {
+    throw new Error(SERVER_MEMORY);
+  }
+
   if (res.status === 400) {
     const raw = await readBody(res);
     // A full window will not fit by dropping the thinking fields.
@@ -446,6 +454,9 @@ async function postWithThinkingFallback(options: ChatCallOptions): Promise<Respo
   logInfo("llm chat", { status: res.status });
   if (!res.ok) {
     const raw = await readBody(res);
+    if (res.status === 507) {
+      throw new Error(SERVER_MEMORY);
+    }
     if (res.status === 400 && isContextLengthExceeded(raw)) {
       throw new Error(contextTooLongMessage(options.messages));
     }

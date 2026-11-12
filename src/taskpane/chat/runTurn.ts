@@ -155,8 +155,8 @@ export function openTurn(input: OpenTurnInput): OpenTurn {
     input.files || [],
     fileCharBudget(
       settings.contextLimit,
-      stable.length,
-      budgetSchemaTokens(promptBase.search, promptBase.argos)
+      budgetSchemaTokens(promptBase.search, promptBase.argos),
+      stable.length
     )
   );
   const notes = turnAttachmentNotes({
@@ -196,33 +196,6 @@ export function outgoingTokens(input: OpenTurnInput): number {
   return prepareRequest(opened.messages, input.settings.contextLimit, opened.tools, {
     log: false,
   }).tokens;
-}
-
-/** The composer meter. Same count as `outgoingTokens`, so the preview cannot drift from send. */
-export function previewTokens(input: OpenTurnInput): number {
-  return outgoingTokens(input);
-}
-
-/**
- * The attachment the meter counts. A cached read keeps shapes, list marks and
- * the markup; the live selection replaces the focus without reading the body
- * again. Null when nothing matching this scope has been read yet.
- */
-export function meterAttachment(
-  cached: Attachment | null,
-  options: {
-    scope: Attachment["scope"];
-    markup: boolean;
-    selection: string;
-    budget: number;
-  }
-): Attachment | null {
-  if (!cached || cached.scope !== options.scope || cached.markup !== options.markup) {
-    return null;
-  }
-  const room = Math.max(0, options.budget);
-  const focus = options.scope === "none" ? "" : (options.selection || "").slice(0, room);
-  return { ...cached, focus };
 }
 
 function attachmentShowsBody(attachment: Attachment): boolean | null {
@@ -301,7 +274,8 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       elapsedMs: Date.now() - started,
     });
     const nextTools = offeredTools();
-    const next = prepareRequest(messages, limit, nextTools);
+    // Count only. Logging here would record a trim the send did not make.
+    const next = prepareRequest(messages, limit, nextTools, { log: false });
     options.onRequestTokens?.(next.tokens);
     return {
       usage,

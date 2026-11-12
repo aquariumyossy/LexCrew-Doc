@@ -31,7 +31,7 @@ import {
   toolRoundLimitNotice,
 } from "../../shared/tools";
 import { DEFAULT_SETTINGS } from "../settings";
-import { meterAttachment, openTurn, outgoingTokens, previewTokens, runTurn } from "./runTurn";
+import { openTurn, outgoingTokens, runTurn } from "./runTurn";
 
 const chatStream = vi.hoisted(() => vi.fn());
 const fetchThinkingBudget = vi.hoisted(() => vi.fn());
@@ -1064,42 +1064,31 @@ describe("meter and send share one fit", () => {
     expect(prepared.tokens).toBeLessThan(requestTokens(opened.messages, opened.tools));
   });
 
-  it("counts a cached attachment with shapes the same way the send does", () => {
-    const cached: Attachment = {
+  it("counts a real attachment with shapes the same way the send does", () => {
+    const attachment: Attachment = {
       ...EMPTY_ATTACHMENT,
       scope: "document",
       document: "[1] 〔第１条〕甲は乙に委託する。",
+      focus: "甲",
       listMarks: true,
       shapes: { text: "[図1]\n別紙の図", truncated: false, error: "", count: 1 },
     };
-    const shown = meterAttachment(cached, {
-      scope: "document",
-      markup: false,
-      selection: "甲",
-      budget: 1_000,
-    });
-    expect(shown?.shapes?.text).toContain("別紙の図");
-    expect(shown?.listMarks).toBe(true);
-    expect(shown?.focus).toBe("甲");
     const input = {
       settings,
       instruction: "見て",
-      attachment: shown as Attachment,
+      attachment,
       history: [] as StoredMessage[],
       hasBody: true,
     };
     const opened = openTurn(input);
-    expect(previewTokens(input)).toBe(outgoingTokens(input));
-    expect(previewTokens(input)).toBe(
+    expect(outgoingTokens(input)).toBe(
       prepareRequest(opened.messages, settings.contextLimit, opened.tools).tokens
     );
     const user = opened.messages.at(-1)?.content || "";
     expect(user).toContain("別紙の図");
     expect(user).toContain("Word の項番号");
+    expect(user).toContain("甲");
     expect(opened.tools.map((tool) => tool.function.name)).toContain("delete_shape");
-    expect(
-      meterAttachment(cached, { scope: "selection", markup: false, selection: "", budget: 10 })
-    ).toBe(null);
   });
 
   it("counts reasoning on the next round of this turn and not on a later turn", async () => {

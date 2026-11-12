@@ -367,6 +367,12 @@ export type DocumentText = {
   truncated: boolean;
   listMarks: boolean;
   shapes: ShapeRead;
+  reviewedFallback: boolean;
+  inlineMarkup: boolean;
+  inlineCommentCount: number;
+  inlineChanges: ChangeNote[];
+  inlineChangesTruncated: boolean;
+  inlineAppendixComments: CommentNote[];
 };
 
 type AttachedParagraph = {
@@ -504,6 +510,19 @@ export function turnSource(): string | null {
   return turnSourceText;
 }
 
+/** The bindings a meter read must not touch. Tests use this to see a turn. */
+export function turnBinding(): {
+  source: string | null;
+  paragraphs: number[];
+  spentShapes: number[];
+} {
+  return {
+    source: turnSourceText,
+    paragraphs: [...attachedParagraphs.keys()].sort((a, b) => a - b),
+    spentShapes: [...spentShapes].sort((a, b) => a - b),
+  };
+}
+
 function forgetParagraphNumbers(): void {
   turnSourceText = null;
   attachedParagraphs = new Map();
@@ -565,6 +584,11 @@ function resolveMarkupLocations(
 type ReadDocumentOptions = {
   markup?: boolean;
   markupBudget?: number;
+  /**
+   * The send commits paragraph numbers, shape ids and the source text the
+   * tools resolve against. A meter read must not: it can overlap a turn.
+   */
+  commit?: boolean;
 };
 
 /** Consecutive paragraphs without text, shown as one line. A picture paragraph is its own run. */
@@ -614,15 +638,35 @@ function shapesOn(number: number, anchors: readonly (number | null)[]): string[]
   return labels;
 }
 
+function emptyDocumentText(): DocumentText {
+  return {
+    text: "",
+    paragraphs: 0,
+    truncated: false,
+    listMarks: false,
+    shapes: EMPTY_SHAPES,
+    reviewedFallback: false,
+    inlineMarkup: false,
+    inlineCommentCount: 0,
+    inlineChanges: [],
+    inlineChangesTruncated: false,
+    inlineAppendixComments: [],
+  };
+}
+
 export async function readDocumentText(
   maxChars: number,
   options: ReadDocumentOptions = {}
 ): Promise<DocumentText> {
-  forgetParagraphNumbers();
+  const commit = options.commit !== false;
+  if (commit) {
+    forgetParagraphNumbers();
+  }
   if (!isWordHost() || maxChars <= 0) {
-    return { text: "", paragraphs: 0, truncated: false, listMarks: false, shapes: EMPTY_SHAPES };
+    return emptyDocumentText();
   }
   return Word.run(async (context) => {
+    let reviewedFallback = false;
     const paragraphs = context.document.body.paragraphs;
     paragraphs.load("items/text,items/isListItem");
     await context.sync();
@@ -640,12 +684,20 @@ export async function readDocumentText(
       try {
         await context.sync();
       } catch {
-        attachmentReviewedFallback = true;
+        reviewedFallback = true;
+        if (commit) {
+          attachmentReviewedFallback = true;
+        }
         reviewed.length = 0;
       }
     } else {
-      attachmentReviewedFallback = true;
+      reviewedFallback = true;
+      if (commit) {
+        attachmentReviewedFallback = true;
+      }
     }
+    let inlineMarkup = false;
+    let inlineCommentCount = 0;
 
     let documentXml = "";
     let commentsXml: string | undefined;
@@ -665,7 +717,7 @@ export async function readDocumentText(
     let inlineChangesTruncated = false;
     let appendixComments: CommentNote[] = [];
     let markupParagraphs = -1;
-    if (options.markup && !attachmentReviewedFallback && !shapeError) {
+    if (options.markup && !reviewedFallback && !shapeError) {
       try {
         const parsed = readMarkupBody(documentXml, commentsXml, { skipShapeParagraphs: true });
         markupParagraphs = parsed.paragraphCount;
@@ -677,8 +729,12 @@ export async function readDocumentText(
             inlineChanges = parsed.changes;
             inlineChangesTruncated = parsed.changesTruncated;
             appendixComments = parsed.commentsForAppendix;
-            lastInlineCommentCount = parsed.inlineCommentCount;
-            attachmentUsesInlineMarkup = parsed.hasInlineMarkup;
+            inlineCommentCount = parsed.inlineCommentCount;
+            inlineMarkup = parsed.hasInlineMarkup;
+            if (commit) {
+              lastInlineCommentCount = parsed.inlineCommentCount;
+              attachmentUsesInlineMarkup = parsed.hasInlineMarkup;
+            }
           }
         }
       } catch {
@@ -687,7 +743,9 @@ export async function readDocumentText(
     }
 
     const shapeRoom = Math.max(0, maxChars - `\n\n${SHAPES_MARKER}\n`.length);
-    const placement = shapeError ? { blocks: [], bodyParagraphs: 0, paragraphs: [] } : readShapeBlocks(documentXml);
+    const placement = shapeError
+      ? { blocks: [], bodyParagraphs: 0, paragraphs: [] }
+      : readShapeBlocks(documentXml);
     const aligned = shapeError
       ? null
       : alignFacts(placement, paragraphs.items.map(paragraphText), "attachment", markupParagraphs);
@@ -703,11 +761,11 @@ export async function readDocumentText(
       const paragraph = paragraphs.items[index];
       const raw = paragraphText(paragraph);
       const reviewedText =
-        !attachmentReviewedFallback && reviewed[index]
+        !reviewedFallback && reviewed[index]
           ? paragraphText({ text: reviewed[index].value || "" })
           : raw;
       const display = inlineMarked
-        ? inlineMarked[index] ?? reviewedText
+        ? (inlineMarked[index] ?? reviewedText)
         : neutralizeLiteralMarkup(reviewedText);
       const kind = bodyKind(display, facts?.[index]);
       displays.push(display);
@@ -719,13 +777,13 @@ export async function readDocumentText(
         blankLabels.push(mark.isListItem ? wrapListMark(mark) : "");
       }
     }
-    if (!shapeError) {
+    if (!shapeError && commit) {
       turnSourceText = [...displays, ...shapeBlocks.flatMap((block) => block.lines)].join("\n");
     }
     const fitted = shapeError
       ? { text: "", truncated: false, shown: [] as string[], anchors: [] as (number | null)[] }
       : fitShapeText(shapeBlocks, shapeRoom, TRUNCATION_NOTE);
-    if (!shapeError) {
+    if (!shapeError && commit) {
       attachedShapes = fitted.shown;
       attachedShapeAnchors = fitted.anchors;
       spentShapes = new Set();
@@ -744,7 +802,7 @@ export async function readDocumentText(
 
     const lines: string[] = [];
     const attached = new Map<number, AttachedParagraph>();
-    allParagraphRawTexts = new Map();
+    const rawTexts = new Map<number, string>();
     let used = 0;
     let truncated = false;
     let listMarks = false;
@@ -767,7 +825,7 @@ export async function readDocumentText(
       const paragraph = paragraphs.items[index];
       const number = index + 1;
       const raw = paragraphText(paragraph);
-      allParagraphRawTexts.set(number, raw);
+      rawTexts.set(number, raw);
       const display = displays[index];
       if (kinds[index] === "gone") {
         continue;
@@ -816,7 +874,7 @@ export async function readDocumentText(
       truncated = true;
     }
 
-    if (inlineMarked && attachmentUsesInlineMarkup) {
+    if (inlineMarked && inlineMarkup) {
       const legend = `${MARKUP_LEGEND}\n\n`;
       if (used + legend.length <= bodyBudget) {
         lines.unshift(legend.trimEnd());
@@ -841,16 +899,30 @@ export async function readDocumentText(
       }
     }
 
-    attachedParagraphs = attached;
-    attachedParagraphCount = paragraphs.items.length;
-
-    if (attachmentUsesInlineMarkup) {
-      lastInlineChanges = inlineChanges;
-      lastInlineChangesTruncated = inlineChangesTruncated;
-      lastInlineAppendixComments = appendixComments;
+    if (commit) {
+      allParagraphRawTexts = rawTexts;
+      attachedParagraphs = attached;
+      attachedParagraphCount = paragraphs.items.length;
+      if (inlineMarkup) {
+        lastInlineChanges = inlineChanges;
+        lastInlineChangesTruncated = inlineChangesTruncated;
+        lastInlineAppendixComments = appendixComments;
+      }
     }
 
-    return { text: lines.join("\n"), paragraphs: numberedCount, truncated, listMarks, shapes };
+    return {
+      text: lines.join("\n"),
+      paragraphs: numberedCount,
+      truncated,
+      listMarks,
+      shapes,
+      reviewedFallback,
+      inlineMarkup,
+      inlineCommentCount,
+      inlineChanges,
+      inlineChangesTruncated,
+      inlineAppendixComments: appendixComments,
+    };
   });
 }
 
@@ -1031,14 +1103,18 @@ function usedChars<T>(list: MarkupList<T>, cost: (item: T) => number): number {
 export async function readAttachment(
   scope: AttachmentScope,
   budget: number,
-  markup: boolean
+  markup: boolean,
+  options: { commit?: boolean } = {}
 ): Promise<Attachment> {
+  const commit = options.commit !== false;
   if (!isWordHost() || scope === "none") {
     // No numbers were handed over, so last turn's must not stay resolvable.
-    forgetParagraphNumbers();
+    if (commit) {
+      forgetParagraphNumbers();
+    }
     return { ...EMPTY_ATTACHMENT, scope };
   }
-  const selected = await readSelectionAttachment();
+  const selected = await readSelectionAttachment(commit);
   const focus = selected.text.slice(0, Math.max(0, budget));
   const focusCut = focus.length < selected.text.length;
 
@@ -1054,7 +1130,9 @@ export async function readAttachment(
   const markupUsed = commentsUsed + usedChars(changes, changeChars);
 
   if (scope === "selection") {
-    forgetParagraphNumbers();
+    if (commit) {
+      forgetParagraphNumbers();
+    }
     if (markup) {
       resolveMarkupLocations(comments, changes);
     }
@@ -1068,7 +1146,7 @@ export async function readAttachment(
       comments,
       changes,
       listMarks: selected.listMarks,
-      reviewedFallback: attachmentReviewedFallback,
+      reviewedFallback: selected.reviewedFallback,
       inlineMarkup: false,
     };
   }
@@ -1076,16 +1154,17 @@ export async function readAttachment(
   const body = await readDocumentText(remaining, {
     markup,
     markupBudget: forMarkup,
+    commit,
   });
 
   if (markup) {
     resolveMarkupLocations(comments, changes);
-    if (attachmentUsesInlineMarkup) {
-      changes.items = lastInlineChanges;
-      changes.truncated = lastInlineChangesTruncated;
+    if (body.inlineMarkup) {
+      changes.items = body.inlineChanges;
+      changes.truncated = body.inlineChangesTruncated;
       comments.items = comments.items
         .filter((note) => note.replies.length > 0 || note.resolved)
-        .concat(lastInlineAppendixComments);
+        .concat(body.inlineAppendixComments);
     }
   }
 
@@ -1100,11 +1179,20 @@ export async function readAttachment(
     comments,
     changes,
     listMarks: body.listMarks || selected.listMarks,
-    reviewedFallback: attachmentReviewedFallback,
-    inlineMarkup: attachmentUsesInlineMarkup,
-    inlineCommentCount: attachmentUsesInlineMarkup ? lastInlineCommentCount : undefined,
+    reviewedFallback: body.reviewedFallback,
+    inlineMarkup: body.inlineMarkup,
+    inlineCommentCount: body.inlineMarkup ? body.inlineCommentCount : undefined,
     shapes: body.shapes,
   };
+}
+
+/** Same bytes as `readAttachment`, without touching the turn's tool state. */
+export async function readAttachmentForMeter(
+  scope: AttachmentScope,
+  budget: number,
+  markup: boolean
+): Promise<Attachment> {
+  return readAttachment(scope, budget, markup, { commit: false });
 }
 
 export async function getSelectionText(): Promise<string> {
@@ -1120,13 +1208,14 @@ export async function getSelectionText(): Promise<string> {
  * Selection text the model sees. List marks are added here, not in
  * `getSelectionText`, which the pane uses to tell an empty caret from a range.
  */
-async function readSelectionAttachment(): Promise<{
+async function readSelectionAttachment(commit: boolean): Promise<{
   text: string;
   listMarks: boolean;
   paragraphs: number;
+  reviewedFallback: boolean;
 }> {
   if (!isWordHost()) {
-    return { text: "", listMarks: false, paragraphs: 0 };
+    return { text: "", listMarks: false, paragraphs: 0, reviewedFallback: false };
   }
   try {
     return await Word.run(async (context) => {
@@ -1138,13 +1227,14 @@ async function readSelectionAttachment(): Promise<{
       const raw = range.text || "";
       const paragraphs = raw.split(/\r\n?|\n/).filter((line) => line.trim()).length;
       if (!raw.trim()) {
-        return { text: raw, listMarks: false, paragraphs };
+        return { text: raw, listMarks: false, paragraphs, reviewedFallback: false };
       }
       await loadListStrings(context, collection.items);
 
       const useReviewed = canReadReviewed();
       type ReviewedTextResult = { value: string };
       const reviewed: ReviewedTextResult[] = [];
+      let reviewedFallback = false;
       if (useReviewed) {
         for (const paragraph of collection.items) {
           reviewed.push(
@@ -1154,10 +1244,13 @@ async function readSelectionAttachment(): Promise<{
         try {
           await context.sync();
         } catch {
-          attachmentReviewedFallback = true;
+          reviewedFallback = true;
           reviewed.length = 0;
         }
       } else {
+        reviewedFallback = true;
+      }
+      if (commit && reviewedFallback) {
         attachmentReviewedFallback = true;
       }
 
@@ -1166,7 +1259,7 @@ async function readSelectionAttachment(): Promise<{
       for (let index = 0; index < collection.items.length; index += 1) {
         const paragraph = collection.items[index];
         const line =
-          !attachmentReviewedFallback && reviewed[index]
+          !reviewedFallback && reviewed[index]
             ? paragraphText({ text: reviewed[index].value || "" })
             : paragraphText(paragraph);
         if (!line.trim()) {
@@ -1182,6 +1275,7 @@ async function readSelectionAttachment(): Promise<{
         text: lines.length ? lines.join("\r") : raw,
         listMarks,
         paragraphs: lines.length || paragraphs,
+        reviewedFallback,
       };
     });
   } catch {
@@ -1190,12 +1284,13 @@ async function readSelectionAttachment(): Promise<{
       text: raw,
       listMarks: false,
       paragraphs: raw.split(/\r\n?|\n/).filter((line) => line.trim()).length,
+      reviewedFallback: false,
     };
   }
 }
 
 export async function getSelectionInfo(): Promise<{ text: string; paragraphs: number }> {
-  const read = await readSelectionAttachment();
+  const read = await readSelectionAttachment(false);
   return { text: read.text, paragraphs: read.paragraphs };
 }
 

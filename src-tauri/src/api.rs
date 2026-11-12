@@ -1239,6 +1239,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_does_not_retry_when_the_server_is_out_of_memory() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mtplx = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with({
+                let hits = hits.clone();
+                move |_request: &MockRequest| {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    ResponseTemplate::new(507)
+                        .set_body_json(json!({ "error": { "message": "insufficient memory" } }))
+                }
+            })
+            .mount(&mtplx)
+            .await;
+        let (status, body) = json_request(
+            create_router(None),
+            "POST",
+            "/api/chat",
+            json!({
+                "llmBaseUrl": format!("{}/v1", mtplx.uri()),
+                "llmApiKey": "test-key",
+                "messages": [{ "role": "user", "content": "点検して" }],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body["error"],
+            "推論サーバーのメモリに収まりません。設定のコンテキスト上限を、サーバーが報告する値以下にしてください。"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn thinking_budget_reads_the_mtplx_metrics_of_a_request() {
         let mtplx = MockServer::start().await;
         Mock::given(method("GET"))

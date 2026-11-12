@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { assembleMeterAttachment } from "./chat/meterSession";
 import { mapBlocks } from "../shared/blocks";
 import { SHAPE_NOTE } from "../shared/extract/shapeText";
-import { SHAPES_MARKER } from "../shared/prompts";
+import { SHAPES_MARKER, userMessageWithAttachment } from "../shared/prompts";
 import {
   applyFormat,
   copyFormat,
@@ -18,6 +19,7 @@ import {
   insertDraftParagraphs,
   readAttachment,
   readAttachmentForMeter,
+  readMeterSource,
   turnBinding,
   setOutlineLevel,
   deleteMatching,
@@ -1327,6 +1329,7 @@ describe("readDocumentText", () => {
       inlineChanges: [],
       inlineChangesTruncated: false,
       inlineAppendixComments: [],
+      paragraphTexts: new Map(),
     });
   });
 
@@ -1942,6 +1945,28 @@ describe("reading comments and tracked changes", () => {
       text: "無催告で",
     });
     expect(attachment.changes.items[0].where).toBe("[段落 2]");
+  });
+
+  it("resolves tracked changes the same way for the meter and the send", async () => {
+    installWord({
+      selection: "",
+      body: "",
+      paragraphs: ["別の条文"],
+      markupChanges: [{ ...change, where: "別の条文" }],
+    });
+    await readAttachment("document", 10_000, true);
+
+    installWord({ selection: "第2条（代金）", body: "", paragraphs, markupChanges: [change] });
+    const meter = await readAttachmentForMeter("document", 10_000, true);
+    const sent = await readAttachment("document", 10_000, true);
+    expect(meter.changes.items[0].where).toBe("[段落 2]");
+    expect(sent.changes.items[0].where).toBe("[段落 2]");
+    expect(userMessageWithAttachment("見て", meter)).toBe(userMessageWithAttachment("見て", sent));
+
+    const source = await readMeterSource("document", 10_000, true);
+    const assembled = assembleMeterAttachment(source, source.selection, 10_000);
+    expect(assembled.changes.items[0].where).toBe("[段落 2]");
+    expect(assembled.focus).toBe(sent.focus);
   });
 
   it("maps every tracked change type Word reports", async () => {

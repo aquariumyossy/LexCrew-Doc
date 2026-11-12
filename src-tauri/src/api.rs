@@ -504,7 +504,9 @@ async fn post_ocr(State(state): State<AppState>, Json(body): Json<OcrRequest>) -
             match ocr::vision_unsupported_message(&error.message) {
                 Some(message) => json_error(StatusCode::BAD_GATEWAY, message, None),
                 None => {
-                    let message = if llm::is_context_too_long_message(&error.message) {
+                    let message = if error.message == llm::SERVER_MEMORY {
+                        llm::OCR_SERVER_MEMORY.to_string()
+                    } else if llm::is_context_too_long_message(&error.message) {
                         llm::OCR_PAGE_TOO_LONG.to_string()
                     } else {
                         error.message.clone()
@@ -1236,6 +1238,39 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["error"], "このページは大きすぎて読めません。");
+    }
+
+    #[tokio::test]
+    async fn ocr_does_not_suggest_changing_the_context_limit_when_memory_is_short() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mtplx = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with({
+                let hits = hits.clone();
+                move |_request: &MockRequest| {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    ResponseTemplate::new(507).set_body_json(json!({
+                        "error": { "message": "insufficient memory" }
+                    }))
+                }
+            })
+            .mount(&mtplx)
+            .await;
+        let (status, body) = json_request(
+            create_router(None),
+            "POST",
+            "/api/ocr",
+            json!({
+                "llmBaseUrl": format!("{}/v1", mtplx.uri()),
+                "llmApiKey": "test-key",
+                "image": "data:image/png;base64,aaaa",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "このページは推論サーバーのメモリに収まりません。");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

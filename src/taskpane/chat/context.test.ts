@@ -562,6 +562,69 @@ describe("dropOldest", () => {
     expect(afterTools.some((message) => message.content?.startsWith("古い"))).toBe(true);
   });
 
+  it("keeps the cut across read_paragraphs rounds and the next turn", () => {
+    const limit = 2_000;
+    const band = Math.max(1, limit - Math.floor(limit * DROP_TARGET_RATIO));
+    const history: ChatMessage[] = [{ role: "system", content: "s" }];
+    let n = 0;
+    while (messagesTokens(history) <= limit) {
+      history.push({ role: "user", content: `u${n}${"あ".repeat(40)}` });
+      history.push({ role: "assistant", content: `a${n}${"い".repeat(40)}` });
+      n += 1;
+    }
+    const baseline = firstKeptUser(dropOldest(history, limit));
+    expect(baseline).not.toBe("");
+
+    const read = "段落".repeat(Math.ceil((band * 1.5 * CHARS_PER_TOKEN) / 2));
+    const call = (id: string): ChatMessage => ({
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        { id, type: "function", function: { name: "read_paragraphs", arguments: "{}" } },
+      ],
+    });
+    const round1: ChatMessage[] = [
+      ...history,
+      call("r1"),
+      { role: "tool", content: read, tool_call_id: "r1" },
+    ];
+    const fitted1 = dropOldest(round1, limit);
+    expect(firstKeptUser(fitted1)).toBe(baseline);
+    expect(messagesTokens(fitted1)).toBeLessThanOrEqual(limit);
+
+    const round2: ChatMessage[] = [
+      ...round1,
+      call("r2"),
+      { role: "tool", content: read, tool_call_id: "r2" },
+    ];
+    const fitted2 = dropOldest(round2, limit);
+    expect(firstKeptUser(fitted2)).toBe(baseline);
+    expect(messagesTokens(fitted2)).toBeLessThanOrEqual(limit);
+    const tools = fitted2.filter((message) => message.role === "tool");
+    expect(tools[0]?.content).toBe(STALE_DOCUMENT_READ);
+    expect(tools[1]?.content).not.toBe(read);
+    expect(messagesTokens(fitted2)).toBeLessThan(messagesTokens(round2));
+
+    const replay: ChatMessage[] = [
+      { role: "system", content: "s" },
+      ...toChatMessages(
+        round2
+          .filter((message) => message.role !== "system")
+          .map((message, index) =>
+            stored({
+              role: message.role as "user" | "assistant" | "tool",
+              content: message.content || "",
+              toolCalls: message.tool_calls || [],
+              toolCallId: message.tool_call_id || "",
+              id: index,
+            })
+          )
+      ),
+      { role: "user", content: "つぎ" },
+    ];
+    expect(firstKeptUser(dropOldest(replay, limit))).toBe(baseline);
+  });
+
   it("trims a long transcript in one pass", () => {
     const messages: ChatMessage[] = [{ role: "system", content: "s" }];
     for (let index = 0; index < 1_500; index += 1) {

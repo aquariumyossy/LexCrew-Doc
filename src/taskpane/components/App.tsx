@@ -99,8 +99,10 @@ import {
   getSelectionText,
   isWordHost,
   readAttachment,
-  readAttachmentForMeter,
+  readMeterSource,
+  readSelectionForMeter,
 } from "../word";
+import { createMeterSession } from "../chat/meterSession";
 import { OcrRunner, useFileSources } from "../files/useFileSources";
 import { ocrFile } from "../files/ocr";
 import { aboutCopy } from "../about";
@@ -714,19 +716,27 @@ const App: React.FC = () => {
       .catch(() => undefined);
   }, []);
 
+  const meterSession = React.useRef<ReturnType<typeof createMeterSession> | null>(null);
+  if (!meterSession.current) {
+    meterSession.current = createMeterSession({
+      readSource: readMeterSource,
+      readSelection: readSelectionForMeter,
+    });
+  }
+
   React.useEffect(() => {
     if (!inWord) {
       setCachedAttachment(null);
       return undefined;
     }
-    // A turn owns the paragraph map and the shape list. Reading for the meter
-    // waits, and the read itself does not commit that state.
+    // A turn owns the paragraph map and the shape list. The meter waits.
     if (busy) {
       return undefined;
     }
     let cancel = false;
     const timer = window.setTimeout(() => {
-      void readAttachmentForMeter(scope, attachBudget, withMarkup)
+      void meterSession.current
+        .requestBody(scope, attachBudget, withMarkup)
         .then((attachment) => {
           if (!cancel) {
             setCachedAttachment(attachment);
@@ -738,7 +748,28 @@ const App: React.FC = () => {
       cancel = true;
       window.clearTimeout(timer);
     };
-  }, [inWord, busy, scope, attachBudget, withMarkup, readGeneration, selectionText]);
+  }, [inWord, busy, scope, attachBudget, withMarkup, readGeneration]);
+
+  React.useEffect(() => {
+    if (!inWord || busy) {
+      return undefined;
+    }
+    let cancel = false;
+    const timer = window.setTimeout(() => {
+      void meterSession.current
+        .selectionChanged()
+        .then((attachment) => {
+          if (!cancel && attachment) {
+            setCachedAttachment(attachment);
+          }
+        })
+        .catch(() => undefined);
+    }, 300);
+    return () => {
+      cancel = true;
+      window.clearTimeout(timer);
+    };
+  }, [inWord, busy, selectionText]);
 
   React.useEffect(() => {
     if (!inWord) {

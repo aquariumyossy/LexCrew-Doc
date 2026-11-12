@@ -373,6 +373,8 @@ export type DocumentText = {
   inlineChanges: ChangeNote[];
   inlineChangesTruncated: boolean;
   inlineAppendixComments: CommentNote[];
+  /** Raw paragraph text by number, for resolving markup without module state. */
+  paragraphTexts: ReadonlyMap<number, string>;
 };
 
 type AttachedParagraph = {
@@ -383,18 +385,6 @@ type AttachedParagraph = {
   listString: string;
   isListItem: boolean;
 };
-
-/** Every paragraph number to raw text, including blanks skipped from the attachment. */
-let allParagraphRawTexts = new Map<number, string>();
-/** Set when getReviewedText could not be used for the body this turn. */
-let attachmentReviewedFallback = false;
-/** Set when inline markup was embedded in the body this turn. */
-let attachmentUsesInlineMarkup = false;
-/** Inline markup read from the last body read, when phase 2 succeeded. */
-let lastInlineChanges: ChangeNote[] = [];
-let lastInlineChangesTruncated = false;
-let lastInlineAppendixComments: CommentNote[] = [];
-let lastInlineCommentCount = 0;
 
 const PARAGRAPH_LABEL = /^\s*\[(\d+)\]\s*/;
 const PARAGRAPH_LABEL_ONLY = /^\s*\[(\d+)\]\s*$/;
@@ -531,33 +521,23 @@ function forgetParagraphNumbers(): void {
   attachedShapeAnchors = [];
   spentShapes = new Set();
   deletedShapeIds = new Set();
-  allParagraphRawTexts = new Map();
-  attachmentReviewedFallback = false;
-  attachmentUsesInlineMarkup = false;
-  lastInlineChanges = [];
-  lastInlineChangesTruncated = false;
-  lastInlineAppendixComments = [];
-  lastInlineCommentCount = 0;
 }
 
-function resolveLocationText(rawParagraphText: string): string {
+function resolveLocationText(
+  rawParagraphText: string,
+  paragraphTexts: ReadonlyMap<number, string>
+): string {
   const target = compact(paragraphText({ text: rawParagraphText }));
   if (!target) {
-    for (const [number, raw] of allParagraphRawTexts) {
+    for (const [number, raw] of paragraphTexts) {
       if (!compact(raw)) {
         return formatParagraphRef(number);
       }
     }
     return clipNote(rawParagraphText, MAX_CHANGE_WHERE_CHARS);
   }
-  for (const [number, raw] of allParagraphRawTexts) {
+  for (const [number, raw] of paragraphTexts) {
     const dense = compact(raw);
-    if (dense === target || (target.length >= 4 && dense.includes(target))) {
-      return formatParagraphRef(number);
-    }
-  }
-  for (const [number, row] of attachedParagraphs) {
-    const dense = compact(row.text);
     if (dense === target || (target.length >= 4 && dense.includes(target))) {
       return formatParagraphRef(number);
     }
@@ -567,16 +547,17 @@ function resolveLocationText(rawParagraphText: string): string {
 
 function resolveMarkupLocations(
   comments: MarkupList<CommentNote>,
-  changes: MarkupList<ChangeNote>
+  changes: MarkupList<ChangeNote>,
+  paragraphTexts: ReadonlyMap<number, string>
 ): void {
   for (const note of comments.items) {
     if (note.anchor && !isParagraphRef(note.anchor)) {
-      note.anchor = resolveLocationText(note.anchor);
+      note.anchor = resolveLocationText(note.anchor, paragraphTexts);
     }
   }
   for (const note of changes.items) {
     if (note.where && !isParagraphRef(note.where)) {
-      note.where = resolveLocationText(note.where);
+      note.where = resolveLocationText(note.where, paragraphTexts);
     }
   }
 }
@@ -651,6 +632,7 @@ function emptyDocumentText(): DocumentText {
     inlineChanges: [],
     inlineChangesTruncated: false,
     inlineAppendixComments: [],
+    paragraphTexts: new Map(),
   };
 }
 
@@ -685,16 +667,10 @@ export async function readDocumentText(
         await context.sync();
       } catch {
         reviewedFallback = true;
-        if (commit) {
-          attachmentReviewedFallback = true;
-        }
         reviewed.length = 0;
       }
     } else {
       reviewedFallback = true;
-      if (commit) {
-        attachmentReviewedFallback = true;
-      }
     }
     let inlineMarkup = false;
     let inlineCommentCount = 0;
@@ -731,10 +707,6 @@ export async function readDocumentText(
             appendixComments = parsed.commentsForAppendix;
             inlineCommentCount = parsed.inlineCommentCount;
             inlineMarkup = parsed.hasInlineMarkup;
-            if (commit) {
-              lastInlineCommentCount = parsed.inlineCommentCount;
-              attachmentUsesInlineMarkup = parsed.hasInlineMarkup;
-            }
           }
         }
       } catch {
@@ -900,14 +872,8 @@ export async function readDocumentText(
     }
 
     if (commit) {
-      allParagraphRawTexts = rawTexts;
       attachedParagraphs = attached;
       attachedParagraphCount = paragraphs.items.length;
-      if (inlineMarkup) {
-        lastInlineChanges = inlineChanges;
-        lastInlineChangesTruncated = inlineChangesTruncated;
-        lastInlineAppendixComments = appendixComments;
-      }
     }
 
     return {
@@ -922,6 +888,7 @@ export async function readDocumentText(
       inlineChanges,
       inlineChangesTruncated,
       inlineAppendixComments: appendixComments,
+      paragraphTexts: rawTexts,
     };
   });
 }
@@ -1114,7 +1081,7 @@ export async function readAttachment(
     }
     return { ...EMPTY_ATTACHMENT, scope };
   }
-  const selected = await readSelectionAttachment(commit);
+  const selected = await readSelectionAttachment();
   const focus = selected.text.slice(0, Math.max(0, budget));
   const focusCut = focus.length < selected.text.length;
 
@@ -1134,7 +1101,8 @@ export async function readAttachment(
       forgetParagraphNumbers();
     }
     if (markup) {
-      resolveMarkupLocations(comments, changes);
+      // A selection hands out no paragraph numbers, so locations stay as text.
+      resolveMarkupLocations(comments, changes, new Map());
     }
     return {
       scope,
@@ -1146,6 +1114,7 @@ export async function readAttachment(
       comments,
       changes,
       listMarks: selected.listMarks,
+      // The selection's own read: the prompt note must match this text.
       reviewedFallback: selected.reviewedFallback,
       inlineMarkup: false,
     };
@@ -1158,7 +1127,7 @@ export async function readAttachment(
   });
 
   if (markup) {
-    resolveMarkupLocations(comments, changes);
+    resolveMarkupLocations(comments, changes, body.paragraphTexts);
     if (body.inlineMarkup) {
       changes.items = body.inlineChanges;
       changes.truncated = body.inlineChangesTruncated;
@@ -1195,6 +1164,132 @@ export async function readAttachmentForMeter(
   return readAttachment(scope, budget, markup, { commit: false });
 }
 
+/** Selection text the meter may swap in without reading the body again. */
+export type MeterSelection = {
+  text: string;
+  listMarks: boolean;
+  paragraphs: number;
+  reviewedFallback: boolean;
+};
+
+/**
+ * Body and markup read at the full attachment budget, selection not reserved.
+ * A later selection change reallocates this instead of reading the document again.
+ */
+export type MeterSource = {
+  scope: AttachmentScope;
+  markup: boolean;
+  budget: number;
+  selection: MeterSelection;
+  comments: MarkupList<CommentNote>;
+  changes: MarkupList<ChangeNote>;
+  document: string;
+  paragraphs: number;
+  truncated: boolean;
+  listMarks: boolean;
+  reviewedFallback: boolean;
+  inlineMarkup: boolean;
+  inlineCommentCount?: number;
+  shapes?: ShapeRead;
+};
+
+const EMPTY_SELECTION: MeterSelection = {
+  text: "",
+  listMarks: false,
+  paragraphs: 0,
+  reviewedFallback: false,
+};
+
+/** The document read behind the meter. Does not commit paragraph numbers or shapes. */
+export async function readMeterSource(
+  scope: AttachmentScope,
+  budget: number,
+  markup: boolean
+): Promise<MeterSource> {
+  if (!isWordHost() || scope === "none") {
+    return {
+      scope,
+      markup,
+      budget,
+      selection: EMPTY_SELECTION,
+      comments: emptyMarkup<CommentNote>(),
+      changes: emptyMarkup<ChangeNote>(),
+      document: "",
+      paragraphs: 0,
+      truncated: false,
+      listMarks: false,
+      reviewedFallback: false,
+      inlineMarkup: false,
+    };
+  }
+  const selected = await readSelectionAttachment();
+  // The whole budget is available here. The selection is applied later, from
+  // this cache, so a caret move does not read the package again.
+  const forMarkup = markup ? markupCharBudget(Math.max(0, budget)) : 0;
+  const comments: MarkupList<CommentNote> = markup
+    ? await readComments(scope, Math.floor(forMarkup / 2))
+    : emptyMarkup<CommentNote>();
+  const commentsUsed = usedChars(comments, commentChars);
+  const changes: MarkupList<ChangeNote> = markup
+    ? await readChanges(scope, forMarkup - commentsUsed)
+    : emptyMarkup<ChangeNote>();
+  if (scope === "selection") {
+    if (markup) {
+      resolveMarkupLocations(comments, changes, new Map());
+    }
+    return {
+      scope,
+      markup,
+      budget,
+      selection: selected,
+      comments,
+      changes,
+      document: "",
+      paragraphs: 0,
+      truncated: false,
+      listMarks: false,
+      reviewedFallback: false,
+      inlineMarkup: false,
+    };
+  }
+  const markupUsed = commentsUsed + usedChars(changes, changeChars);
+  const body = await readDocumentText(Math.max(0, budget - markupUsed), {
+    markup,
+    markupBudget: forMarkup,
+    commit: false,
+  });
+  if (markup) {
+    resolveMarkupLocations(comments, changes, body.paragraphTexts);
+    if (body.inlineMarkup) {
+      changes.items = body.inlineChanges;
+      changes.truncated = body.inlineChangesTruncated;
+      comments.items = comments.items
+        .filter((note) => note.replies.length > 0 || note.resolved)
+        .concat(body.inlineAppendixComments);
+    }
+  }
+  return {
+    scope,
+    markup,
+    budget,
+    selection: selected,
+    comments,
+    changes,
+    document: body.text,
+    paragraphs: body.paragraphs,
+    truncated: body.truncated,
+    listMarks: body.listMarks,
+    reviewedFallback: body.reviewedFallback,
+    inlineMarkup: body.inlineMarkup,
+    inlineCommentCount: body.inlineMarkup ? body.inlineCommentCount : undefined,
+    shapes: body.shapes,
+  };
+}
+
+export async function readSelectionForMeter(): Promise<MeterSelection> {
+  return readSelectionAttachment();
+}
+
 export async function getSelectionText(): Promise<string> {
   return Word.run(async (context) => {
     const range = context.document.getSelection();
@@ -1208,7 +1303,7 @@ export async function getSelectionText(): Promise<string> {
  * Selection text the model sees. List marks are added here, not in
  * `getSelectionText`, which the pane uses to tell an empty caret from a range.
  */
-async function readSelectionAttachment(commit: boolean): Promise<{
+async function readSelectionAttachment(): Promise<{
   text: string;
   listMarks: boolean;
   paragraphs: number;
@@ -1250,9 +1345,6 @@ async function readSelectionAttachment(commit: boolean): Promise<{
       } else {
         reviewedFallback = true;
       }
-      if (commit && reviewedFallback) {
-        attachmentReviewedFallback = true;
-      }
 
       const lines: string[] = [];
       let listMarks = false;
@@ -1290,7 +1382,7 @@ async function readSelectionAttachment(commit: boolean): Promise<{
 }
 
 export async function getSelectionInfo(): Promise<{ text: string; paragraphs: number }> {
-  const read = await readSelectionAttachment(false);
+  const read = await readSelectionAttachment();
   return { text: read.text, paragraphs: read.paragraphs };
 }
 

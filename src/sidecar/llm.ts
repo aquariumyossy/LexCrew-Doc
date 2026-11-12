@@ -73,6 +73,7 @@ export const CONTEXT_TOO_LONG_NEW_CHAT = "会話が長すぎます。新しい�
 export const CONTEXT_TOO_LONG_ATTACHMENT =
   "会話が長すぎます。添付を減らすか、指示を分けてください。";
 export const OCR_PAGE_TOO_LONG = "このページは大きすぎて読めません。";
+export const OCR_SERVER_MEMORY = "このページは推論サーバーのメモリに収まりません。";
 export const SERVER_MEMORY =
   "推論サーバーのメモリに収まりません。設定のコンテキスト上限を、サーバーが報告する値以下にしてください。";
 

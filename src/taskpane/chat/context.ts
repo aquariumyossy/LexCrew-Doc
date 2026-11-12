@@ -302,7 +302,109 @@ function currentTurnStart(messages: ChatMessage[]): number {
  * When the pinned turn is already past that headroom, or it fills so much of
  * the room that a whole step would erase the history that still fits, drop
  * only what does not fit.
+ *
+ * Document reads are weighed at the stub they become on the next turn. Counting
+ * the full text would move the cut for one round and force another prefill
+ * once the stub is substituted.
  */
+function snapshotCallIds(messages: ChatMessage[]): Set<string> {
+  const ids = new Set<string>();
+  for (const message of messages) {
+    for (const call of message.tool_calls || []) {
+      if (call.id && isDocumentSnapshotTool(call.function?.name || "")) {
+        ids.add(call.id);
+      }
+    }
+  }
+  return ids;
+}
+
+function isSnapshotResult(message: ChatMessage, ids: Set<string>): boolean {
+  return (
+    message.role === "tool" && Boolean(message.tool_call_id) && ids.has(message.tool_call_id || "")
+  );
+}
+
+/** Token weight of a message as the next turn will replay it. */
+function replayTokens(message: ChatMessage, ids: Set<string>): number {
+  if (!isSnapshotResult(message, ids) || (message.content || "") === STALE_DOCUMENT_READ) {
+    return messageTokens(message);
+  }
+  return messageTokens({
+    role: "tool",
+    content: STALE_DOCUMENT_READ,
+    tool_call_id: message.tool_call_id,
+  });
+}
+
+/**
+ * The current turn's own reads are what blew the budget. Stub the earlier ones
+ * (they are stubs on replay anyway) and shrink the newest, instead of cutting
+ * more history to make room for a text the next turn will not resend.
+ */
+function fitSnapshotReads(
+  messages: ChatMessage[],
+  limit: number,
+  ids: Set<string>,
+  options?: FitOptions
+): ChatMessage[] {
+  if (!ids.size || messagesTokens(messages) <= limit) {
+    return messages;
+  }
+  const turn = currentTurnStart(messages);
+  const reads: number[] = [];
+  for (let index = turn; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (isSnapshotResult(message, ids) && (message.content || "") !== STALE_DOCUMENT_READ) {
+      reads.push(index);
+    }
+  }
+  if (!reads.length) {
+    return messages;
+  }
+  const out = messages.slice();
+  let total = messagesTokens(out);
+  let stubbed = 0;
+  const earlier = reads.length > 1 ? reads.slice(0, -1) : [];
+  for (const index of earlier) {
+    if (total <= limit) {
+      break;
+    }
+    const before = messageTokens(out[index]);
+    const next: ChatMessage = { ...out[index], content: STALE_DOCUMENT_READ };
+    const after = messageTokens(next);
+    if (after >= before) {
+      continue;
+    }
+    out[index] = next;
+    total -= before - after;
+    stubbed += 1;
+  }
+  const newest = reads[reads.length - 1];
+  if (total > limit) {
+    const before = messageTokens(out[newest]);
+    const keep = before - (total - limit);
+    const stub = messageTokens({ role: "tool", content: STALE_DOCUMENT_READ });
+    const next: ChatMessage =
+      keep <= stub
+        ? { ...out[newest], content: STALE_DOCUMENT_READ }
+        : { ...out[newest], content: truncate(out[newest].content || "", Math.max(0, keep - 4)) };
+    const after = messageTokens(next);
+    if (after < before) {
+      out[newest] = next;
+      total -= before - after;
+      stubbed += 1;
+      if (total > limit && next.content !== STALE_DOCUMENT_READ) {
+        out[newest] = { ...out[newest], content: STALE_DOCUMENT_READ };
+      }
+    }
+  }
+  if (stubbed > 0 && trimLogged(options)) {
+    logInfo("context trim", { stubbedReads: stubbed, tokens: messagesTokens(out), limit });
+  }
+  return out;
+}
+
 function tokensToDrop(total: number, limit: number, pinnedTokens: number): number {
   const excess = total - limit;
   if (excess <= 0) {
@@ -334,13 +436,14 @@ export function dropOldest(
   limit: number,
   options?: FitOptions
 ): ChatMessage[] {
-  const weights = messages.map((message) => messageTokens(message));
+  const snapshotIds = snapshotCallIds(messages);
+  const weights = messages.map((message) => replayTokens(message, snapshotIds));
   let total = 0;
   for (const weight of weights) {
     total += weight;
   }
   if (total <= limit) {
-    return messages.slice();
+    return fitSnapshotReads(messages.slice(), limit, snapshotIds, options);
   }
 
   const pinnedFront = messages[0]?.role === "system" ? 1 : 0;
@@ -369,14 +472,12 @@ export function dropOldest(
       }
     }
   }
-  if (dropped === 0) {
-    return messages.slice();
-  }
-  const out = messages.slice(0, pinnedFront).concat(messages.slice(index));
-  if (trimLogged(options)) {
+  const out =
+    dropped === 0 ? messages.slice() : messages.slice(0, pinnedFront).concat(messages.slice(index));
+  if (dropped > 0 && trimLogged(options)) {
     logInfo("context trim", { dropped, tokens: total - droppedTokens, limit });
   }
-  return out;
+  return fitSnapshotReads(out, limit, snapshotIds, options);
 }
 
 /**

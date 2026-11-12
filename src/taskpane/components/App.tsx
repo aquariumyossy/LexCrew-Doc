@@ -104,7 +104,11 @@ import {
   readSelectionForMeter,
   watchParagraphEdits,
 } from "../word";
-import { createMeterSession, selectionNeedsBodyRead } from "../chat/meterSession";
+import {
+  createDocumentEditRefresh,
+  createMeterSession,
+  selectionNeedsBodyRead,
+} from "../chat/meterSession";
 import { OcrRunner, useFileSources } from "../files/useFileSources";
 import { ocrFile } from "../files/ocr";
 import { aboutCopy } from "../about";
@@ -780,17 +784,31 @@ const App: React.FC = () => {
     };
   }, [inWord, busy, selectionText, scope, withMarkup, attachBudget]);
 
+  const meterArgs = React.useRef({ scope, attachBudget, withMarkup, busy });
+  meterArgs.current = { scope, attachBudget, withMarkup, busy };
+
   React.useEffect(() => {
     if (!inWord || !canReadChanges()) {
       return undefined;
     }
     let cancel = false;
     let stop = () => Promise.resolve();
-    void watchParagraphEdits(() => {
-      if (!cancel) {
-        setReadGeneration((generation) => generation + 1);
+    const refresh = createDocumentEditRefresh(() => {
+      if (cancel || meterArgs.current.busy) {
+        return undefined;
       }
-    })
+      const session = meterSession.current;
+      if (!session) {
+        return undefined;
+      }
+      const args = meterArgs.current;
+      return session.requestBody(args.scope, args.attachBudget, args.withMarkup).then((attachment) => {
+        if (!cancel) {
+          setCachedAttachment(attachment);
+        }
+      });
+    });
+    void watchParagraphEdits(() => refresh.onEdit())
       .then((cleanup) => {
         if (cancel) {
           void cleanup();
@@ -801,6 +819,7 @@ const App: React.FC = () => {
       .catch(() => undefined);
     return () => {
       cancel = true;
+      refresh.dispose();
       void stop();
     };
   }, [inWord]);

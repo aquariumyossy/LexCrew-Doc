@@ -183,6 +183,57 @@ export function selectionNeedsBodyRead(
   return (scope === "selection" && markup) || !paragraphEvents;
 }
 
+/** Quiet time after the last paragraph edit before the meter reads the body again. */
+export const DOCUMENT_EDIT_QUIET_MS = 1_500;
+
+/**
+ * One read, 1.5s after the last edit. Every edit extends that wait, so typing
+ * faster than the quiet time does not read at all. A read already running for
+ * this same pause is not started again; a read that began earlier is followed
+ * by one fresh read when it finishes.
+ */
+export function createDocumentEditRefresh(
+  read: () => Promise<unknown> | unknown,
+  quietMs = DOCUMENT_EDIT_QUIET_MS
+): { onEdit: () => void; dispose: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let inflight = false;
+  let again = false;
+
+  const start = () => {
+    if (inflight) {
+      again = true;
+      return;
+    }
+    inflight = true;
+    again = false;
+    Promise.resolve(read()).finally(() => {
+      inflight = false;
+      if (again) {
+        again = false;
+        start();
+      }
+    });
+  };
+
+  return {
+    onEdit() {
+      again = false;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      timer = setTimeout(start, quietMs);
+    },
+    dispose() {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      timer = undefined;
+      again = false;
+    },
+  };
+}
+
 type BodyRequest = { scope: AttachmentScope; budget: number; markup: boolean };
 
 /**

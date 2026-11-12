@@ -248,10 +248,9 @@ export function canReadChanges(): boolean {
   }
 }
 
-const PARAGRAPH_EDIT_DEBOUNCE_MS = 300;
-
 /**
- * Tell `onEdit` after the user types, pastes, or deletes, once the burst settles.
+ * Forward each paragraph edit as it happens. The caller waits out the typing
+ * burst; debouncing here as well would let a read start between keystrokes.
  * Paragraph events are WordApi 1.6. Older Word gets no subscription; the caller
  * uses selection changes as the cheap signal instead.
  */
@@ -259,12 +258,8 @@ export async function watchParagraphEdits(onEdit: () => void): Promise<() => Pro
   if (!canReadChanges()) {
     return async () => undefined;
   }
-  let timer: ReturnType<typeof setTimeout> | undefined;
   const notify = () => {
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-    timer = setTimeout(onEdit, PARAGRAPH_EDIT_DEBOUNCE_MS);
+    onEdit();
     return Promise.resolve();
   };
   let document: Word.Document | null = null;
@@ -280,9 +275,6 @@ export async function watchParagraphEdits(onEdit: () => void): Promise<() => Pro
     await context.sync();
   });
   return async () => {
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
     const tracked = document;
     if (!tracked) {
       return;

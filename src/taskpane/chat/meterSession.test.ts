@@ -1,8 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AttachmentScope, CommentNote } from "../../shared/attachment";
 import { MeterSelection, MeterSource } from "../word";
 import {
+  DOCUMENT_EDIT_QUIET_MS,
   assembleMeterAttachment,
+  createDocumentEditRefresh,
   createMeterSession,
   selectionNeedsBodyRead,
 } from "./meterSession";
@@ -38,6 +40,51 @@ function comment(content: string): CommentNote {
     replies: [],
   };
 }
+
+describe("createDocumentEditRefresh", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function typeFor(
+    interval: number,
+    duration: number,
+    onEdit: () => void,
+    reads: () => number
+  ) {
+    onEdit();
+    let elapsed = 0;
+    while (elapsed + interval < duration) {
+      await vi.advanceTimersByTimeAsync(interval);
+      elapsed += interval;
+      expect(reads()).toBe(0);
+      onEdit();
+    }
+  }
+
+  it("reads once, 1.5s after the last edit, for both slow and fast typing", async () => {
+    vi.useFakeTimers();
+    for (const interval of [320, 100]) {
+      let reads = 0;
+      const refresh = createDocumentEditRefresh(() => {
+        reads += 1;
+      });
+      await typeFor(
+        interval,
+        10_000,
+        () => refresh.onEdit(),
+        () => reads
+      );
+      await vi.advanceTimersByTimeAsync(DOCUMENT_EDIT_QUIET_MS - 1);
+      expect(reads).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(reads).toBe(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(reads).toBe(1);
+      refresh.dispose();
+    }
+  });
+});
 
 describe("selectionNeedsBodyRead", () => {
   it("re-reads the body for selection markup, and whenever paragraph events are missing", () => {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { assembleMeterAttachment } from "./chat/meterSession";
 import { mapBlocks } from "../shared/blocks";
 import { SHAPE_NOTE } from "../shared/extract/shapeText";
@@ -3616,30 +3616,23 @@ describe("watchParagraphEdits", () => {
     };
   }
 
-  it("debounces paragraph edits and skips the subscription on older Word", async () => {
+  it("forwards each paragraph edit and skips the subscription on older Word", async () => {
     const old = installEvents(false);
     const skipped = await watchParagraphEdits(() => undefined);
     expect(old.calls).toEqual([]);
     await skipped();
 
-    vi.useFakeTimers();
-    try {
-      const events = installEvents(true);
-      let edits = 0;
-      const cleanup = await watchParagraphEdits(() => {
-        edits += 1;
-      });
-      expect(events.calls).toEqual(["added", "changed", "deleted"]);
-      await events.fire("changed");
-      await events.fire("added");
-      expect(edits).toBe(0);
-      await vi.advanceTimersByTimeAsync(300);
-      expect(edits).toBe(1);
-      await cleanup();
-      expect(events.removed).toEqual(["added", "changed", "deleted"]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const events = installEvents(true);
+    let edits = 0;
+    const cleanup = await watchParagraphEdits(() => {
+      edits += 1;
+    });
+    expect(events.calls).toEqual(["added", "changed", "deleted"]);
+    await events.fire("changed");
+    await events.fire("added");
+    expect(edits).toBe(2);
+    await cleanup();
+    expect(events.removed).toEqual(["added", "changed", "deleted"]);
   });
 });
 

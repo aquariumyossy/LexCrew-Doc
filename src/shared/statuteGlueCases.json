@@ -400,5 +400,105 @@
       { "law": "民法", "key": "709" },
       { "law": "民法", "key": "710" }
     ]
+  },
+  {
+    "id": "paren-period-same",
+    "text": "（民法第709条、第710条。以下同じ。）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "paren-period-defined",
+    "text": "（民法第709条及び第710条。以下「不法行為規定」という。）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "paren-period-then-outer",
+    "text": "民法第709条（会社法第2条、第3条。以下同じ。）及び第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2" },
+      { "law": "会社法", "key": "3" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "paren-bang",
+    "text": "（民法第709条、第710条！）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "unclosed-newline-douhou",
+    "text": "民法第709条（会社法第2条を除く。\n同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "quote-second-citation",
+    "text": "民法第709条「会社法第2条及び同法第3条を参照。」",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2", "label": "要確認", "reasonHas": "引用" },
+      { "law": "会社法", "key": "3", "label": "要確認", "reasonHas": "引用" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "quote-stands-alone",
+    "text": "「民法第709条及び同法第710条」",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "houritsu-kojin",
+    "text": "個人情報の保護に関する法律第2条",
+    "rows": [{ "law": "個人情報の保護に関する法律", "key": "2" }]
+  },
+  {
+    "id": "houritsu-mail",
+    "text": "特定電子メールの送信の適正化等に関する法律第2条",
+    "rows": [{ "law": "特定電子メールの送信の適正化等に関する法律", "key": "2" }]
+  },
+  {
+    "id": "houritsu-access",
+    "text": "不正アクセス行為の禁止等に関する法律第3条",
+    "rows": [{ "law": "不正アクセス行為の禁止等に関する法律", "key": "3" }]
+  },
+  {
+    "id": "houritsu-bango",
+    "text": "行政手続における特定の個人を識別するための番号の利用等に関する法律第2条",
+    "rows": [{ "law": "行政手続における特定の個人を識別するための番号の利用等に関する法律", "key": "2" }]
+  },
+  {
+    "id": "paren-names-company",
+    "text": "民法第709条（会社法の適用を除く。）及び同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "paren-names-product",
+    "text": "民法第709条（製造物責任法の適用がある場合を除く。）及び同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
   }
 ]

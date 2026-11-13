@@ -84,7 +84,7 @@ type EnumFrame = {
   suppl: boolean;
 };
 
-type OpenQuote = { outer: string | null; sawOther: boolean };
+type OpenQuote = { outer: string | null; sawOther: boolean; marksInner: boolean };
 
 export function markUnverified(answer: string, verified: VerifiedCite[]): string {
   const chars = Array.from(answer);
@@ -129,7 +129,11 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
       const c = chars[seen];
       if (c === "「") {
         const frame = stack[stack.length - 1];
-        quotes.push({ outer: frame?.law ? lawKey(frame.law) : null, sawOther: false });
+        quotes.push({
+          outer: frame?.law ? lawKey(frame.law) : null,
+          sawOther: false,
+          marksInner: Boolean(frame?.law),
+        });
         lastQuote = { at: seen, open: true };
       } else if (c === "」") {
         const quote = quotes.pop();
@@ -140,6 +144,14 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
           }
         }
         lastQuote = { at: seen, open: false };
+      } else if (quotes.length === 0 && isLineBreak(c)) {
+        while (stack.length > 1) {
+          absorbClosedFrame(stack);
+        }
+        const frame = stack[stack.length - 1];
+        if (frame) {
+          frame.prevEnd = seen + 1;
+        }
       } else if (quotes.length === 0 && (c === "（" || c === "(")) {
         const outer = stack[stack.length - 1];
         stack.push({
@@ -154,23 +166,13 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
           suppl: false,
         });
       } else if (quotes.length === 0 && (c === "）" || c === ")") && stack.length > 1) {
-        const inner = stack.pop();
-        const outer = stack[stack.length - 1];
-        if (inner && outer) {
-          if (inner.sawOther) {
-            outer.ambiguous = true;
-            outer.sawOther = true;
-          } else if (inner.named) {
-            if (inner.douhou) {
-              outer.douhou = inner.douhou;
-            }
-            if (outer.law == null && inner.law) {
-              outer.law = inner.law;
-            }
-            outer.named = true;
-            if (outer.openedWith && outer.law && lawKey(outer.law) !== outer.openedWith) {
-              outer.sawOther = true;
-            }
+        const openAt = stack[stack.length - 1]?.openAt;
+        const outerLaw = stack[stack.length - 2]?.law ?? null;
+        absorbClosedFrame(stack);
+        if (openAt != null && parenTextNamesOther(chars, openAt, seen, outerLaw)) {
+          const frame = stack[stack.length - 1];
+          if (frame) {
+            frame.ambiguous = true;
           }
         }
       }
@@ -227,7 +229,13 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
         remember(frame, found);
         frame.suppl = span.suppl;
         name = found;
-      } else if (window.endsWith("憲法") || window.endsWith("法") || window.endsWith("令") || window.endsWith("規則")) {
+      } else if (
+        window.endsWith("法律") ||
+        window.endsWith("憲法") ||
+        window.endsWith("法") ||
+        window.endsWith("令") ||
+        window.endsWith("規則")
+      ) {
         remember(frame, window);
         frame.suppl = span.suppl;
         name = window;
@@ -251,8 +259,7 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
       }
       continue;
     }
-    const quoteOpen =
-      accepted > 0 && lastQuote !== null && lastQuote.open && lastQuote.at >= stack[0].prevEnd;
+    const quoteOpen = quotes.some((quote) => quote.marksInner);
     accepted += 1;
     if (quoteOpen) {
       if (!alreadyMarked(chars, span.end)) {
@@ -619,6 +626,7 @@ function lawKey(name: string): string {
 
 function looksLikeLawName(name: string): boolean {
   return (
+    name.endsWith("法律") ||
     name.endsWith("憲法") ||
     name.endsWith("法") ||
     name.endsWith("令") ||
@@ -739,6 +747,48 @@ function matchingClose(chars: string[], openAt: number, limit: number): number |
   return null;
 }
 
+function isLineBreak(c: string): boolean {
+  return c === "\n" || c === "\r" || c === "\u000b" || c === "\u2028" || c === "\u2029";
+}
+
+function absorbClosedFrame(stack: EnumFrame[]): void {
+  if (stack.length <= 1) {
+    return;
+  }
+  const inner = stack.pop();
+  const outer = stack[stack.length - 1];
+  if (!inner || !outer) {
+    return;
+  }
+  if (inner.sawOther) {
+    outer.ambiguous = true;
+    outer.sawOther = true;
+  } else if (inner.named) {
+    if (inner.douhou) {
+      outer.douhou = inner.douhou;
+    }
+    if (outer.law == null && inner.law) {
+      outer.law = inner.law;
+    }
+    outer.named = true;
+    if (outer.openedWith && outer.law && lawKey(outer.law) !== outer.openedWith) {
+      outer.sawOther = true;
+    }
+  }
+}
+
+function parenTextNamesOther(chars: string[], openAt: number, closeAt: number, outerLaw: string | null): boolean {
+  if (!outerLaw || closeAt <= openAt + 1) {
+    return false;
+  }
+  const inner = chars.slice(openAt + 1, closeAt).join("");
+  if (isPromulgation(inner) || isAbbreviationNote(inner)) {
+    return false;
+  }
+  const mentioned = latestLawMention(inner);
+  return Boolean(mentioned && lawKey(mentioned) !== lawKey(outerLaw));
+}
+
 function parenClosesInSentence(chars: string[], openAt: number): boolean {
   let depth = 0;
   let quote = false;
@@ -766,7 +816,7 @@ function parenClosesInSentence(chars: string[], openAt: number): boolean {
       }
       continue;
     }
-    if (depth === 1 && isHardBoundary(c)) {
+    if (depth === 1 && isLineBreak(c)) {
       return false;
     }
   }

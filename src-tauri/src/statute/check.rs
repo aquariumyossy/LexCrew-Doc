@@ -268,6 +268,16 @@ fn judge(
         hit.reason = "未取得（オフライン）".into();
         return hit;
     }
+    if !online {
+        if let Some(row) = local.clone() {
+            let known_amendment = db.remote_as_of(&law.law_id).ok().flatten().is_some_and(|remote| {
+                crate::statute::refresh::revision_is_newer(&remote, &law.as_of)
+            });
+            if known_amendment {
+                return stale_amendment(hit, &row, "改正あり・最新本文を取得できず（オフライン）");
+            }
+        }
+    }
     let fetched = if online {
         if cancel_requested() {
             hit.reason = "照合を中止しました。".into();
@@ -590,6 +600,8 @@ struct Frame {
 struct OpenQuote {
     outer: Option<Current>,
     saw_other: bool,
+    /// This 「 opened after a citation, so every article inside it is unfinished quotation.
+    marks_inner: bool,
 }
 
 fn same_current(left: &Current, right: &Current) -> bool {
@@ -603,12 +615,66 @@ fn same_current(left: &Current, right: &Current) -> bool {
 /// Parentheses get their own enumeration. Headings, list markers, and
 /// promulgation parentheses push and pop before the next article, so the
 /// outer anchor is unchanged. Parentheses inside 「」 are not structure.
+fn is_line_break(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{000B}' | '\u{2028}' | '\u{2029}')
+}
+
+fn absorb_closed_frame(stack: &mut Vec<Frame>) {
+    if stack.len() <= 1 {
+        return;
+    }
+    let inner = stack.pop().unwrap();
+    let Some(outer) = stack.last_mut() else {
+        return;
+    };
+    if inner.saw_other_law {
+        outer.ambiguous = true;
+        outer.saw_other_law = true;
+    } else if inner.named {
+        if outer.law.is_none() {
+            outer.law = inner.law.clone();
+        }
+        if inner.douhou.is_some() {
+            outer.douhou = inner.douhou;
+        }
+        outer.named = true;
+        if let (Some(opened), Some(law)) = (&outer.opened_with, &outer.law) {
+            if !same_current(opened, law) {
+                outer.saw_other_law = true;
+            }
+        }
+    }
+}
+
+fn paren_text_names_other(
+    db: &StatuteDb,
+    chars: &[char],
+    open_at: usize,
+    close_at: usize,
+    outer: Option<&Current>,
+) -> bool {
+    let Some(Current::Law(outer)) = outer else {
+        return false;
+    };
+    if close_at <= open_at + 1 {
+        return false;
+    }
+    let inner: String = chars[open_at + 1..close_at].iter().collect();
+    if is_promulgation(&inner) || is_abbreviation_note(&inner) {
+        return false;
+    }
+    let Some(found) = db.rightmost_law(&inner).ok().flatten() else {
+        return false;
+    };
+    found.law_id != outer.law_id
+}
+
 fn sync_parens(
+    db: &StatuteDb,
     stack: &mut Vec<Frame>,
     quotes: &mut Vec<OpenQuote>,
     chars: &[char],
     seen: &mut usize,
-    last_quote: &mut Option<(usize, bool)>,
     until: usize,
 ) {
     let until = until.min(chars.len());
@@ -616,11 +682,12 @@ fn sync_parens(
         let c = chars[*seen];
         if c == '「' {
             let outer = stack.last().and_then(|frame| frame.law.clone());
+            let marks_inner = stack.last().is_some_and(|frame| frame.law.is_some());
             quotes.push(OpenQuote {
                 outer,
                 saw_other: false,
+                marks_inner,
             });
-            *last_quote = Some((*seen, true));
         } else if c == '」' {
             if let Some(quote) = quotes.pop() {
                 if quote.saw_other {
@@ -629,7 +696,14 @@ fn sync_parens(
                     }
                 }
             }
-            *last_quote = Some((*seen, false));
+        } else if quotes.is_empty() && is_line_break(c) {
+            while stack.len() > 1 {
+                absorb_closed_frame(stack);
+            }
+            // The next citation must not read a law name out of the abandoned parenthesis.
+            if let Some(frame) = stack.last_mut() {
+                frame.prev_end = *seen + 1;
+            }
         } else if quotes.is_empty() && (c == '（' || c == '(') {
             let (douhou, opened_with, ambiguous) = match stack.last() {
                 Some(frame) => (frame.douhou.clone(), frame.law.clone(), frame.ambiguous),
@@ -646,25 +720,16 @@ fn sync_parens(
                 ambiguous,
             });
         } else if quotes.is_empty() && (c == '）' || c == ')') && stack.len() > 1 {
-            let inner = stack.pop().unwrap();
-            if let Some(outer) = stack.last_mut() {
-                if inner.saw_other_law {
-                    // The parenthesis named a different law than the one outside.
-                    // 同法 after the close does not choose either of them.
-                    outer.ambiguous = true;
-                    outer.saw_other_law = true;
-                } else if inner.named {
-                    if outer.law.is_none() {
-                        outer.law = inner.law.clone();
-                    }
-                    if inner.douhou.is_some() {
-                        outer.douhou = inner.douhou;
-                    }
-                    outer.named = true;
-                    if let (Some(opened), Some(law)) = (&outer.opened_with, &outer.law) {
-                        if !same_current(opened, law) {
-                            outer.saw_other_law = true;
-                        }
+            let open_at = stack.last().and_then(|frame| frame.open_at);
+            let outer_law = stack
+                .get(stack.len().saturating_sub(2))
+                .and_then(|frame| frame.law.clone());
+            let close_at = *seen;
+            absorb_closed_frame(stack);
+            if let Some(open_at) = open_at {
+                if paren_text_names_other(db, chars, open_at, close_at, outer_law.as_ref()) {
+                    if let Some(frame) = stack.last_mut() {
+                        frame.ambiguous = true;
                     }
                 }
             }
@@ -702,7 +767,9 @@ fn paren_closes_in_sentence(chars: &[char], open_at: usize) -> bool {
             }
             continue;
         }
-        if depth == 1 && is_hard_boundary(c) {
+        // 。 and ！ inside the parenthesis are not a missing close.
+        // A line break or the end of the text is.
+        if depth == 1 && is_line_break(c) {
             return false;
         }
     }
@@ -743,18 +810,10 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
     }];
     let mut quotes: Vec<OpenQuote> = Vec::new();
     let mut seen = 0usize;
-    let mut last_quote: Option<(usize, bool)> = None;
     let mut raws = Vec::new();
     for (index, span) in spans.iter().enumerate() {
         let next = spans.get(index + 1).map(|s| s.start).unwrap_or(chars.len());
-        sync_parens(
-            &mut stack,
-            &mut quotes,
-            &chars,
-            &mut seen,
-            &mut last_quote,
-            span.start,
-        );
+        sync_parens(db, &mut stack, &mut quotes, &chars, &mut seen, span.start);
         let frame_i = stack.len() - 1;
         let from = stack[frame_i].prev_end.min(span.start);
         let between: String = chars[from..span.start].iter().collect();
@@ -856,8 +915,7 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             }
         });
         let quote_unread = quote.is_none() && quote_nearby(&chars, clause.end, next);
-        let inside_quote = !raws.is_empty()
-            && last_quote.is_some_and(|(pos, open)| open && pos >= stack[0].prev_end);
+        let inside_quote = quotes.iter().any(|quote| quote.marks_inner);
         let citation = if dou || window.is_none() {
             if let Some(law) = law.as_ref() {
                 format!(
@@ -959,7 +1017,8 @@ fn is_deleted_body(body: &str) -> bool {
 }
 
 fn looks_like_law(text: &str) -> bool {
-    text.ends_with('法')
+    text.ends_with("法律")
+        || text.ends_with('法')
         || text.ends_with('令')
         || text.ends_with("規則")
         || text.ends_with("憲法")
@@ -2687,6 +2746,26 @@ mod tests {
                 "{hit:?}"
             );
         }
+
+        let offline_known = check_text(
+            &newer(&[article("709", "第709条", "古い709")]),
+            &OfflineEgov,
+            "民法第709条",
+            "2026-11-13",
+            false,
+        );
+        assert_eq!(offline_known[0].label, "要確認", "{offline_known:?}");
+        assert!(
+            offline_known[0]
+                .reason
+                .contains("改正あり・最新本文を取得できず（オフライン）"),
+            "{offline_known:?}"
+        );
+        let plain = StatuteDb::open_memory().unwrap();
+        minpo(&plain, &[article("709", "第709条", "本文")]);
+        let offline_unknown = check_text(&plain, &OfflineEgov, "民法第709条", "2026-11-13", false);
+        assert_eq!(offline_unknown[0].label, "一致", "{offline_unknown:?}");
+        assert_eq!(offline_unknown[0].offline_note, OFFLINE_NOTE);
     }
 
     #[test]

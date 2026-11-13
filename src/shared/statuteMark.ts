@@ -77,25 +77,49 @@ type EnumFrame = {
   openAt: number | null;
   law: string | null;
   douhou: string | null;
+  openedWith: string | null;
   named: boolean;
+  sawOther: boolean;
+  ambiguous: boolean;
   suppl: boolean;
 };
+
+type OpenQuote = { outer: string | null; sawOther: boolean };
 
 export function markUnverified(answer: string, verified: VerifiedCite[]): string {
   const chars = Array.from(answer);
   const spans = articleSpans(answer);
   const inserts: number[] = [];
   const stack: EnumFrame[] = [
-    { prevEnd: 0, openAt: null, law: null, douhou: null, named: false, suppl: false },
+    {
+      prevEnd: 0,
+      openAt: null,
+      law: null,
+      douhou: null,
+      openedWith: null,
+      named: false,
+      sawOther: false,
+      ambiguous: false,
+      suppl: false,
+    },
   ];
+  const quotes: OpenQuote[] = [];
   let seen = 0;
-  let quoting = false;
   let lastQuote: { at: number; open: boolean } | null = null;
   let accepted = 0;
   const remember = (frame: EnumFrame, name: string) => {
+    const key = lawKey(name);
+    if (frame.openedWith && key !== frame.openedWith) {
+      frame.sawOther = true;
+    }
+    const quote = quotes[quotes.length - 1];
+    if (quote?.outer && key !== quote.outer) {
+      quote.sawOther = true;
+    }
     frame.law = name;
     frame.douhou = name;
     frame.named = true;
+    frame.ambiguous = false;
   };
   for (const span of spans) {
     if (span.start > chars.length || span.end > chars.length || span.start > span.end) {
@@ -104,30 +128,49 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     while (seen < span.start && seen < chars.length) {
       const c = chars[seen];
       if (c === "「") {
-        quoting = true;
+        const frame = stack[stack.length - 1];
+        quotes.push({ outer: frame?.law ? lawKey(frame.law) : null, sawOther: false });
         lastQuote = { at: seen, open: true };
       } else if (c === "」") {
-        quoting = false;
+        const quote = quotes.pop();
+        if (quote?.sawOther) {
+          const frame = stack[stack.length - 1];
+          if (frame) {
+            frame.ambiguous = true;
+          }
+        }
         lastQuote = { at: seen, open: false };
-      } else if (!quoting && (c === "（" || c === "(")) {
+      } else if (quotes.length === 0 && (c === "（" || c === "(")) {
         const outer = stack[stack.length - 1];
         stack.push({
           prevEnd: seen + 1,
           openAt: seen,
           law: null,
-          douhou: outer.douhou,
+          douhou: outer?.douhou ?? null,
+          openedWith: outer?.law ? lawKey(outer.law) : null,
           named: false,
+          sawOther: false,
+          ambiguous: outer?.ambiguous ?? false,
           suppl: false,
         });
-      } else if (!quoting && (c === "）" || c === ")") && stack.length > 1) {
+      } else if (quotes.length === 0 && (c === "）" || c === ")") && stack.length > 1) {
         const inner = stack.pop();
         const outer = stack[stack.length - 1];
-        if (inner?.named && outer) {
-          if (inner.douhou) {
-            outer.douhou = inner.douhou;
-          }
-          if (outer.law == null && inner.law) {
-            outer.law = inner.law;
+        if (inner && outer) {
+          if (inner.sawOther) {
+            outer.ambiguous = true;
+            outer.sawOther = true;
+          } else if (inner.named) {
+            if (inner.douhou) {
+              outer.douhou = inner.douhou;
+            }
+            if (outer.law == null && inner.law) {
+              outer.law = inner.law;
+            }
+            outer.named = true;
+            if (outer.openedWith && outer.law && lawKey(outer.law) !== outer.openedWith) {
+              outer.sawOther = true;
+            }
           }
         }
       }
@@ -147,6 +190,14 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
       enumerated = false;
     }
     const inherited = dou || enumerated;
+    if (dou && frame.ambiguous) {
+      if (!alreadyMarked(chars, span.end)) {
+        inserts.push(span.end);
+      }
+      frame.prevEnd = span.end;
+      accepted += 1;
+      continue;
+    }
     const target = dou ? frame.douhou : frame.law;
     let name: string | null;
     if (!span.suppl && !dou && !enumerated && (window === null || !looksLikeLawName(window))) {
@@ -560,6 +611,10 @@ function sameLawAlias(chars: string[], openAt: number, floor: number, inner: str
   const outer = resolveCatalog(preceding);
   const innerLaw = resolveCatalog(inner.trim());
   return Boolean(outer && innerLaw && outer.id === innerLaw.id);
+}
+
+function lawKey(name: string): string {
+  return resolveCatalog(name)?.id ?? name;
 }
 
 function looksLikeLawName(name: string): boolean {

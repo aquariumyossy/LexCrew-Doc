@@ -56,6 +56,8 @@ struct Raw {
     quote: Option<String>,
     quote_unread: bool,
     inside_quote: bool,
+    /// 同法 after a paren or quote that named a different law.
+    ambiguous_douhou: bool,
     suppl: bool,
     schedule: bool,
     anchor: String,
@@ -224,6 +226,10 @@ fn judge(
         anchor: raw.anchor,
         occurrence,
     };
+    if raw.ambiguous_douhou {
+        hit.reason = "同法の指す法令が曖昧".into();
+        return hit;
+    }
     if raw.bare_douhou {
         hit.reason = "同法の指す法令が分かりません。".into();
         return hit;
@@ -569,10 +575,29 @@ struct Frame {
     open_at: Option<usize>,
     /// Law a joined bare article inherits. Fresh parentheses start with none.
     law: Option<Current>,
-    /// What 同法 means here. Starts as the outer last named law.
+    /// What 同法 means here, until a conflicting close makes it ambiguous.
     douhou: Option<Current>,
-    /// A law was named in this frame, so 同法 bubbles out when the parenthesis closes.
+    /// Law already in force when this parenthesis opened.
+    opened_with: Option<Current>,
+    /// A law was named in this frame.
     named: bool,
+    /// This frame named a law other than `opened_with`.
+    saw_other_law: bool,
+    /// 同法 here must not be resolved to either candidate.
+    ambiguous: bool,
+}
+
+struct OpenQuote {
+    outer: Option<Current>,
+    saw_other: bool,
+}
+
+fn same_current(left: &Current, right: &Current) -> bool {
+    match (left, right) {
+        (Current::Law(left), Current::Law(right)) => left.law_id == right.law_id,
+        (Current::Historical(left), Current::Historical(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Parentheses get their own enumeration. Headings, list markers, and
@@ -580,9 +605,9 @@ struct Frame {
 /// outer anchor is unchanged. Parentheses inside 「」 are not structure.
 fn sync_parens(
     stack: &mut Vec<Frame>,
+    quotes: &mut Vec<OpenQuote>,
     chars: &[char],
     seen: &mut usize,
-    quoting: &mut bool,
     last_quote: &mut Option<(usize, bool)>,
     until: usize,
 ) {
@@ -590,29 +615,56 @@ fn sync_parens(
     while *seen < until {
         let c = chars[*seen];
         if c == '「' {
-            *quoting = true;
+            let outer = stack.last().and_then(|frame| frame.law.clone());
+            quotes.push(OpenQuote {
+                outer,
+                saw_other: false,
+            });
             *last_quote = Some((*seen, true));
         } else if c == '」' {
-            *quoting = false;
+            if let Some(quote) = quotes.pop() {
+                if quote.saw_other {
+                    if let Some(frame) = stack.last_mut() {
+                        frame.ambiguous = true;
+                    }
+                }
+            }
             *last_quote = Some((*seen, false));
-        } else if !*quoting && (c == '（' || c == '(') {
-            let douhou = stack.last().and_then(|frame| frame.douhou.clone());
+        } else if quotes.is_empty() && (c == '（' || c == '(') {
+            let (douhou, opened_with, ambiguous) = match stack.last() {
+                Some(frame) => (frame.douhou.clone(), frame.law.clone(), frame.ambiguous),
+                None => (None, None, false),
+            };
             stack.push(Frame {
                 prev_end: *seen + 1,
                 open_at: Some(*seen),
                 law: None,
                 douhou,
+                opened_with,
                 named: false,
+                saw_other_law: false,
+                ambiguous,
             });
-        } else if !*quoting && (c == '）' || c == ')') && stack.len() > 1 {
+        } else if quotes.is_empty() && (c == '）' || c == ')') && stack.len() > 1 {
             let inner = stack.pop().unwrap();
-            if inner.named {
-                if let Some(outer) = stack.last_mut() {
-                    outer.douhou = inner.douhou;
-                    // A bare 第N条 after the close inherits this law only when
-                    // the outer citation had none. An outer law stays put (M3).
+            if let Some(outer) = stack.last_mut() {
+                if inner.saw_other_law {
+                    // The parenthesis named a different law than the one outside.
+                    // 同法 after the close does not choose either of them.
+                    outer.ambiguous = true;
+                    outer.saw_other_law = true;
+                } else if inner.named {
                     if outer.law.is_none() {
-                        outer.law = inner.law;
+                        outer.law = inner.law.clone();
+                    }
+                    if inner.douhou.is_some() {
+                        outer.douhou = inner.douhou;
+                    }
+                    outer.named = true;
+                    if let (Some(opened), Some(law)) = (&outer.opened_with, &outer.law) {
+                        if !same_current(opened, law) {
+                            outer.saw_other_law = true;
+                        }
                     }
                 }
             }
@@ -657,10 +709,23 @@ fn paren_closes_in_sentence(chars: &[char], open_at: usize) -> bool {
     false
 }
 
-fn remember_law(frame: &mut Frame, current: Current) {
+fn remember_law(frame: &mut Frame, current: Current, quotes: &mut [OpenQuote]) {
+    if let Some(opened) = &frame.opened_with {
+        if !same_current(opened, &current) {
+            frame.saw_other_law = true;
+        }
+    }
+    if let Some(quote) = quotes.last_mut() {
+        if let Some(outer) = &quote.outer {
+            if !same_current(outer, &current) {
+                quote.saw_other = true;
+            }
+        }
+    }
     frame.douhou = Some(current.clone());
     frame.law = Some(current);
     frame.named = true;
+    frame.ambiguous = false;
 }
 
 fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
@@ -671,19 +736,22 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
         open_at: None,
         law: None,
         douhou: None,
+        opened_with: None,
         named: false,
+        saw_other_law: false,
+        ambiguous: false,
     }];
+    let mut quotes: Vec<OpenQuote> = Vec::new();
     let mut seen = 0usize;
-    let mut quoting = false;
     let mut last_quote: Option<(usize, bool)> = None;
     let mut raws = Vec::new();
     for (index, span) in spans.iter().enumerate() {
         let next = spans.get(index + 1).map(|s| s.start).unwrap_or(chars.len());
         sync_parens(
             &mut stack,
+            &mut quotes,
             &chars,
             &mut seen,
-            &mut quoting,
             &mut last_quote,
             span.start,
         );
@@ -692,9 +760,13 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
         let between: String = chars[from..span.start].iter().collect();
         let visible = gap_core(&chars[from..span.start]);
         if let Some(mention) = db.rightmost_law(&visible).ok().flatten() {
-            remember_law(&mut stack[frame_i], Current::Law(mention));
+            remember_law(&mut stack[frame_i], Current::Law(mention), &mut quotes);
         } else if let Some(name) = historical_mention(&visible) {
-            remember_law(&mut stack[frame_i], Current::Historical(name));
+            remember_law(
+                &mut stack[frame_i],
+                Current::Historical(name),
+                &mut quotes,
+            );
         }
         let window = law_window(db, &chars, span.start, from);
         let mut enumerated = window.is_none() && enumeration_gap(&between);
@@ -714,12 +786,15 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
                 continue;
             }
         }
+        let ambiguous_douhou = dou && stack[frame_i].ambiguous;
         let inherit = if dou {
             stack[frame_i].douhou.clone()
         } else {
             stack[frame_i].law.clone()
         };
-        let (law, unresolved, bare_douhou, historical) = if dou || enumerated {
+        let (law, unresolved, bare_douhou, historical) = if ambiguous_douhou {
+            (None, String::new(), false, false)
+        } else if dou || enumerated {
             match inherit {
                 Some(Current::Law(law)) => (Some(law), String::new(), false, false),
                 Some(Current::Historical(name)) => (None, name, false, true),
@@ -735,12 +810,13 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
                 remember_law(
                     &mut stack[frame_i],
                     Current::Historical(window.text.clone()),
+                    &mut quotes,
                 );
                 (None, window.text.clone(), false, true)
             } else {
                 match db.match_law_in_text(&window.text) {
                     Ok(Some(law)) => {
-                        remember_law(&mut stack[frame_i], Current::Law(law.clone()));
+                        remember_law(&mut stack[frame_i], Current::Law(law.clone()), &mut quotes);
                         (Some(law), String::new(), false, false)
                     }
                     _ if looks_like_law(&window.text) => {
@@ -818,6 +894,7 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             quote,
             quote_unread,
             inside_quote,
+            ambiguous_douhou,
             suppl: span.suppl,
             schedule: false,
             anchor,
@@ -851,6 +928,7 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             quote: None,
             quote_unread: false,
             inside_quote: false,
+            ambiguous_douhou: false,
             suppl: false,
             schedule: true,
             anchor: anchor.clone(),

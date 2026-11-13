@@ -354,5 +354,51 @@
       { "law": "民法", "key": "709" },
       { "law": "民法", "key": "710" }
     ]
+  },
+  {
+    "id": "douhou-after-different-paren",
+    "text": "民法第709条（会社法第2条を除く。）及び同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "douhou-after-different-quote",
+    "text": "民法第709条「会社法第2条を参照。」及び同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "douhou-after-different-paren-company",
+    "text": "会社法第2条（民法第709条参照）。同法第3条",
+    "rows": [
+      { "law": "会社法", "key": "2" },
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "3", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "douhou-heading-unchanged",
+    "text": "民法第709条（不法行為）及び同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "douhou-inside-paren-unchanged",
+    "text": "（民法第709条、同法第710条）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
   }
 ]

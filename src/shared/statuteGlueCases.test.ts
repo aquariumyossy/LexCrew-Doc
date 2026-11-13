@@ -41,6 +41,16 @@ describe("statute glue cases", () => {
     expect(marked).not.toContain("（要確認）");
   });
 
+  it("marks 同法 after a conflicting parenthesis even when both laws were fetched", () => {
+    const marked = markUnverified("民法第709条（会社法第2条を除く。）及び同法第710条", [
+      { names: ["民法"], key: "709" },
+      { names: ["会社法"], key: "2" },
+      { names: ["民法"], key: "710" },
+      { names: ["会社法"], key: "710" },
+    ]);
+    expect(marked).toContain("同法第710条（要確認）");
+  });
+
   it("leaves an inner 同法 unmarked once every cited article was fetched", () => {
     const marked = markUnverified("民法第709条（会社法第2条及び同法第3条を除く。）及び第710条", [
       { names: ["民法"], key: "709" },

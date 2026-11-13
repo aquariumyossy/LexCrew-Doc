@@ -29,10 +29,13 @@ import {
   findInDocument,
   readDocumentText,
   readParagraphs,
+  releaseStatuteRange,
+  rememberStatuteRange,
   replaceParagraphs,
   turnSource,
   replaceQuote,
   replaceSelection,
+  selectTextOccurrence,
 } from "./word";
 
 /* global globalThis */
@@ -3633,6 +3636,51 @@ describe("watchParagraphEdits", () => {
     expect(edits).toBe(2);
     await cleanup();
     expect(events.removed).toEqual(["added", "changed", "deleted"]);
+  });
+});
+
+describe("statute jump range", () => {
+  it("keeps searching the selection that was checked", async () => {
+    const original = "民法第709条及び第710条";
+    let selectionText = original;
+    const searched: string[] = [];
+    const rangeFor = (text: string) => ({
+      text,
+      track: () => undefined,
+      untrack: () => undefined,
+      search: (needle: string) => {
+        searched.push(text);
+        const count = text.split(needle).length - 1;
+        return {
+          load: () => undefined,
+          items: Array.from({ length: count }, () => ({ select: () => undefined })),
+        };
+      },
+    });
+    const context = {
+      document: {
+        getSelection: () => rangeFor(selectionText),
+        body: rangeFor("本文全体"),
+      },
+      sync: async () => undefined,
+    };
+    (globalThis as unknown as { Word: unknown }).Word = {
+      run: (first: unknown, second?: (ctx: typeof context) => Promise<unknown>) => {
+        const batch = typeof first === "function" ? first : second;
+        return batch?.(context);
+      },
+    };
+    (globalThis as unknown as { Office: unknown }).Office = {
+      context: { host: "Word" },
+      HostType: { Word: "Word" },
+    };
+
+    await rememberStatuteRange("selection");
+    selectionText = "第710条だけが残った選択";
+    expect(await selectTextOccurrence("第709条", 0, "selection")).toBe(true);
+    expect(await selectTextOccurrence("第710条", 0, "selection")).toBe(true);
+    expect(searched).toEqual([original, original]);
+    await releaseStatuteRange();
   });
 });
 

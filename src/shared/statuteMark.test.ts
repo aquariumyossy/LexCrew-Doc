@@ -127,4 +127,32 @@ describe("markUnverified", () => {
     const old = markUnverified("旧民法第1条。", [verified(["民法"], "1")]);
     expect(old).toContain("（要確認）");
   });
+
+  it("inherits a bare article only inside an enumeration or 同法", () => {
+    const known = [verified(["民法"], "415"), verified(["民法"], "709"), verified(["民法"], "710"), verified(["民法"], "1")];
+    expect(markUnverified("民法第415条に基づき請求する。第1条の目的は契約の目的である。", known)).not.toContain(
+      "第1条（要確認）"
+    );
+    expect(markUnverified("民法第415条に基づき請求する。第1条の目的は契約の目的である。", known)).not.toContain("要確認");
+    expect(markUnverified("民法第709条及び第710条", known)).not.toContain("要確認");
+    const further = markUnverified("民法第709条。さらに第9999条", known);
+    expect(further).toContain("さらに第9999条");
+    expect(further).not.toContain("（要確認）");
+    const dou = markUnverified("民法第709条を適用する。同法第1条。", [verified(["民法"], "709")]);
+    expect(dou).toContain("同法第1条（要確認）");
+  });
+
+  it("marks 項 and 号 after the whole citation", () => {
+    const marked = markUnverified("民法第710条第1項はまだ確認していない。", [verified(["民法"], "709")]);
+    expect(marked).toContain("第710条第1項（要確認）");
+    expect(marked).not.toContain("第710条（要確認）");
+  });
+
+  it("accepts a hiragana particle in front of a law name", () => {
+    const known = [verified(["民法"], "709"), verified(["保険法"], "1")];
+    expect(markUnverified("について民法第709条", known)).not.toContain("要確認");
+    expect(markUnverified("契約による民法第709条", known)).not.toContain("要確認");
+    expect(markUnverified("損害保険法第1条", known)).toContain("（要確認）");
+    expect(markUnverified("旧民法第709条", known)).toContain("（要確認）");
+  });
 });

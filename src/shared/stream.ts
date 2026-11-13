@@ -1,5 +1,5 @@
 import { Completion, Usage, parseCompletion, stripThinking } from "./stripThinking";
-import { ToolCall } from "./tools";
+import { syntheticToolId, ToolCall } from "./tools";
 
 export type StreamSnapshot = {
   content: string;
@@ -131,8 +131,8 @@ export class StreamAccumulator {
     const toolCalls: ToolCall[] = this.tools
       .slice()
       .sort((a, b) => a.index - b.index)
-      .map((tool, index) => ({
-        id: tool.id.trim() || `call_${index}`,
+      .map((tool) => ({
+        id: tool.id.trim() || syntheticToolId(),
         type: "function" as const,
         function: { name: tool.name, arguments: tool.arguments },
       }))
@@ -188,7 +188,7 @@ export class StreamAccumulator {
     this.mergeTools([
       {
         index: 0,
-        id: "call_0",
+        id: syntheticToolId(),
         function: fn,
       },
     ]);

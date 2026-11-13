@@ -10,7 +10,7 @@ mod refresh;
 mod store;
 mod xmlparse;
 
-pub use check::check_text;
+pub use check::{check_text, set_check_cancel};
 pub use cite::{cap_statute_tool_text, format_tool_result};
 pub use egov::{EgovFailure, EgovSource, LiveEgov, OfflineEgov};
 pub use lookup::{resolve_articles, resolve_without_refresh, ArticleQuery};

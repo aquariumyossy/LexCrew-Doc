@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DataRoot>
+  <Result>
+    <Code>0</Code>
+  </Result>
+  <ApplData>
+    <LawId>417AC0000000086</LawId>
+    <LawFullText>
+      <Law>
+        <LawNum>平成十七年法律第八十六号</LawNum>
+        <LawBody>
+          <LawTitle>会社法</LawTitle>
+          <MainProvision>
+            <!-- 2026-11-11 seed: 会社法第331条第1項第2号 is 「二　削除」 -->
+            <Article Num="331">
+              <ArticleTitle>第三百三十一条</ArticleTitle>
+              <Paragraph Num="1">
+                <ParagraphSentence>
+                  <Sentence>次に掲げる者は、取締役となることができない。</Sentence>
+                </ParagraphSentence>
+                <Item Num="1">
+                  <ItemTitle>一</ItemTitle>
+                  <ItemSentence>
+                    <Sentence>法人</Sentence>
+                  </ItemSentence>
+                </Item>
+                <Item Num="2">
+                  <ItemTitle>二</ItemTitle>
+                  <ItemSentence>
+                    <Sentence>削除</Sentence>
+                  </ItemSentence>
+                </Item>
+              </Paragraph>
+            </Article>
+            <!-- 2026-11-11 seed: 刑法第2条第1号 is 「一　削除」 -->
+            <Article Num="2">
+              <ArticleTitle>第二条</ArticleTitle>
+              <Paragraph Num="1">
+                <ParagraphSentence>
+                  <Sentence>この法律は、日本国外において次に掲げる罪を犯したすべての者に適用する。</Sentence>
+                </ParagraphSentence>
+                <Item Num="1">
+                  <ItemTitle>一</ItemTitle>
+                  <ItemSentence>
+                    <Sentence>削除</Sentence>
+                  </ItemSentence>
+                </Item>
+                <Item Num="2">
+                  <ItemTitle>二</ItemTitle>
+                  <ItemSentence>
+                    <Sentence>内乱の罪</Sentence>
+                  </ItemSentence>
+                </Item>
+              </Paragraph>
+            </Article>
+            <Article Num="9">
+              <ArticleTitle>第九条</ArticleTitle>
+              <Paragraph Num="1">
+                <ParagraphSentence>
+                  <Sentence>前文がある。</Sentence>
+                </ParagraphSentence>
+              </Paragraph>
+              <Paragraph Num="2">
+                <ParagraphSentence>
+                  <Sentence>２　削除</Sentence>
+                </ParagraphSentence>
+              </Paragraph>
+            </Article>
+          </MainProvision>
+        </LawBody>
+      </Law>
+    </LawFullText>
+  </ApplData>
+</DataRoot>

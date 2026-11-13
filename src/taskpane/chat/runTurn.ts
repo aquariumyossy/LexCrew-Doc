@@ -449,8 +449,8 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       return end(lastUsage);
     }
 
-    // Ids are `call_${index}` when the server omits them, so they repeat across
-    // rounds. Only results written for this round count as answering this round.
+    // Omitted ids become call_sN in the stream reader, so they do not repeat
+    // across rounds. Only results written for this round count as answering it.
     const answeredThisRound = new Set<string>();
     try {
       for (const call of completion.toolCalls) {

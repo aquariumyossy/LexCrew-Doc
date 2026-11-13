@@ -104,9 +104,9 @@ function trimLogged(options?: FitOptions): boolean {
  * has to see the snapshot before the turn ends.
  */
 /**
- * Name of the call this tool message answers. The server often omits ids, and
- * the client then reuses `call_${index}` every round, so a map of the whole
- * conversation would attach a later call's name to an earlier result. Only the
+ * Name of the call this tool message answers. Older transcripts repeat
+ * `call_0` across rounds, so a map of the whole conversation would attach a
+ * later call's name to an earlier result. Only the
  * assistant message immediately before this run of tool messages counts, and
  * the nth result with an id answers the nth call with that id.
  */
@@ -159,9 +159,9 @@ export function toChatMessages(stored: StoredMessage[]): ChatMessage[] {
 
 /**
  * A cancelled turn can leave an assistant `tool_calls` with no tool result,
- * and the server rejects that on the next request. `call_${index}` is reused
- * whenever the server omits ids, so a call is answered only by a tool message
- * with that id in the contiguous run immediately after that assistant message.
+ * and the server rejects that on the next request. Older transcripts reuse
+ * `call_${index}` when the server omitted ids, so a call is answered only by a
+ * tool message with that id in the contiguous run immediately after that assistant message.
  * A tool message with no matching call in that run is dropped. A complete
  * transcript is left as it was stored.
  */

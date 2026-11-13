@@ -2711,12 +2711,20 @@ export function describeToolCall(name: string, rawArguments: string): string {
   }
 }
 
+let syntheticToolSerial = 0;
+
+/** A tool id the server left blank. Unique for the life of the page, so two turns cannot share `call_0`. */
+export function syntheticToolId(): string {
+  syntheticToolSerial += 1;
+  return `call_s${syntheticToolSerial}`;
+}
+
 export function normalizeToolCalls(input: unknown): ToolCall[] {
   if (!Array.isArray(input)) {
     return [];
   }
   const calls: ToolCall[] = [];
-  input.forEach((item, index) => {
+  input.forEach((item) => {
     const row = asRecord(item);
     if (!row) {
       return;
@@ -2727,7 +2735,7 @@ export function normalizeToolCalls(input: unknown): ToolCall[] {
       return;
     }
     const args = fn && typeof fn.arguments === "string" ? fn.arguments : "";
-    const id = text(row, "id").trim() || `call_${index}`;
+    const id = text(row, "id").trim() || syntheticToolId();
     calls.push({ id, type: "function", function: { name, arguments: args } });
   });
   return calls;

@@ -4,6 +4,8 @@
 //! enabled, go through `resolve_without_refresh` and send only a law id and an
 //! article number.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::Serialize;
 
 use crate::statute::cite::ToolArticle;
@@ -46,7 +48,7 @@ struct Raw {
     display: String,
     paragraph: Option<u32>,
     item: Option<u32>,
-    item_branch: Option<u32>,
+    item_branch: Vec<u32>,
     clause_unread: bool,
     quote: Option<String>,
     quote_unread: bool,
@@ -67,6 +69,25 @@ pub fn check_text(
     online: bool,
 ) -> Vec<CheckHit> {
     check_text_opts(db, client, text, today, online, MAX_ONLINE, ONLINE_GAP_MS)
+}
+
+thread_local! {
+    static CHECK_CANCEL: std::cell::RefCell<Option<std::sync::Arc<AtomicBool>>> =
+        std::cell::RefCell::new(None);
+}
+
+fn cancel_requested() -> bool {
+    CHECK_CANCEL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    })
+}
+
+/// The button handler sets this for the duration of one check. The blocking
+/// loop stops calling e-Gov once the HTTP request is dropped.
+pub fn set_check_cancel(flag: Option<std::sync::Arc<AtomicBool>>) {
+    CHECK_CANCEL.with(|slot| *slot.borrow_mut() = flag);
 }
 
 pub fn check_text_opts(
@@ -132,26 +153,17 @@ impl EgovSource for LocalNames<'_> {
 }
 
 fn literal_occurrence(text: &str, anchor: &str, start_char: usize) -> usize {
-    if anchor.is_empty() {
+    if anchor.is_empty() || start_char == 0 {
         return 0;
     }
-    let chars: Vec<char> = text.chars().collect();
-    let needle: Vec<char> = anchor.chars().collect();
-    if needle.is_empty() {
-        return 0;
-    }
-    let mut count = 0usize;
-    let mut i = 0usize;
-    let limit = start_char.min(chars.len());
-    while i + needle.len() <= limit {
-        if chars[i..i + needle.len()] == needle[..] {
-            count += 1;
-            i += needle.len();
-        } else {
-            i += 1;
+    let mut bytes = 0usize;
+    for (seen, ch) in text.chars().enumerate() {
+        if seen >= start_char {
+            break;
         }
+        bytes += ch.len_utf8();
     }
-    count
+    text[..bytes.min(text.len())].matches(anchor).count()
 }
 
 fn judge(
@@ -209,14 +221,29 @@ fn judge(
         hit.reason = "削除された条です".into();
         return hit;
     }
-    if local.is_none() && law.source == "bundle" {
-        return number_miss(hit, "その条はありません。");
-    }
     if local.is_none() && !online {
+        // A missing row in the seed is not proof the article does not exist.
         hit.reason = "未取得（オフライン）".into();
         return hit;
     }
-    let fetched = if online {
+    let fetched = if let Some(row) = local.clone() {
+        Some(ToolArticle {
+            names: vec![law.name.clone()],
+            article_num: row.num,
+            heading: row.heading,
+            body: row.body,
+            as_of: row.as_of,
+            verified: true,
+            offline: !online,
+            note: String::new(),
+            law_query: law.name.clone(),
+            article_query: raw.display.clone(),
+        })
+    } else if online {
+        if cancel_requested() {
+            hit.reason = "照合を中止しました。".into();
+            return hit;
+        }
         if !budget.allow() {
             hit.reason = "件数が多いため未確認".into();
             return hit;
@@ -234,18 +261,7 @@ fn judge(
         .into_iter()
         .next()
     } else {
-        local.map(|row| ToolArticle {
-            names: vec![law.name.clone()],
-            article_num: row.num,
-            heading: row.heading,
-            body: row.body,
-            as_of: row.as_of,
-            verified: true,
-            offline: true,
-            note: String::new(),
-            law_query: law.name.clone(),
-            article_query: raw.display.clone(),
-        })
+        None
     };
     let Some(article) = fetched else {
         hit.reason = "条文を確認できませんでした。".into();
@@ -284,7 +300,7 @@ fn judge(
     } else {
         format!("（{}）\n{}", article.heading, article.body)
     };
-    let target = match clause_text(&article.body, raw.paragraph, raw.item, raw.item_branch) {
+    let target = match clause_text(&article.body, raw.paragraph, raw.item, &raw.item_branch) {
         Ok(text) => text,
         Err(ClauseMiss::Paragraph(n)) => {
             return number_miss(hit, &format!("第{n}項はありません。"));
@@ -292,10 +308,20 @@ fn judge(
         Err(ClauseMiss::Item(n)) => {
             return number_miss(hit, &format!("第{n}号はありません。"));
         }
-        Err(ClauseMiss::Branch(item, branch)) => {
-            return number_miss(hit, &format!("第{item}号の{branch}はありません。"));
+        Err(ClauseMiss::Branch(item, branches)) => {
+            let tail = branches
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("の");
+            return number_miss(hit, &format!("第{item}号の{tail}はありません。"));
         }
     };
+    if is_deleted_text(&target) {
+        hit.reason = "削除された項または号です".into();
+        hit.offline_note.clear();
+        return hit;
+    }
     if raw.quote_unread {
         hit.reason = "近くの引用を照合できませんでした。".into();
         return hit;
@@ -354,7 +380,7 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             current = Some(Current::Historical(name));
         }
         let window = law_window(&chars, span.start);
-        let inherit = current.is_some() && (window.is_none() || connector_gap(&between));
+        let enumerated = window.is_none() && enumeration_gap(&between);
         let dou = window.as_ref().is_some_and(|w| w.text == "同法");
         if let Some(window) = window.as_ref() {
             if window.text != "同法" && denied(&window.text) {
@@ -363,13 +389,26 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
                 continue;
             }
         }
-        let (law, unresolved, bare_douhou, historical) = if dou || (window.is_none() && inherit) {
+        let (law, unresolved, bare_douhou, historical) = if dou {
             match current.clone() {
                 Some(Current::Law(law)) => (Some(law), String::new(), false, false),
                 Some(Current::Historical(name)) => (None, name, false, true),
-                None if dou => (None, String::new(), true, false),
-                None => (None, String::new(), false, false),
+                None => (None, String::new(), true, false),
             }
+        } else if enumerated {
+            match current.clone() {
+                Some(Current::Law(law)) => (Some(law), String::new(), false, false),
+                Some(Current::Historical(name)) => (None, name, false, true),
+                None => {
+                    prev_end = span.end.min(chars.len());
+                    continue;
+                }
+            }
+        } else if window.is_none() {
+            // A bare 第N条 after a sentence or ordinary words is the contract's
+            // own article, not a statute citation.
+            prev_end = span.end.min(chars.len());
+            continue;
         } else if let Some(window) = window.as_ref() {
             if is_historical_name(&window.text) {
                 current = Some(Current::Historical(window.text.clone()));
@@ -395,12 +434,13 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             prev_end = span.end;
             continue;
         };
-        let clause = read_clause(&chars, span.end);
-        let anchor_start = window.as_ref().map(|w| w.start).unwrap_or(span.start);
+        let clause = read_clause(&chars, span.end, next);
+        let mut anchor_start = window.as_ref().map(|w| w.start).unwrap_or(span.start);
         let anchor_end = clause.end.max(span.end).min(chars.len());
+        anchor_start = anchor_start.min(anchor_end);
         let mut anchor: String = chars[anchor_start..anchor_end].iter().collect();
         if anchor.chars().count() > 80 {
-            let tail = clause_label(clause.paragraph, clause.item, clause.item_branch);
+            let tail = clause_label(clause.paragraph, clause.item, &clause.item_branch);
             anchor = format!("{}{}", span.display, tail);
         }
         let quote = quote_after(&chars, clause.end, next).or_else(|| {
@@ -417,14 +457,14 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
                     "{}{}{}",
                     law.name,
                     span.display,
-                    clause_label(clause.paragraph, clause.item, clause.item_branch)
+                    clause_label(clause.paragraph, clause.item, &clause.item_branch)
                 )
             } else if historical {
                 format!(
                     "{}{}{}",
                     unresolved,
                     span.display,
-                    clause_label(clause.paragraph, clause.item, clause.item_branch)
+                    clause_label(clause.paragraph, clause.item, &clause.item_branch)
                 )
             } else {
                 anchor.clone()
@@ -474,7 +514,7 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             display: anchor.clone(),
             paragraph: None,
             item: None,
-            item_branch: None,
+            item_branch: Vec::new(),
             clause_unread: false,
             quote: None,
             quote_unread: false,
@@ -488,7 +528,7 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
     raws
 }
 
-fn clause_label(paragraph: Option<u32>, item: Option<u32>, branch: Option<u32>) -> String {
+fn clause_label(paragraph: Option<u32>, item: Option<u32>, branches: &[u32]) -> String {
     let mut out = String::new();
     if let Some(n) = paragraph {
         out.push_str(&format!("第{n}項"));
@@ -496,7 +536,7 @@ fn clause_label(paragraph: Option<u32>, item: Option<u32>, branch: Option<u32>) 
     if let Some(n) = item {
         out.push_str(&format!("第{n}号"));
     }
-    if let Some(n) = branch {
+    for n in branches {
         out.push_str(&format!("の{n}"));
     }
     out
@@ -550,7 +590,11 @@ fn law_window(chars: &[char], cite_start: usize) -> Option<Window> {
     if start == end {
         return None;
     }
-    let text: String = chars[start..end].iter().collect();
+    let full: String = chars[start..end].iter().collect();
+    let peeled = crate::statute::store::law_name_after_particle(&full);
+    let shift = full.chars().count() - peeled.chars().count();
+    start += shift;
+    let text = peeled.to_string();
     if text.ends_with('条') || text.ends_with('項') || text.ends_with('号') {
         return None;
     }
@@ -607,7 +651,7 @@ fn denied(window: &str) -> bool {
     DENY_LAW_NAME.iter().any(|deny| name == *deny || window == *deny)
 }
 
-fn connector_gap(between: &str) -> bool {
+fn enumeration_gap(between: &str) -> bool {
     let chars: Vec<char> = between.chars().collect();
     let mut text = String::new();
     let mut i = 0usize;
@@ -627,25 +671,36 @@ fn connector_gap(between: &str) -> bool {
         }
         i += 1;
     }
-    is_connector(&text) || text == "同法" || text.ends_with("同法")
+    matches!(
+        text.as_str(),
+        "及び" | "および" | "並びに" | "ならびに" | "又は" | "または" | "若しくは" | "、" | "，" | "・"
+    )
 }
 
 fn is_connector(text: &str) -> bool {
-    matches!(
-        text,
-        "及び" | "および" | "又は" | "または" | "若しくは" | "並びに" | "と" | "、" | "，" | "・"
-    )
+    enumeration_gap(text)
 }
 
 struct ClauseRead {
     paragraph: Option<u32>,
     item: Option<u32>,
-    item_branch: Option<u32>,
+    item_branch: Vec<u32>,
     end: usize,
     unread: bool,
 }
 
-fn read_clause(chars: &[char], start: usize) -> ClauseRead {
+fn read_clause(chars: &[char], start: usize, limit: usize) -> ClauseRead {
+    let limit = limit.min(chars.len());
+    if start >= limit {
+        return ClauseRead {
+            paragraph: None,
+            item: None,
+            item_branch: Vec::new(),
+            end: limit,
+            unread: false,
+        };
+    }
+    let chars = &chars[..limit];
     let mut unread = false;
     let (paragraph, after_p) = match read_unit(chars, start, '項') {
         Some((n, end)) => (n, end),
@@ -663,22 +718,27 @@ fn read_clause(chars: &[char], start: usize) -> ClauseRead {
         }
         None => (None, after_p),
     };
-    let (item_branch, end) = if item.is_some() && chars.get(after_i) == Some(&'の') {
-        match take_numeral(chars, after_i + 1) {
-            Some((n, next)) => (Some(n), next),
-            None => {
-                unread = true;
-                (None, after_i)
+    let mut item_branch = Vec::new();
+    let mut end = after_i.min(chars.len());
+    if item.is_some() {
+        while chars.get(end) == Some(&'の') {
+            match take_numeral(chars, end + 1) {
+                Some((n, next)) => {
+                    item_branch.push(n);
+                    end = next.min(chars.len());
+                }
+                None => {
+                    unread = true;
+                    break;
+                }
             }
         }
-    } else {
-        (None, after_i)
-    };
+    }
     ClauseRead {
         paragraph,
         item,
         item_branch,
-        end,
+        end: end.min(chars.len()),
         unread,
     }
 }
@@ -747,8 +807,14 @@ fn take_numeral(chars: &[char], start: usize) -> Option<(u32, usize)> {
 }
 
 fn quote_after(chars: &[char], start: usize, limit: usize) -> Option<String> {
-    let mut i = start;
+    if start >= chars.len() {
+        return None;
+    }
+    let mut i = start.min(chars.len());
     let limit = limit.min(chars.len());
+    if i >= limit {
+        return None;
+    }
     while i < limit && chars[i].is_whitespace() {
         i += 1;
     }
@@ -772,7 +838,11 @@ fn quote_after(chars: &[char], start: usize, limit: usize) -> Option<String> {
         "と",
         "も",
     ];
-    let rest: String = chars[i..limit.min(i + 12)].iter().collect();
+    if i >= chars.len() {
+        return None;
+    }
+    let hi = limit.min(i.saturating_add(12)).max(i).min(chars.len());
+    let rest: String = chars[i..hi].iter().collect();
     for lead in LEADS {
         if rest.starts_with(lead) {
             i += lead.chars().count();
@@ -796,7 +866,13 @@ fn quote_after(chars: &[char], start: usize, limit: usize) -> Option<String> {
 }
 
 fn quote_nearby(chars: &[char], start: usize, limit: usize) -> bool {
+    if start >= chars.len() {
+        return false;
+    }
     let end = limit.min(start.saturating_add(48)).min(chars.len());
+    if start >= end {
+        return false;
+    }
     chars[start..end].contains(&'「')
 }
 
@@ -862,20 +938,20 @@ fn schedule_spans(chars: &[char]) -> Vec<(usize, usize)> {
 enum ClauseMiss {
     Paragraph(u32),
     Item(u32),
-    Branch(u32, u32),
+    Branch(u32, Vec<u32>),
 }
 
 struct Block {
     paragraph: u32,
     text: String,
-    items: Vec<(u32, Option<u32>, String)>,
+    items: Vec<(u32, Vec<u32>, String)>,
 }
 
 fn clause_text(
     body: &str,
     paragraph: Option<u32>,
     item: Option<u32>,
-    branch: Option<u32>,
+    branches: &[u32],
 ) -> Result<String, ClauseMiss> {
     if paragraph.is_none() && item.is_none() {
         return Ok(body.to_string());
@@ -889,10 +965,10 @@ fn clause_text(
         let Some((_, _, text)) = block
             .items
             .iter()
-            .find(|it| it.0 == n && it.1 == branch)
+            .find(|it| it.0 == n && it.1 == branches)
         else {
-            if branch.is_some() {
-                return Err(ClauseMiss::Branch(n, branch.unwrap_or(0)));
+            if !branches.is_empty() {
+                return Err(ClauseMiss::Branch(n, branches.to_vec()));
             }
             return Err(ClauseMiss::Item(n));
         };
@@ -984,7 +1060,7 @@ fn is_fw_digit(c: char) -> bool {
     c.is_ascii_digit() || ('０'..='９').contains(&c)
 }
 
-fn item_marker(line: &str) -> Option<(u32, Option<u32>, String)> {
+fn item_marker(line: &str) -> Option<(u32, Vec<u32>, String)> {
     let trimmed = line.trim_start();
     let chars: Vec<char> = trimmed.chars().collect();
     let mut i = 0usize;
@@ -1002,27 +1078,34 @@ fn item_marker(line: &str) -> Option<(u32, Option<u32>, String)> {
     if n == 0 || n > 999 {
         return None;
     }
-    let mut branch = None;
+    let mut branch = Vec::new();
     let mut k = i;
-    if chars.get(k) == Some(&'の') {
+    while chars.get(k) == Some(&'の') {
         let mut b = k + 1;
         let bstart = b;
         while b < chars.len() && is_numeral_char(chars[b]) {
             b += 1;
         }
-        if b > bstart {
-            let btok: String = chars[bstart..b].iter().collect();
-            if let Some(value) = parse_legal_numeral(&btok) {
-                branch = Some(value);
-                k = b;
-            }
+        if b == bstart {
+            break;
         }
+        let btok: String = chars[bstart..b].iter().collect();
+        let Some(value) = parse_legal_numeral(&btok) else {
+            break;
+        };
+        branch.push(value);
+        k = b;
     }
     if chars.get(k).is_none_or(|c| !c.is_whitespace()) {
         return None;
     }
     let rest: String = chars[k + 1..].iter().collect();
     Some((n, branch, rest.trim().to_string()))
+}
+
+fn is_deleted_text(text: &str) -> bool {
+    let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    flat == "削除" || flat == "（削除）"
 }
 
 pub fn quote_diff(quote: &str, article: &str) -> Option<String> {
@@ -1150,9 +1233,9 @@ mod tests {
         assert_eq!(hits.len(), 3, "{hits:?}");
         assert_eq!(hits[0].label, "一致");
         assert!(hits[0].citation.contains("民訴法"));
-        assert_eq!(hits[1].label, "番号違い", "{hits:?}");
+        assert_eq!(hits[1].label, "要確認", "{hits:?}");
         assert!(hits[1].citation.starts_with("民事訴訟法"), "{hits:?}");
-        assert_eq!(hits[1].reason, "その条はありません。");
+        assert_eq!(hits[1].reason, "未取得（オフライン）");
         assert_eq!(hits[2].label, "一致", "{hits:?}");
         assert!(hits[2].offline_note.contains("オフライン"), "{hits:?}");
 
@@ -1329,7 +1412,8 @@ mod tests {
         }
         let or = check_text(&db, &OfflineEgov, "民法第709条又は第9999条", "2026-11-13", false);
         assert_eq!(or[0].label, "一致", "{or:?}");
-        assert_eq!(or[1].label, "番号違い", "{or:?}");
+        assert_eq!(or[1].label, "要確認", "{or:?}");
+        assert_eq!(or[1].reason, "未取得（オフライン）");
     }
 
     #[test]
@@ -1394,5 +1478,247 @@ mod tests {
             0,
         );
         assert!(hits.iter().all(|hit| hit.reason.contains("件数が多い")), "{hits:?}");
+    }
+
+    #[test]
+    fn odd_citations_do_not_panic() {
+        for sample in [
+            "民法第709条第710条第1項",
+            "第1条",
+            "民法第415条第1項第2号の3の4の5",
+            "「」民法第",
+            "第条",
+            "民法第0条",
+            "同法第",
+            "民法第709条「",
+            "）民法第415条（",
+            "",
+            "第1条第2条第3条第4項第5号の2の99",
+            "民法第709条。さらに第9999条",
+        ] {
+            let hits = statuses(sample);
+            assert!(hits.len() < 20, "{sample} {hits:?}");
+        }
+    }
+
+    #[test]
+    fn bare_articles_inherit_only_inside_an_enumeration() {
+        let db = db();
+        seed(&db);
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2026-11-11",
+            "2026-11-11",
+            "bundle",
+            &["民法".into()],
+            &[
+                article("415", "第415条", BODY_415),
+                article("1", "第1条", "私権は、公共の福祉に適合しなければならない。"),
+                article("709", "第709条", "不法行為の本文。"),
+                article("710", "第710条", "財産以外の損害。"),
+            ],
+        )
+        .unwrap();
+        let sentence = check_text(
+            &db,
+            &OfflineEgov,
+            "民法第415条に基づき請求する。第1条の目的は契約の目的である。",
+            "2026-11-13",
+            false,
+        );
+        assert_eq!(sentence.len(), 1, "{sentence:?}");
+        assert!(sentence[0].citation.contains("415"), "{sentence:?}");
+
+        let both = check_text(&db, &OfflineEgov, "民法第709条及び第710条", "2026-11-13", false);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both.iter().all(|hit| hit.citation.contains("民法")), "{both:?}");
+        assert!(both.iter().all(|hit| hit.label == "一致"), "{both:?}");
+
+        let further = check_text(
+            &db,
+            &OfflineEgov,
+            "民法第709条。さらに第9999条",
+            "2026-11-13",
+            false,
+        );
+        assert_eq!(further.len(), 1, "{further:?}");
+        assert!(further[0].citation.contains("709"), "{further:?}");
+
+        let dou = check_text(&db, &OfflineEgov, "民法第709条を適用する。同法第1条。", "2026-11-13", false);
+        assert_eq!(dou.len(), 2, "{dou:?}");
+        assert!(dou[1].citation.starts_with("民法"), "{dou:?}");
+        assert!(dou[1].citation.contains("第1条"), "{dou:?}");
+        assert_eq!(dou[1].label, "一致", "{dou:?}");
+
+        let kept = check_text(
+            &db,
+            &OfflineEgov,
+            "民法第709条。さらに第1条。同法第710条。",
+            "2026-11-13",
+            false,
+        );
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept[1].citation.contains("710"), "{kept:?}");
+        assert!(kept.iter().all(|hit| !hit.citation.contains("第1条") || hit.citation.contains("710")), "{kept:?}");
+    }
+
+    #[test]
+    fn deleted_items_and_paragraphs_are_not_a_match() {
+        let parsed = crate::statute::xmlparse::parse_law_xml(include_str!(
+            "fixtures/deleted_clause.xml"
+        ))
+        .unwrap();
+        let body_331 = parsed
+            .articles
+            .iter()
+            .find(|article| article.key == "331")
+            .unwrap();
+        let body_2 = parsed.articles.iter().find(|article| article.key == "2").unwrap();
+        let body_9 = parsed.articles.iter().find(|article| article.key == "9").unwrap();
+        assert!(body_331.body.contains("二\u{3000}削除"), "{}", body_331.body);
+        assert!(body_2.body.contains("一\u{3000}削除"), "{}", body_2.body);
+        assert!(body_9.body.contains("削除"), "{}", body_9.body);
+        let db = db();
+        let company = [body_331.clone(), body_9.clone()];
+        db.replace_law(
+            "417AC0000000086",
+            "会社法",
+            "",
+            "2026-11-11",
+            "2026-11-11",
+            "bundle",
+            &["会社法".into()],
+            &company,
+        )
+        .unwrap();
+        let criminal = [body_2.clone()];
+        db.replace_law(
+            "140AC0000000045",
+            "刑法",
+            "",
+            "2026-11-11",
+            "2026-11-11",
+            "bundle",
+            &["刑法".into()],
+            &criminal,
+        )
+        .unwrap();
+        let hits = check_text(
+            &db,
+            &OfflineEgov,
+            "会社法第331条第1項第1号。会社法第331条第1項第2号。会社法第9条第2項。刑法第2条第1号。",
+            "2026-11-13",
+            false,
+        );
+        assert_eq!(hits.len(), 4, "{hits:?}");
+        assert_eq!(hits[0].label, "一致", "{hits:?}");
+        assert!(hits[1..].iter().all(|hit| hit.label == "要確認"), "{hits:?}");
+        assert!(
+            hits[1..].iter().all(|hit| hit.reason.contains("削除")),
+            "{hits:?}"
+        );
+        assert!(hits[1..].iter().all(|hit| hit.label != "一致"));
+    }
+
+    #[test]
+    fn every_no_branch_is_its_own_number() {
+        let db = db();
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2026-11-11",
+            "2026-11-11",
+            "bundle",
+            &["民法".into()],
+            &[
+                article("3_2", "第3条の2", "親の本文。"),
+                article("3_2_3", "第3条の2の3", "二重枝番の本文。"),
+                article(
+                    "10",
+                    "第10条",
+                    "三　親\n三の二　途中\n三の二の九十九　末尾の本文。",
+                ),
+            ],
+        )
+        .unwrap();
+        let hits = check_text(
+            &db,
+            &OfflineEgov,
+            "民法第3条の2の3。民法第10条第3号の2の99。民法第10条第3号の2の100。",
+            "2026-11-13",
+            false,
+        );
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(hits[0].label, "一致", "{hits:?}");
+        assert!(hits[0].article_text.contains("二重枝番"), "{hits:?}");
+        assert!(!hits[0].article_text.contains("親の本文"), "{hits:?}");
+        assert_eq!(hits[1].label, "一致", "{hits:?}");
+        assert!(hits[1].article_text.contains("末尾"), "{hits:?}");
+        assert_eq!(hits[2].label, "番号違い", "{hits:?}");
+        assert!(!hits[2].reason.contains("親"), "{hits:?}");
+    }
+
+    #[test]
+    fn a_particle_before_the_law_name_still_resolves() {
+        let hits = statuses("について民法第415条。契約による民法第3条の2。");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits.iter().all(|hit| hit.label == "一致"), "{hits:?}");
+        assert!(hits.iter().all(|hit| hit.citation.contains("民法")), "{hits:?}");
+    }
+
+    #[test]
+    fn cached_hits_do_not_spend_the_online_budget() {
+        let db = db();
+        seed(&db);
+        let started = std::time::Instant::now();
+        let hits = check_text_opts(
+            &db,
+            &OfflineEgov,
+            "民法第415条。民法第3条の2。民訴法第1条。",
+            "2026-11-13",
+            true,
+            0,
+            60_000,
+        );
+        assert!(started.elapsed().as_millis() < 1000, "cached check slept");
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert!(hits.iter().all(|hit| hit.label == "一致"), "{hits:?}");
+    }
+
+    struct CancelReset;
+    impl Drop for CancelReset {
+        fn drop(&mut self) {
+            set_check_cancel(None);
+        }
+    }
+
+    #[test]
+    fn abort_stops_before_the_next_fetch() {
+        let db = db();
+        seed(&db);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        set_check_cancel(Some(flag));
+        let _reset = CancelReset;
+        let hits = check_text(&db, &OfflineEgov, "民法第9999条", "2026-11-13", true);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].label, "要確認", "{hits:?}");
+        assert_eq!(hits[0].reason, "照合を中止しました。");
+    }
+
+    #[test]
+    fn an_online_miss_for_a_bundled_law_is_a_wrong_number() {
+        let db = db();
+        seed(&db);
+        let client = crate::statute::egov::MapEgov::new(vec![(
+            String::new(),
+            Err(crate::statute::egov::EgovFailure::NotFound),
+        )]);
+        let hits = check_text(&db, &client, "民法第9999条", "2026-11-13", true);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].label, "番号違い", "{hits:?}");
+        assert_eq!(hits[0].reason, "その条はありません。");
     }
 }

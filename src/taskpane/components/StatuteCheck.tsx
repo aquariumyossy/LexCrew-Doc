@@ -8,7 +8,7 @@ import {
   jumpTarget,
   rowLabel,
 } from "../statuteCheck";
-import { getSelectionText, readBodyText, selectTextOccurrence } from "../word";
+import { getSelectionText, readBodyText, rememberStatuteRange, selectTextOccurrence } from "../word";
 
 const useStyles = makeStyles({
   wrap: {
@@ -85,6 +85,11 @@ export const StatuteCheck: React.FC<Props> = ({ disabled, inWord, online }) => {
       const documentText = selection.trim() ? "" : await readBodyText();
       const request = checkRequest(selection, documentText, online);
       setScope(request.scope);
+      try {
+        await rememberStatuteRange(request.scope);
+      } catch {
+        // A later jump falls back to the selection Word has at that moment.
+      }
       if (!request.text.trim()) {
         setRows([]);
         setNote(emptyCheckMessage(request.scope));

@@ -682,24 +682,46 @@ fn statute_online(flag: Option<bool>) -> bool {
     flag.unwrap_or(true)
 }
 
+/// Set when the HTTP handler is dropped, including a client disconnect.
+/// The blocking check reads the flag between e-Gov calls.
+struct StopFetch(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopFetch {
+    fn drop(&mut self) {
+        self.0
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 async fn post_statute_check(Json(body): Json<StatuteCheckRequest>) -> Response {
     let text = body.text;
     let online = statute_online(body.online);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = StopFetch(cancel.clone());
+    let flag = cancel.clone();
     let joined = tokio::task::spawn_blocking(move || {
-        let service = crate::statute::shared();
-        if !service.enabled.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err("法令DBを開けませんでした。".to_string());
-        }
-        let today = statute_today();
-        Ok(crate::statute::check_text(
-            &service.db,
-            service.client.as_ref(),
-            &text,
-            &today,
-            online,
-        ))
+        crate::statute::set_check_cancel(Some(flag));
+        let outcome = (|| {
+            let service = crate::statute::shared();
+            if !service.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("法令DBを開けませんでした。".to_string());
+            }
+            let today = statute_today();
+            Ok(crate::statute::check_text(
+                &service.db,
+                service.client.as_ref(),
+                &text,
+                &today,
+                online,
+            ))
+        })();
+        crate::statute::set_check_cancel(None);
+        outcome
     })
     .await;
+    // Keep `stop` alive until the blocking check returns. Dropping this
+    // future on a client disconnect sets the flag and the loop stops fetching.
+    drop(stop);
     match joined {
         Ok(Ok(results)) => Json(json!({ "results": results })).into_response(),
         Ok(Err(error)) => json_error(StatusCode::SERVICE_UNAVAILABLE, &error, None),

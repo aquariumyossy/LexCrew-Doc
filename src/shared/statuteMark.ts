@@ -89,19 +89,22 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     if (mentioned) {
       currentLaw = mentioned;
     }
-    const inherit =
-      currentLaw !== null &&
-      (isConnector(between) || between.trim() === "同法" || between.endsWith("同法"));
     const window = lawWindow(chars, span.start);
     const dou = window === "同法";
+    const enumerated = window === null && isEnumeration(between);
+    const inherited = dou || enumerated;
     let name: string | null;
+    if (!span.suppl && !dou && !enumerated && (window === null || !looksLikeLawName(window))) {
+      previousEnd = span.end;
+      continue;
+    }
     if (dou && currentLaw === null) {
       const laws = new Set(
         verified.filter((item) => item.key === span.key).map((item) => item.names[0] || "")
       );
       laws.delete("");
       name = laws.size === 1 ? [...laws][0] : null;
-    } else if (inherit || dou) {
+    } else if (inherited) {
       name = currentLaw;
     } else if (window) {
       if (deniedToken(window)) {
@@ -148,9 +151,9 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
       previousEnd = span.end;
       continue;
     }
-    const suppl = span.suppl || ((inherit || dou) && currentSuppl);
+    const suppl = span.suppl || (inherited && currentSuppl);
     currentSuppl = suppl;
-    if (!inherit && !dou) {
+    if (!inherited) {
       currentLaw = name;
     }
     const ok =
@@ -208,15 +211,42 @@ function deniedToken(window: string): boolean {
   return DENY_LAW_NAME.some((deny) => deny === name || deny === window);
 }
 
+const NAME_PARTICLES = ["によれば", "について", "による", "により", "では", "には", "とは", "から", "まで", "より"];
+
 function prefixOk(before: string): boolean {
-  if (!before || before.endsWith("旧") || before.endsWith("改正前")) {
-    return !before;
+  if (!before) {
+    return true;
+  }
+  if (before.endsWith("旧") || before.endsWith("改正前")) {
+    return false;
   }
   if (before.endsWith("改正") || before.endsWith("現行") || before.endsWith("新")) {
     const rest = before.replace(/(改正|現行|新)$/u, "");
     return rest.length === 0 || /[。、，・（）「」\sはをにがとのやもへでか]/u.test(rest.slice(-1));
   }
+  if (NAME_PARTICLES.some((particle) => before.endsWith(particle))) {
+    return true;
+  }
   return /[。、，・（）「」\sはをにがとのやもへでか]/u.test(before.slice(-1));
+}
+
+function lawNameAfterParticle(name: string): string {
+  let best = 0;
+  for (const particle of NAME_PARTICLES) {
+    const idx = name.lastIndexOf(particle);
+    if (idx < 0) {
+      continue;
+    }
+    const cut = idx + particle.length;
+    const rest = name.slice(cut);
+    if (Array.from(rest).length < 2 || cut >= name.length || /[ぁ-ん]/u.test(rest)) {
+      continue;
+    }
+    if (cut > best) {
+      best = cut;
+    }
+  }
+  return best > 0 ? name.slice(best) : name;
 }
 
 function boundedSuffix(window: string, name: string): boolean {
@@ -277,19 +307,28 @@ function lawWindow(chars: string[], citeStart: number): string | null {
   if (start === end) {
     return null;
   }
-  const name = chars.slice(start, end).join("");
+  const raw = chars.slice(start, end).join("");
+  const name = lawNameAfterParticle(raw);
   return Array.from(name).length < 2 ? null : name;
+}
+
+function looksLikeLawName(name: string): boolean {
+  return (
+    name.endsWith("憲法") ||
+    name.endsWith("法") ||
+    name.endsWith("令") ||
+    name.endsWith("規則") ||
+    name.endsWith("条例")
+  );
+}
+
+function isEnumeration(between: string): boolean {
+  const text = between.replace(/「[^」]*」/gu, "").replace(/\s/gu, "");
+  return ["及び", "および", "並びに", "ならびに", "又は", "または", "若しくは", "、", "，", "・"].includes(text);
 }
 
 function isLawChar(c: string): boolean {
   return /[\u3400-\u9fff\u3040-\u30ff々、，]/u.test(c);
-}
-
-function isConnector(between: string): boolean {
-  const text = Array.from(between)
-    .filter((c) => !/\s/u.test(c))
-    .join("");
-  return ["及び", "および", "又は", "または", "若しくは", "並びに", "と", "、", "，", "・"].includes(text);
 }
 
 function alreadyMarked(chars: string[], end: number): boolean {
@@ -412,7 +451,47 @@ function citationAt(chars: string[], i: number): ArticleSpan | null {
   if (!ident) {
     return null;
   }
+  end = extendClause(chars, end);
+  if (start > end || end > chars.length) {
+    return null;
+  }
   return { start, end, key: ident.key, display: ident.display, suppl };
+}
+
+function extendClause(chars: string[], end: number): number {
+  let cursor = end;
+  const paragraph = readMarkedUnit(chars, cursor, "項");
+  if (paragraph !== null) {
+    cursor = paragraph;
+  }
+  const item = readMarkedUnit(chars, cursor, "号");
+  if (item === null) {
+    return cursor;
+  }
+  cursor = item;
+  while (chars[cursor] === "の") {
+    const branch = takeNumeral(chars, cursor + 1);
+    if (!branch) {
+      break;
+    }
+    cursor = branch.end;
+  }
+  return cursor;
+}
+
+function readMarkedUnit(chars: string[], start: number, unit: string): number | null {
+  let i = start;
+  while (i < chars.length && /\s/u.test(chars[i])) {
+    i += 1;
+  }
+  if (chars[i] !== "第") {
+    return null;
+  }
+  const num = takeNumeral(chars, i + 1);
+  if (!num || chars[num.end] !== unit) {
+    return null;
+  }
+  return num.end + 1;
 }
 
 function takeBranches(chars: string[], end: number, parts: number[]): number {

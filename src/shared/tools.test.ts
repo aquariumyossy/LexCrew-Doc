@@ -830,10 +830,15 @@ describe("normalizeToolCalls", () => {
       "nope",
       { function: { name: "get_selection" } },
     ]);
-    expect(calls).toEqual([
-      { id: "a1", type: "function", function: { name: "search", arguments: '{"q":"民法"}' } },
-      { id: "call_3", type: "function", function: { name: "get_selection", arguments: "" } },
-    ]);
+    expect(calls[0]).toEqual({
+      id: "a1",
+      type: "function",
+      function: { name: "search", arguments: '{"q":"民法"}' },
+    });
+    expect(calls[1].function).toEqual({ name: "get_selection", arguments: "" });
+    expect(calls[1].id).toMatch(/^call_s\d+$/);
+    const again = normalizeToolCalls([{ function: { name: "get_selection" } }]);
+    expect(again[0].id).not.toBe(calls[1].id);
   });
 
   it("returns an empty list when the field is missing", () => {

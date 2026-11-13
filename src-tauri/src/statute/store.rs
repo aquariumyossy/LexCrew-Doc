@@ -11,6 +11,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::statute::refresh::parse_ymd;
 use crate::statute::xmlparse::{article_spans, ListedUpdate, ParsedArticle};
 
+/// Packed on 2026-11-11. Rebuild with `python3 scripts/fetch_statutes.py`.
+/// A missing article is 要確認 while offline, even for a bundled law.
 pub const BUNDLE_VERSION: &str = "2026-11-11b";
 const BUNDLE_VERSION_KEY: &str = "bundle_version";
 
@@ -82,7 +84,8 @@ pub struct LawRef {
     pub as_of: String,
     pub checked_on: String,
     pub article_count: usize,
-    /// `bundle` means the seed has the whole law, so a missing article is a bad number.
+    /// `bundle` means the seed shipped the whole law. A missing row is still
+    /// 要確認 until e-Gov is asked, because the seed can be older than the statute.
     pub source: String,
 }
 
@@ -577,7 +580,7 @@ impl StatuteDb {
         let Some(entries) = cache.as_ref() else {
             return Ok(None);
         };
-        let found = entries.iter().find(|hit| alias_suffix_bounded(&norm, &hit.alias));
+        let found = longest_bounded_suffix(entries, &norm);
         let Some(found) = found else {
             return Ok(None);
         };
@@ -597,7 +600,7 @@ impl StatuteDb {
         let Some(entries) = cache.as_ref() else {
             return Ok(None);
         };
-        let found = entries.iter().find(|hit| alias_suffix_bounded(&norm, &hit.alias));
+        let found = longest_bounded_suffix(entries, &norm);
         let Some(found) = found else {
             return Ok(None);
         };
@@ -932,6 +935,28 @@ pub fn alias_suffix_bounded(text: &str, alias: &str) -> bool {
     alias_prefix_ok(before)
 }
 
+/// Hiragana that can sit immediately before a law name (`について民法`).
+/// Longest first so `によれば` is not cut down to `より`.
+const NAME_PARTICLES: &[&str] = &[
+    "によれば",
+    "について",
+    "による",
+    "により",
+    "では",
+    "には",
+    "とは",
+    "から",
+    "まで",
+    "より",
+];
+
+fn longest_bounded_suffix<'a>(entries: &'a [AliasHit], norm: &str) -> Option<&'a AliasHit> {
+    entries
+        .iter()
+        .filter(|hit| alias_suffix_bounded(norm, &hit.alias))
+        .max_by_key(|hit| hit.alias.chars().count())
+}
+
 fn alias_prefix_ok(before: &str) -> bool {
     if before.is_empty() {
         return true;
@@ -944,7 +969,41 @@ fn alias_prefix_ok(before: &str) -> bool {
             return rest.is_empty() || rest.chars().last().is_some_and(is_name_boundary);
         }
     }
+    if NAME_PARTICLES.iter().any(|particle| before.ends_with(particle)) {
+        return true;
+    }
     before.chars().last().is_some_and(is_name_boundary)
+}
+
+/// Drops a particle glued to the front of a law name (`契約による民法` → `民法`).
+/// A remainder that still contains hiragana is left alone so official titles
+/// such as `個人情報の保護に関する法律` stay intact.
+pub(crate) fn law_name_after_particle(text: &str) -> &str {
+    let mut best = 0usize;
+    for particle in NAME_PARTICLES {
+        let Some(idx) = text.rfind(particle) else {
+            continue;
+        };
+        let after = idx + particle.len();
+        if !text.is_char_boundary(after) {
+            continue;
+        }
+        let rest = &text[after..];
+        if rest.chars().count() < 2 {
+            continue;
+        }
+        if rest.chars().any(|c| ('\u{3040}'..='\u{309F}').contains(&c)) {
+            continue;
+        }
+        if after > best && after < text.len() {
+            best = after;
+        }
+    }
+    if best == 0 {
+        text
+    } else {
+        &text[best..]
+    }
 }
 
 fn is_name_boundary(c: char) -> bool {

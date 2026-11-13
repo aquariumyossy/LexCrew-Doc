@@ -567,6 +567,40 @@ impl StatuteDb {
         Ok(out)
     }
 
+    /// Rightmost alias in `text`, with no boundary check. Offsets are in chars.
+    pub fn rightmost_alias_anywhere(&self, text: &str) -> Result<Option<(usize, usize, String)>, String> {
+        self.ensure_alias_cache()?;
+        let cache = self.aliases.lock();
+        let Some(entries) = cache.as_ref() else {
+            return Ok(None);
+        };
+        let mut best: Option<(usize, usize, usize, String)> = None;
+        for hit in entries {
+            if hit.alias.chars().count() < 2 {
+                continue;
+            }
+            let mut from = 0usize;
+            while let Some(pos) = text[from..].find(&hit.alias) {
+                let abs = from + pos;
+                if !text.is_char_boundary(abs) {
+                    from = abs + 1;
+                    continue;
+                }
+                let start = text[..abs].chars().count();
+                let end = start + hit.alias.chars().count();
+                let replace = match &best {
+                    None => true,
+                    Some((at, alen, _, _)) => end > *at || (end == *at && hit.alias.len() > *alen),
+                };
+                if replace {
+                    best = Some((end, hit.alias.len(), start, hit.alias.clone()));
+                }
+                from = abs + hit.alias.len().max(1);
+            }
+        }
+        Ok(best.map(|(_, _, start, alias)| (start, start + alias.chars().count(), alias)))
+    }
+
     /// Rightmost current-law name in `text`. Historical prefixes are ignored.
     pub fn rightmost_law(&self, text: &str) -> Result<Option<LawRef>, String> {
         #[cfg(test)]

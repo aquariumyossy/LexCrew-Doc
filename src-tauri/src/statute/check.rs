@@ -1072,12 +1072,22 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             );
         }
         let across_line = stack[frame_i].close_at.is_some();
-        let window = law_window(db, &chars, span.start, from);
+        let mut window = law_window(db, &chars, span.start, from);
         let enumerated = window.is_none() && enumeration_gap(&between, across_line);
-        let dou = window.as_ref().is_some_and(|w| w.text == "同法");
+        let mut dou = window.as_ref().is_some_and(|w| w.text == "同法");
         if dou {
             for frame in stack.iter_mut() {
                 flush_pending(db, &chars, frame);
+            }
+        }
+        let frame_ambiguous = dou && douhou_is_ambiguous(&stack);
+        if dou && !frame_ambiguous && !window.as_ref().is_some_and(|item| item.force_ambiguous) {
+            if let Some(item) = window.as_mut() {
+                if let Some(alias) = item.retarget.clone() {
+                    item.start = item.retarget_at;
+                    item.text = alias;
+                    dou = false;
+                }
             }
         }
         if let Some(window) = window.as_ref() {
@@ -1088,7 +1098,9 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
                 continue;
             }
         }
-        let ambiguous_douhou = dou && douhou_is_ambiguous(&stack);
+        let ambiguous_douhou = dou
+            && (window.as_ref().is_some_and(|item| item.force_ambiguous)
+                || douhou_is_ambiguous(&stack));
         let inherit = if dou {
             stack[frame_i].douhou.clone()
         } else {
@@ -1335,6 +1347,11 @@ fn historical_mention(text: &str) -> Option<String> {
 struct Window {
     start: usize,
     text: String,
+    /// 同法 whose prefix names an unknown statute, code, or foreign law.
+    force_ambiguous: bool,
+    /// A known law named in the words before 同法. Used only when 同法 is not already ambiguous.
+    retarget: Option<String>,
+    retarget_at: usize,
 }
 
 fn law_window(db: &StatuteDb, chars: &[char], cite_start: usize, floor: usize) -> Option<Window> {
@@ -1375,9 +1392,146 @@ fn law_window(db: &StatuteDb, chars: &[char], cite_start: usize, floor: usize) -
         return None;
     }
     if text.chars().count() < 2 || is_connector(&text) {
-        None
-    } else {
-        Some(Window { start, text })
+        return None;
+    }
+    let adjusted = adjust_douhou_window(db, chars, floor, end, start, text);
+    Some(Window {
+        start: adjusted.start,
+        text: adjusted.text,
+        force_ambiguous: adjusted.force_ambiguous,
+        retarget: adjusted.retarget,
+        retarget_at: adjusted.retarget_at,
+    })
+}
+
+struct DouhouAdjust {
+    text: String,
+    start: usize,
+    force_ambiguous: bool,
+    retarget: Option<String>,
+    retarget_at: usize,
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '々')
+}
+
+fn douhou_boundary_ok(prefix: &str) -> bool {
+    if prefix.is_empty() || prefix.ends_with("上記") || prefix.ends_with("前記") {
+        return true;
+    }
+    match prefix.chars().last() {
+        Some(c) if is_cjk(c) => false,
+        _ => true,
+    }
+}
+
+fn deny_tail(head: &str) -> bool {
+    DENY_LAW_NAME.iter().any(|deny| head.ends_with(deny))
+        || DENY_LAW_ENDING.iter().any(|deny| head.ends_with(deny))
+}
+
+/// A statute-like word in the text before 同法, other than a deny-list word.
+fn unknown_lawlike_end(prefix: &str, known: Option<(usize, usize)>) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for marker in ["法典", "条例", "規則", "令", "法"] {
+        let mut from = 0usize;
+        while let Some(pos) = prefix[from..].find(marker) {
+            let abs = from + pos;
+            if !prefix.is_char_boundary(abs) {
+                from = abs + 1;
+                continue;
+            }
+            let end = prefix[..abs].chars().count() + marker.chars().count();
+            let head: String = prefix.chars().take(end).collect();
+            let covered = known.is_some_and(|(start, known_end)| end > start && end <= known_end);
+            if !covered && !deny_tail(&head) {
+                best = Some(best.map_or(end, |at| at.max(end)));
+            }
+            from = abs + marker.len().max(1);
+        }
+    }
+    best
+}
+
+fn acronym_end(prefix: &str) -> Option<usize> {
+    let chars: Vec<char> = prefix.chars().collect();
+    let mut best: Option<usize> = None;
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i].is_ascii_alphabetic() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if i - start >= 2 {
+                best = Some(i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+fn adjust_douhou_window(
+    db: &StatuteDb,
+    chars: &[char],
+    floor: usize,
+    end: usize,
+    start: usize,
+    text: String,
+) -> DouhouAdjust {
+    let plain = |text: String, start: usize| DouhouAdjust {
+        text,
+        start,
+        force_ambiguous: false,
+        retarget: None,
+        retarget_at: 0,
+    };
+    let Some(prefix) = text.strip_suffix("同法") else {
+        return plain(text, start);
+    };
+    if !douhou_boundary_ok(prefix) {
+        return plain(text, start);
+    }
+    let douhou_at = end - 2;
+    let mut look = douhou_at;
+    while look > floor && !is_hard_boundary(chars[look - 1]) {
+        look -= 1;
+    }
+    let wider: String = chars[look..douhou_at].iter().collect();
+    let known = db.rightmost_alias_anywhere(&wider).ok().flatten();
+    let known_span = known.as_ref().map(|(at, stop, _)| (*at, *stop));
+    let unknown = unknown_lawlike_end(&wider, known_span)
+        .into_iter()
+        .chain(acronym_end(&wider))
+        .max();
+    let known_end = known.as_ref().map(|(_, stop, _)| *stop);
+    if unknown.is_some_and(|at| known_end.map(|stop| at > stop).unwrap_or(true)) {
+        return DouhouAdjust {
+            text: "同法".into(),
+            start: douhou_at,
+            force_ambiguous: true,
+            retarget: None,
+            retarget_at: 0,
+        };
+    }
+    if let Some((at, _, alias)) = known {
+        return DouhouAdjust {
+            text: "同法".into(),
+            start: douhou_at,
+            force_ambiguous: false,
+            retarget: Some(alias),
+            retarget_at: look + at,
+        };
+    }
+    DouhouAdjust {
+        text: "同法".into(),
+        start: douhou_at,
+        force_ambiguous: false,
+        retarget: None,
+        retarget_at: 0,
     }
 }
 
@@ -1746,12 +1900,6 @@ fn same_law_alias(
 }
 
 fn leading_connector_len(text: &str) -> Option<usize> {
-    // に基づき同法 / とともに同法 / ただし、同法. No stored law name ends in 同法.
-    if let Some(prefix) = text.strip_suffix("同法") {
-        if !prefix.is_empty() {
-            return Some(prefix.chars().count());
-        }
-    }
     for conn in [
         "若しくは",
         "ならびに",

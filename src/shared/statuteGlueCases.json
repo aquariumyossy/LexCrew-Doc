@@ -1107,5 +1107,130 @@
       { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
     ],
     "keepMark": true
+  },
+  {
+    "id": "r16-retarget-tadashi-kaisha",
+    "text": "民法第709条。ただし会社法に基づき同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r16-retarget-mata-kaisha",
+    "text": "民法第709条。また会社法に基づき同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r16-retarget-yotte-kaisha",
+    "text": "民法第709条。よって会社法に基づき同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r16-retarget-sunawachi-kaisha",
+    "text": "民法第709条。すなわち会社法に基づき同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r16-ambiguous-minpo",
+    "text": "民法第709条を参照。次に、ドイツ民法典については、同法第823条が適用される。",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "823", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r16-ambiguous-ordinance",
+    "text": "民法第709条。東京都迷惑防止条例については同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r16-ambiguous-code",
+    "text": "民法第709条。米国統一商事法典については、同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r16-ambiguous-gdpr",
+    "text": "民法第709条。GDPRについては同法第6条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "6", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r16-ambiguous-circle-law",
+    "text": "民法第709条。〇〇法については同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r16-kyodo-unresolved",
+    "text": "民法第709条及び共同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "共同法", "key": "2", "label": "要確認" }
+    ]
+  },
+  {
+    "id": "r16-godou-unresolved",
+    "text": "民法第709条及び合同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "合同法", "key": "2", "label": "要確認" }
+    ]
+  },
+  {
+    "id": "r16-kyodou-unresolved",
+    "text": "民法第709条及び協同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "協同法", "key": "2", "label": "要確認" }
+    ]
+  },
+  {
+    "id": "r16-keep-honkeiyaku",
+    "text": "民法第709条。本契約に基づき同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r16-keep-jouki",
+    "text": "民法第709条。上記同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r16-keep-zenki",
+    "text": "民法第709条。前記同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
   }
 ]

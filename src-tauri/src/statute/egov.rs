@@ -137,8 +137,11 @@ pub fn egress_url(url: &str) -> Result<String, EgovFailure> {
     if let Some(next) = v2_url(url) {
         return Ok(next);
     }
-    if url.contains("/updatelawlists/") {
-        return Ok(url.to_string());
+    let prefix = format!("{API_ORIGIN}/updatelawlists/");
+    if let Some(date) = url.strip_prefix(&prefix) {
+        if date.len() == 8 && date.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(url.to_string());
+        }
     }
     Err(EgovFailure::Bad(
         "法令IDと条番号以外は e-Gov に送りません".into(),
@@ -245,8 +248,11 @@ mod tests {
         assert!(v2_url(&update_list_url("20261111")).is_none());
         assert!(v2_url(&lawlist_url(2)).is_none());
         let update = egress_url(&update_list_url("20261111")).unwrap();
-        assert!(update.contains("/updatelawlists/20261111"));
+        assert_eq!(update, update_list_url("20261111"));
         assert!(egress_url(&lawlist_url(2)).is_err());
         assert!(egress_url("https://example.test/secret").is_err());
+        assert!(egress_url("https://evil.example/api/1/updatelawlists/20261111").is_err());
+        assert!(egress_url(&format!("{}extra", update_list_url("20261111"))).is_err());
+        assert!(egress_url(&format!("{}/more", update_list_url("20261111"))).is_err());
     }
 }

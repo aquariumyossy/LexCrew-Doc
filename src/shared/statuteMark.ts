@@ -72,101 +72,140 @@ export function verifiedFromDelivered(content: string): VerifiedCite[] {
   );
 }
 
+type EnumFrame = {
+  prevEnd: number;
+  law: string | null;
+  douhou: string | null;
+  named: boolean;
+  suppl: boolean;
+};
+
 export function markUnverified(answer: string, verified: VerifiedCite[]): string {
   const chars = Array.from(answer);
   const spans = articleSpans(answer);
   const inserts: number[] = [];
-  let currentLaw: string | null = null;
-  let currentSuppl = false;
-  let previousEnd = 0;
+  const stack: EnumFrame[] = [{ prevEnd: 0, law: null, douhou: null, named: false, suppl: false }];
+  let seen = 0;
+  let quoting = false;
+  const remember = (frame: EnumFrame, name: string) => {
+    frame.law = name;
+    frame.douhou = name;
+    frame.named = true;
+  };
   for (const span of spans) {
     if (span.start > chars.length || span.end > chars.length || span.start > span.end) {
       continue;
     }
-    const prev = Math.min(previousEnd, span.start);
-    const between = chars.slice(prev, span.start).join("");
-    const savedLaw = currentLaw;
-    const inside = parenDepth(chars, prev, span.start) > 0;
-    const mentioned = inside ? null : latestLawMention(between);
-    if (mentioned) {
-      currentLaw = mentioned;
+    while (seen < span.start && seen < chars.length) {
+      const c = chars[seen];
+      if (c === "「") {
+        quoting = true;
+      } else if (c === "」") {
+        quoting = false;
+      } else if (!quoting && (c === "（" || c === "(")) {
+        const outer = stack[stack.length - 1];
+        stack.push({
+          prevEnd: seen + 1,
+          law: null,
+          douhou: outer.douhou,
+          named: false,
+          suppl: false,
+        });
+      } else if (!quoting && (c === "）" || c === ")") && stack.length > 1) {
+        const inner = stack.pop();
+        const outer = stack[stack.length - 1];
+        if (inner?.named && inner.douhou && outer) {
+          outer.douhou = inner.douhou;
+        }
+      }
+      seen += 1;
     }
-    const window = lawWindow(chars, span.start, Math.min(previousEnd, span.start));
+    const frame = stack[stack.length - 1];
+    const prev = Math.min(frame.prevEnd, span.start);
+    const between = chars.slice(prev, span.start).join("");
+    const mentioned = latestLawMention(between);
+    if (mentioned) {
+      remember(frame, mentioned);
+    }
+    const window = lawWindow(chars, span.start, prev);
     const dou = window === "同法";
     const enumerated = window === null && isEnumeration(between);
     const inherited = dou || enumerated;
+    const target = dou ? frame.douhou : frame.law;
     let name: string | null;
     if (!span.suppl && !dou && !enumerated && (window === null || !looksLikeLawName(window))) {
       continue;
     }
-    if (dou && currentLaw === null) {
+    if (dou && target === null) {
       const laws = new Set(
         verified.filter((item) => item.key === span.key).map((item) => item.names[0] || "")
       );
       laws.delete("");
       name = laws.size === 1 ? [...laws][0] : null;
     } else if (inherited) {
-      name = currentLaw;
+      name = target;
     } else if (window) {
       if (deniedToken(window)) {
-        currentLaw = null;
+        frame.law = null;
+        frame.douhou = null;
+        frame.named = false;
         if (span.suppl && !alreadyMarked(chars, span.end)) {
           inserts.push(span.end);
-          previousEnd = span.end;
+          frame.prevEnd = span.end;
         }
         continue;
       }
       const found = longestVerifiedSuffix(window, verified);
       if (found) {
-        currentLaw = found;
-        currentSuppl = span.suppl;
+        remember(frame, found);
+        frame.suppl = span.suppl;
         name = found;
       } else if (window.endsWith("憲法") || window.endsWith("法") || window.endsWith("令") || window.endsWith("規則")) {
-        currentLaw = window;
-        currentSuppl = span.suppl;
+        remember(frame, window);
+        frame.suppl = span.suppl;
         name = window;
       } else {
-        currentLaw = null;
+        frame.law = null;
+        frame.douhou = null;
+        frame.named = false;
         if (span.suppl && !alreadyMarked(chars, span.end)) {
           inserts.push(span.end);
-          previousEnd = span.end;
+          frame.prevEnd = span.end;
         }
         continue;
       }
     } else {
-      currentLaw = null;
+      frame.law = null;
+      frame.douhou = null;
+      frame.named = false;
       if (span.suppl && !alreadyMarked(chars, span.end)) {
         inserts.push(span.end);
-        previousEnd = span.end;
+        frame.prevEnd = span.end;
       }
       continue;
     }
-    if (quoteStillOpen(chars, previousEnd, span.start)) {
+    if (stack.some((item) => quoteStillOpen(chars, item.prevEnd, span.start))) {
       if (!alreadyMarked(chars, span.end)) {
         inserts.push(span.end);
       }
-      if (inside) {
-        currentLaw = savedLaw;
-      } else {
-        previousEnd = span.end;
-      }
+      frame.prevEnd = span.end;
       continue;
     }
     if (!name) {
       if ((span.suppl || dou) && !alreadyMarked(chars, span.end)) {
         inserts.push(span.end);
-        previousEnd = span.end;
+        frame.prevEnd = span.end;
       }
       continue;
     }
     if (deniedToken(name)) {
-      previousEnd = span.end;
+      frame.prevEnd = span.end;
       continue;
     }
-    const suppl = span.suppl || (inherited && currentSuppl);
-    currentSuppl = suppl;
-    if (!inherited && !inside) {
-      currentLaw = name;
+    const suppl = span.suppl || (inherited && frame.suppl);
+    frame.suppl = suppl;
+    if (!inherited) {
+      remember(frame, name);
     }
     const ok =
       !suppl &&
@@ -174,11 +213,7 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     if (!ok && !alreadyMarked(chars, span.end)) {
       inserts.push(span.end);
     }
-    if (inside) {
-      currentLaw = savedLaw;
-    } else {
-      previousEnd = span.end;
-    }
+    frame.prevEnd = span.end;
   }
   if (inserts.length === 0) {
     return answer;
@@ -622,9 +657,19 @@ function matchingClose(chars: string[], openAt: number, limit: number): number |
   return null;
 }
 
+function isWellFormedRoman(text: string): boolean {
+  return text.length > 0 && text.length <= 12 && /^(c{0,3})(xc|xl|l?x{0,3})(ix|iv|v?i{0,3})$/i.test(text);
+}
+
 function isListMarker(inner: string): boolean {
   const text = inner.trim();
-  if (!text || Array.from(text).length > 4) {
+  if (!text) {
+    return false;
+  }
+  if (isWellFormedRoman(text)) {
+    return true;
+  }
+  if (Array.from(text).length > 4) {
     return false;
   }
   if (/^[0-9０-９]+$/u.test(text)) {
@@ -647,25 +692,6 @@ function isListMarker(inner: string): boolean {
 
 function isCircled(c: string): boolean {
   return /[①-⑳❶-❿㉑-㉟]/u.test(c);
-}
-
-function parenDepth(chars: string[], from: number, until: number): number {
-  let depth = 0;
-  let quote = false;
-  const end = Math.min(until, chars.length);
-  for (let i = Math.min(from, end); i < end; i += 1) {
-    const c = chars[i];
-    if (c === "「") {
-      quote = true;
-    } else if (c === "」") {
-      quote = false;
-    } else if (!quote && (c === "（" || c === "(")) {
-      depth += 1;
-    } else if (!quote && (c === "）" || c === ")") && depth > 0) {
-      depth -= 1;
-    }
-  }
-  return depth;
 }
 
 function quoteStillOpen(chars: string[], from: number, until: number): boolean {

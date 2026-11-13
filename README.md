@@ -110,7 +110,7 @@ npm run package       # release/ にインストーラ一式を生成（要 Wind
 |------|------|
 | `src/taskpane/` | 作業ウィンドウ UI |
 | `src/sidecar/` | 開発用 API・LLM プロキシ・履歴 DB |
-| `src/shared/` | プロンプト・ツール定義・共有ロジック |
+| `src/shared/` | プロンプト・ツール定義・共有ロジック。`lawCatalog.json` は照合側カタログの写しで、同梱 DB の法令名一覧ではない |
 | `src-tauri/` | トレイ常駐（Rust / Tauri） |
 | `scripts/package.ps1` | リリース用の一括ビルド |
 

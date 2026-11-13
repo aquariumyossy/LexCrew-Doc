@@ -21,7 +21,7 @@ pub const OFFLINE_NOTE: &str = "改正確認できず（オフライン）";
 /// Change this one string if that result should become 要確認 instead.
 const UNCONFIRMED_MATCH_LABEL: &str = "一致";
 
-const DENY_LAW_NAME: &[&str] = &[
+pub(crate) const DENY_LAW_NAME: &[&str] = &[
     "方法", "手法", "療法", "用法", "違法", "適法", "合法", "魔法", "司法", "立法", "憲法改正",
 ];
 
@@ -292,31 +292,45 @@ fn judge(
                 action,
                 crate::statute::refresh::RevisionAction::ReloadLaw { .. }
             );
+            let known_amendment = reloading
+                && db
+                    .remote_as_of(&law.law_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|remote| {
+                        crate::statute::refresh::revision_is_newer(&remote, &law.as_of)
+                    });
             let remembered = failed_reloads.borrow().get(&law.law_id).cloned();
             let cooled = db.probe_failure_note(&law.law_id, &raw.key);
             if reloading && remembered.is_some() {
-                Some(cached_article(
-                    &law,
-                    &row,
-                    &raw.display,
-                    true,
-                    remembered.as_deref().unwrap_or(OFFLINE_NOTE),
-                ))
+                let note = remembered.unwrap_or_else(|| OFFLINE_NOTE.into());
+                if known_amendment {
+                    return stale_amendment(hit, &row, &as_amendment_note(&note));
+                }
+                Some(cached_article(&law, &row, &raw.display, true, &note))
             } else if probing && (cooled.is_some() || !probes.allow()) {
-                Some(cached_article(
-                    &law,
-                    &row,
-                    &raw.display,
-                    true,
-                    cooled.as_deref().unwrap_or(OFFLINE_NOTE),
-                ))
+                let note = cooled.unwrap_or_else(|| OFFLINE_NOTE.into());
+                if known_amendment {
+                    return stale_amendment(hit, &row, &as_amendment_note(&note));
+                }
+                Some(cached_article(&law, &row, &raw.display, true, &note))
             } else {
                 let got = ask();
                 if probing && got.as_ref().is_some_and(probe_failed) {
                     let note = currency_note(got.as_ref().unwrap());
+                    let note = if known_amendment {
+                        as_amendment_note(&note)
+                    } else {
+                        note
+                    };
                     let _ = db.note_probe_failure(&law.law_id, &raw.key, &note);
                     if reloading {
-                        failed_reloads.borrow_mut().insert(law.law_id.clone(), note.clone());
+                        failed_reloads
+                            .borrow_mut()
+                            .insert(law.law_id.clone(), note.clone());
+                    }
+                    if known_amendment {
+                        return stale_amendment(hit, &row, &note);
                     }
                     Some(cached_article(&law, &row, &raw.display, true, &note))
                 } else {
@@ -479,17 +493,50 @@ fn probe_failed(item: &ToolArticle) -> bool {
 }
 
 fn currency_note(item: &ToolArticle) -> String {
-    let digits: String = item
-        .note
-        .split("HTTP ")
-        .nth(1)
-        .map(|rest| rest.chars().take_while(|c| c.is_ascii_digit()).collect())
-        .unwrap_or_default();
-    if digits.len() == 3 {
+    if let Some(digits) = http_digits(&item.note) {
         format!("改正確認できず（HTTP {digits}）")
     } else {
         "e-Govに接続できず改正確認できず".into()
     }
+}
+
+fn http_digits(note: &str) -> Option<String> {
+    let digits: String = note
+        .split("HTTP ")
+        .nth(1)?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.len() == 3 { Some(digits) } else { None }
+}
+
+/// The update list already named a newer text and the reload failed.
+/// That is not the "could not confirm" case, so it stays 要確認.
+fn as_amendment_note(source: &str) -> String {
+    if let Some(digits) = http_digits(source) {
+        format!("改正あり・最新本文を取得できず（HTTP {digits}）")
+    } else if source.contains("接続") || source.contains("オフライン") || source.is_empty() {
+        "改正あり・最新本文を取得できず（e-Govに接続できず）".into()
+    } else {
+        "改正あり・最新本文を取得できず".into()
+    }
+}
+
+fn stale_amendment(
+    mut hit: CheckHit,
+    row: &crate::statute::store::ArticleRow,
+    note: &str,
+) -> CheckHit {
+    hit.status = "review".into();
+    hit.label = "要確認".into();
+    hit.reason = note.to_string();
+    hit.article_text = if row.heading.is_empty() {
+        row.body.clone()
+    } else {
+        format!("（{}）\n{}", row.heading, row.body)
+    };
+    hit.as_of = row.as_of.clone();
+    hit
 }
 
 fn number_miss(mut hit: CheckHit, reason: &str) -> CheckHit {
@@ -514,48 +561,106 @@ enum Current {
     Historical(String),
 }
 
+struct Frame {
+    /// Where the next bare 第N条 in this parenthesis measures its gap from.
+    prev_end: usize,
+    /// Law a joined bare article inherits. Fresh parentheses start with none.
+    law: Option<Current>,
+    /// What 同法 means here. Starts as the outer last named law.
+    douhou: Option<Current>,
+    /// A law was named in this frame, so 同法 bubbles out when the parenthesis closes.
+    named: bool,
+}
+
+/// Parentheses get their own enumeration. Headings, list markers, and
+/// promulgation parentheses push and pop before the next article, so the
+/// outer anchor is unchanged. Parentheses inside 「」 are not structure.
+fn sync_parens(
+    stack: &mut Vec<Frame>,
+    chars: &[char],
+    seen: &mut usize,
+    quoting: &mut bool,
+    until: usize,
+) {
+    let until = until.min(chars.len());
+    while *seen < until {
+        let c = chars[*seen];
+        if c == '「' {
+            *quoting = true;
+        } else if c == '」' {
+            *quoting = false;
+        } else if !*quoting && (c == '（' || c == '(') {
+            let douhou = stack.last().and_then(|frame| frame.douhou.clone());
+            stack.push(Frame {
+                prev_end: *seen + 1,
+                law: None,
+                douhou,
+                named: false,
+            });
+        } else if !*quoting && (c == '）' || c == ')') && stack.len() > 1 {
+            let inner = stack.pop().unwrap();
+            if inner.named {
+                if let Some(outer) = stack.last_mut() {
+                    outer.douhou = inner.douhou;
+                }
+            }
+        }
+        *seen += 1;
+    }
+}
+
+fn remember_law(frame: &mut Frame, current: Current) {
+    frame.douhou = Some(current.clone());
+    frame.law = Some(current);
+    frame.named = true;
+}
+
 fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
     let chars: Vec<char> = text.chars().collect();
     let spans = article_spans(text);
-    let mut current: Option<Current> = None;
-    let mut prev_end = 0usize;
+    let mut stack = vec![Frame {
+        prev_end: 0,
+        law: None,
+        douhou: None,
+        named: false,
+    }];
+    let mut seen = 0usize;
+    let mut quoting = false;
     let mut raws = Vec::new();
     for (index, span) in spans.iter().enumerate() {
         let next = spans.get(index + 1).map(|s| s.start).unwrap_or(chars.len());
-        let from = prev_end.min(span.start);
+        sync_parens(&mut stack, &chars, &mut seen, &mut quoting, span.start);
+        let frame_i = stack.len() - 1;
+        let from = stack[frame_i].prev_end.min(span.start);
         let between: String = chars[from..span.start].iter().collect();
-        let outer_law = current.clone();
-        let inside = paren_depth(&chars, from, span.start) > 0;
-        if !inside {
-            let visible = gap_core(&chars[from..span.start]);
-            if let Some(mention) = db.rightmost_law(&visible).ok().flatten() {
-                current = Some(Current::Law(mention));
-            } else if let Some(name) = historical_mention(&visible) {
-                current = Some(Current::Historical(name));
-            }
+        let visible = gap_core(&chars[from..span.start]);
+        if let Some(mention) = db.rightmost_law(&visible).ok().flatten() {
+            remember_law(&mut stack[frame_i], Current::Law(mention));
+        } else if let Some(name) = historical_mention(&visible) {
+            remember_law(&mut stack[frame_i], Current::Historical(name));
         }
-        let window = law_window(db, &chars, span.start, prev_end);
+        let window = law_window(db, &chars, span.start, from);
         let enumerated = window.is_none() && enumeration_gap(&between);
         let dou = window.as_ref().is_some_and(|w| w.text == "同法");
         if let Some(window) = window.as_ref() {
             if window.text != "同法" && denied(&window.text) {
-                current = None;
+                stack[frame_i].law = None;
+                stack[frame_i].douhou = None;
+                stack[frame_i].named = false;
                 continue;
             }
         }
-        let (law, unresolved, bare_douhou, historical) = if dou {
-            match current.clone() {
+        let inherit = if dou {
+            stack[frame_i].douhou.clone()
+        } else {
+            stack[frame_i].law.clone()
+        };
+        let (law, unresolved, bare_douhou, historical) = if dou || enumerated {
+            match inherit {
                 Some(Current::Law(law)) => (Some(law), String::new(), false, false),
                 Some(Current::Historical(name)) => (None, name, false, true),
-                None => (None, String::new(), true, false),
-            }
-        } else if enumerated {
-            match current.clone() {
-                Some(Current::Law(law)) => (Some(law), String::new(), false, false),
-                Some(Current::Historical(name)) => (None, name, false, true),
-                None => {
-                    continue;
-                }
+                None if dou => (None, String::new(), true, false),
+                None => continue,
             }
         } else if window.is_none() {
             // A bare 第N条 that is not part of this citation does not move the
@@ -563,16 +668,21 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             continue;
         } else if let Some(window) = window.as_ref() {
             if is_historical_name(&window.text) {
-                current = Some(Current::Historical(window.text.clone()));
+                remember_law(
+                    &mut stack[frame_i],
+                    Current::Historical(window.text.clone()),
+                );
                 (None, window.text.clone(), false, true)
             } else {
                 match db.match_law_in_text(&window.text) {
                     Ok(Some(law)) => {
-                        current = Some(Current::Law(law.clone()));
+                        remember_law(&mut stack[frame_i], Current::Law(law.clone()));
                         (Some(law), String::new(), false, false)
                     }
                     _ if looks_like_law(&window.text) => {
-                        current = None;
+                        stack[frame_i].law = None;
+                        stack[frame_i].douhou = None;
+                        stack[frame_i].named = false;
                         (None, window.text.clone(), false, false)
                     }
                     _ => {
@@ -581,7 +691,9 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
                 }
             }
         } else {
-            current = None;
+            stack[frame_i].law = None;
+            stack[frame_i].douhou = None;
+            stack[frame_i].named = false;
             continue;
         };
         let clause = read_clause(&chars, span.end, next);
@@ -598,13 +710,16 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
         }
         let quote = quote_after(&chars, clause.end, next).or_else(|| {
             if closes_paren(&chars, clause.end, next) {
-                quote_before(&chars, anchor_start, prev_end)
+                quote_before(&chars, anchor_start, from)
             } else {
                 None
             }
         });
         let quote_unread = quote.is_none() && quote_nearby(&chars, clause.end, next);
-        let inside_quote = !raws.is_empty() && quote_still_open(&chars, prev_end, span.start);
+        let inside_quote = !raws.is_empty()
+            && stack
+                .iter()
+                .any(|frame| quote_still_open(&chars, frame.prev_end, span.start));
         let citation = if dou || window.is_none() {
             if let Some(law) = law.as_ref() {
                 format!(
@@ -646,11 +761,7 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             anchor,
             citation,
         });
-        if inside {
-            current = outer_law;
-        } else {
-            prev_end = clause.end.max(span.end);
-        }
+        stack[frame_i].prev_end = clause.end.max(span.end);
     }
     for (start, end) in schedule_spans(&chars) {
         if raws.iter().any(|raw| start < raw.start + raw.anchor.chars().count() && end > raw.start)
@@ -823,27 +934,6 @@ fn denied(window: &str) -> bool {
     DENY_LAW_NAME.iter().any(|deny| name == *deny || window == *deny)
 }
 
-fn paren_depth(chars: &[char], from: usize, until: usize) -> i32 {
-    let mut depth = 0i32;
-    let mut quote = false;
-    let until = until.min(chars.len());
-    let mut i = from.min(until);
-    while i < until {
-        let c = chars[i];
-        if c == '「' {
-            quote = true;
-        } else if c == '」' {
-            quote = false;
-        } else if !quote && (c == '（' || c == '(') {
-            depth += 1;
-        } else if !quote && (c == '）' || c == ')') && depth > 0 {
-            depth -= 1;
-        }
-        i += 1;
-    }
-    depth
-}
-
 fn alias_offset(window: &str, db: &StatuteDb, law: &LawRef) -> usize {
     let mut names = db.aliases_of(&law.law_id).unwrap_or_default();
     if !names.iter().any(|name| name == &law.name) {
@@ -987,7 +1077,13 @@ fn matching_close(chars: &[char], open_at: usize, limit: usize) -> Option<usize>
 
 fn is_list_marker(inner: &str) -> bool {
     let text = inner.trim();
-    if text.is_empty() || text.chars().count() > 4 {
+    if text.is_empty() {
+        return false;
+    }
+    if is_well_formed_roman(text) {
+        return true;
+    }
+    if text.chars().count() > 4 {
         return false;
     }
     if text
@@ -1032,6 +1128,50 @@ fn is_list_marker(inner: &str) -> bool {
 
 fn is_roman_numeral(c: char) -> bool {
     ('ⅰ'..='ⅻ').contains(&c) || ('Ⅰ'..='Ⅻ').contains(&c)
+}
+
+/// ASCII roman using i, v, x, l, c only, in the standard subtractive form.
+/// `xiii`, `xiv`, `xx`, and `XIII` are list markers. `iiii` and `vx` are not.
+fn is_well_formed_roman(text: &str) -> bool {
+    let s = text.trim().to_ascii_lowercase();
+    if s.is_empty() || s.len() > 12 {
+        return false;
+    }
+    let b = s.as_bytes();
+    if !b.iter().all(|c| matches!(c, b'i' | b'v' | b'x' | b'l' | b'c')) {
+        return false;
+    }
+    let mut i = 0usize;
+    let mut hundreds = 0;
+    while i < b.len() && b[i] == b'c' && hundreds < 3 {
+        hundreds += 1;
+        i += 1;
+    }
+    if i + 1 < b.len() && b[i] == b'x' && (b[i + 1] == b'c' || b[i + 1] == b'l') {
+        i += 2;
+    } else {
+        if i < b.len() && b[i] == b'l' {
+            i += 1;
+        }
+        let mut tens = 0;
+        while i < b.len() && b[i] == b'x' && tens < 3 {
+            tens += 1;
+            i += 1;
+        }
+    }
+    if i + 1 < b.len() && b[i] == b'i' && (b[i + 1] == b'x' || b[i + 1] == b'v') {
+        i += 2;
+    } else {
+        if i < b.len() && b[i] == b'v' {
+            i += 1;
+        }
+        let mut ones = 0;
+        while i < b.len() && b[i] == b'i' && ones < 3 {
+            ones += 1;
+            i += 1;
+        }
+    }
+    i == b.len()
 }
 
 fn is_circled(c: char) -> bool {
@@ -2340,6 +2480,50 @@ mod tests {
         let second = check_text(&burst_db, &client, "民法第555条", "2026-11-13", true);
         assert!(second[0].article_text.contains("古い本文"), "{second:?}");
         assert!(second[0].offline_note.contains("改正確認"), "{second:?}");
+        assert_eq!(second[0].label, "一致", "{second:?}");
+
+        let amended = StatuteDb::open_memory().unwrap();
+        minpo(
+            &amended,
+            &[
+                article("709", "第709条", "古い709"),
+                article("710", "第710条", "古い710"),
+            ],
+        );
+        amended
+            .store_updates(
+                "2026-11-12",
+                "2026-11-13",
+                &[crate::statute::xmlparse::ListedUpdate {
+                    law_id: "129AC0000000089".into(),
+                    as_of: "2026-11-01".into(),
+                    enforce_on: String::new(),
+                    pending: false,
+                }],
+            )
+            .unwrap();
+        let failed = crate::statute::egov::MapEgov::new(vec![(
+            String::new(),
+            Err(crate::statute::egov::EgovFailure::Bad(
+                "法令APIが応答しませんでした（HTTP 503）".into(),
+            )),
+        )]);
+        let stale = check_text(
+            &amended,
+            &failed,
+            "民法第709条及び第710条",
+            "2026-11-13",
+            true,
+        );
+        assert_eq!(stale.len(), 2, "{stale:?}");
+        for hit in &stale {
+            assert_eq!(hit.label, "要確認", "{hit:?}");
+            assert!(
+                hit.reason.contains("改正あり・最新本文を取得できず（HTTP 503）"),
+                "{hit:?}"
+            );
+            assert_ne!(hit.label, "一致", "{hit:?}");
+        }
     }
 
     #[test]
@@ -2580,6 +2764,7 @@ mod tests {
                 article("90", "第90条", "第九十条の本文。"),
                 article("709", "第709条", "不法行為の本文。"),
                 article("710", "第710条", "財産以外の損害。"),
+                article("711", "第711条", "近親者の損害。"),
             ],
         );
         db.replace_law(
@@ -2590,7 +2775,10 @@ mod tests {
             "2020-01-01",
             "bundle",
             &["会社法".into()],
-            &[article("2", "第2条", "会社の第二条。")],
+            &[
+                article("2", "第2条", "会社の第二条。"),
+                article("3", "第3条", "会社の第三条。"),
+            ],
         )
         .unwrap();
         for case in cases {

@@ -24,4 +24,30 @@ describe("statute glue cases", () => {
       expect(marked, marked).not.toContain("（要確認）");
     }
   });
+
+  it("marks only the unfetched article inside a parenthesis", () => {
+    const marked = markUnverified("損害賠償責任を負う（民法第709条、第710条）。", [
+      { names: ["民法"], key: "709" },
+    ]);
+    expect(marked).toContain("第710条（要確認）");
+    expect(marked).not.toContain("第709条（要確認）");
+  });
+
+  it("leaves a parenthesised 同法 unmarked once both articles were fetched", () => {
+    const marked = markUnverified("（民法第709条、同法第710条）", [
+      { names: ["民法"], key: "709" },
+      { names: ["民法"], key: "710" },
+    ]);
+    expect(marked).not.toContain("（要確認）");
+  });
+
+  it("leaves an inner 同法 unmarked once every cited article was fetched", () => {
+    const marked = markUnverified("民法第709条（会社法第2条及び同法第3条を除く。）及び第710条", [
+      { names: ["民法"], key: "709" },
+      { names: ["会社法"], key: "2" },
+      { names: ["会社法"], key: "3" },
+      { names: ["民法"], key: "710" },
+    ]);
+    expect(marked).not.toContain("（要確認）");
+  });
 });

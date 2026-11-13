@@ -180,11 +180,8 @@ mod tests {
             assert_eq!(aliases, entry.aliases);
         }
         let deny = file["deny"].as_array().unwrap();
-        let expected = [
-            "方法", "手法", "療法", "用法", "違法", "適法", "合法", "魔法", "司法", "立法", "憲法改正",
-        ];
         let got: Vec<&str> = deny.iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(got, expected);
+        assert_eq!(got, crate::statute::check::DENY_LAW_NAME);
     }
 }
 

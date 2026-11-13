@@ -74,6 +74,7 @@ export function verifiedFromDelivered(content: string): VerifiedCite[] {
 
 type EnumFrame = {
   prevEnd: number;
+  openAt: number | null;
   law: string | null;
   douhou: string | null;
   named: boolean;
@@ -84,9 +85,13 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
   const chars = Array.from(answer);
   const spans = articleSpans(answer);
   const inserts: number[] = [];
-  const stack: EnumFrame[] = [{ prevEnd: 0, law: null, douhou: null, named: false, suppl: false }];
+  const stack: EnumFrame[] = [
+    { prevEnd: 0, openAt: null, law: null, douhou: null, named: false, suppl: false },
+  ];
   let seen = 0;
   let quoting = false;
+  let lastQuote: { at: number; open: boolean } | null = null;
+  let accepted = 0;
   const remember = (frame: EnumFrame, name: string) => {
     frame.law = name;
     frame.douhou = name;
@@ -100,12 +105,15 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
       const c = chars[seen];
       if (c === "「") {
         quoting = true;
+        lastQuote = { at: seen, open: true };
       } else if (c === "」") {
         quoting = false;
+        lastQuote = { at: seen, open: false };
       } else if (!quoting && (c === "（" || c === "(")) {
         const outer = stack[stack.length - 1];
         stack.push({
           prevEnd: seen + 1,
+          openAt: seen,
           law: null,
           douhou: outer.douhou,
           named: false,
@@ -114,8 +122,13 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
       } else if (!quoting && (c === "）" || c === ")") && stack.length > 1) {
         const inner = stack.pop();
         const outer = stack[stack.length - 1];
-        if (inner?.named && inner.douhou && outer) {
-          outer.douhou = inner.douhou;
+        if (inner?.named && outer) {
+          if (inner.douhou) {
+            outer.douhou = inner.douhou;
+          }
+          if (outer.law == null && inner.law) {
+            outer.law = inner.law;
+          }
         }
       }
       seen += 1;
@@ -129,7 +142,10 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     }
     const window = lawWindow(chars, span.start, prev);
     const dou = window === "同法";
-    const enumerated = window === null && isEnumeration(between);
+    let enumerated = window === null && isEnumeration(between);
+    if (enumerated && frame.openAt != null && !parenClosesInSentence(chars, frame.openAt)) {
+      enumerated = false;
+    }
     const inherited = dou || enumerated;
     const target = dou ? frame.douhou : frame.law;
     let name: string | null;
@@ -184,7 +200,10 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
       }
       continue;
     }
-    if (stack.some((item) => quoteStillOpen(chars, item.prevEnd, span.start))) {
+    const quoteOpen =
+      accepted > 0 && lastQuote !== null && lastQuote.open && lastQuote.at >= stack[0].prevEnd;
+    accepted += 1;
+    if (quoteOpen) {
       if (!alreadyMarked(chars, span.end)) {
         inserts.push(span.end);
       }
@@ -498,9 +517,7 @@ function peelGlue(chars: string[], end: number, floor: number): number | null {
 }
 
 function matchingOpenSameLine(chars: string[], closeAt: number, floor: number): number | null {
-  const close = chars[closeAt];
-  const open = close === "）" ? "（" : close === ")" ? "(" : "";
-  if (!open) {
+  if (!isCloseParen(chars[closeAt] ?? "")) {
     return null;
   }
   let depth = 0;
@@ -510,9 +527,9 @@ function matchingOpenSameLine(chars: string[], closeAt: number, floor: number): 
     if (isHardBoundary(c) && c !== "。" && c !== "！" && c !== "？" && c !== "!" && c !== "?") {
       return null;
     }
-    if (c === close) {
+    if (isCloseParen(c)) {
       depth += 1;
-    } else if (c === open) {
+    } else if (isOpenParen(c)) {
       depth -= 1;
       if (depth === 0) {
         return i;
@@ -624,6 +641,10 @@ function gapCore(chars: string[]): string {
       i += 1;
       continue;
     }
+    if (chars[i] === "）" || chars[i] === ")") {
+      i += 1;
+      continue;
+    }
     if (isCircled(chars[i])) {
       text += chars[i];
       i += 1;
@@ -637,17 +658,23 @@ function gapCore(chars: string[]): string {
   return text;
 }
 
+function isOpenParen(c: string): boolean {
+  return c === "（" || c === "(";
+}
+
+function isCloseParen(c: string): boolean {
+  return c === "）" || c === ")";
+}
+
 function matchingClose(chars: string[], openAt: number, limit: number): number | null {
-  const open = chars[openAt];
-  const close = open === "（" ? "）" : open === "(" ? ")" : "";
-  if (!close) {
+  if (!isOpenParen(chars[openAt] ?? "")) {
     return null;
   }
   let depth = 0;
   for (let i = openAt; i < Math.min(limit, chars.length); i += 1) {
-    if (chars[i] === open) {
+    if (isOpenParen(chars[i])) {
       depth += 1;
-    } else if (chars[i] === close) {
+    } else if (isCloseParen(chars[i])) {
       depth -= 1;
       if (depth === 0) {
         return i;
@@ -657,8 +684,42 @@ function matchingClose(chars: string[], openAt: number, limit: number): number |
   return null;
 }
 
-function isWellFormedRoman(text: string): boolean {
-  return text.length > 0 && text.length <= 12 && /^(c{0,3})(xc|xl|l?x{0,3})(ix|iv|v?i{0,3})$/i.test(text);
+function parenClosesInSentence(chars: string[], openAt: number): boolean {
+  let depth = 0;
+  let quote = false;
+  for (let i = openAt; i < chars.length; i += 1) {
+    const c = chars[i];
+    if (c === "「") {
+      quote = true;
+      continue;
+    }
+    if (c === "」") {
+      quote = false;
+      continue;
+    }
+    if (quote) {
+      continue;
+    }
+    if (isOpenParen(c)) {
+      depth += 1;
+      continue;
+    }
+    if (isCloseParen(c) && depth > 0) {
+      depth -= 1;
+      if (depth === 0) {
+        return true;
+      }
+      continue;
+    }
+    if (depth === 1 && isHardBoundary(c)) {
+      return false;
+    }
+  }
+  return false;
+}
+
+function isRomanLetterRun(text: string): boolean {
+  return /^[ivxlcⅰ-ⅻⅠ-Ⅻ]+$/iu.test(text);
 }
 
 function isListMarker(inner: string): boolean {
@@ -666,7 +727,7 @@ function isListMarker(inner: string): boolean {
   if (!text) {
     return false;
   }
-  if (isWellFormedRoman(text)) {
+  if (isRomanLetterRun(text)) {
     return true;
   }
   if (Array.from(text).length > 4) {
@@ -692,19 +753,6 @@ function isListMarker(inner: string): boolean {
 
 function isCircled(c: string): boolean {
   return /[①-⑳❶-❿㉑-㉟]/u.test(c);
-}
-
-function quoteStillOpen(chars: string[], from: number, until: number): boolean {
-  let open = false;
-  const end = Math.min(until, chars.length);
-  for (let i = Math.min(from, end); i < end; i += 1) {
-    if (chars[i] === "「") {
-      open = true;
-    } else if (chars[i] === "」") {
-      open = false;
-    }
-  }
-  return open;
 }
 
 function isLawChar(c: string): boolean {

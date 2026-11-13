@@ -29,7 +29,13 @@ pub(crate) static EAGER_NOTES: std::sync::atomic::AtomicBool =
 const UNCONFIRMED_MATCH_LABEL: &str = "一致";
 
 pub(crate) const DENY_LAW_NAME: &[&str] = &[
-    "方法", "手法", "療法", "用法", "違法", "適法", "合法", "魔法", "司法", "立法", "憲法改正",
+    "方法", "手法", "療法", "用法", "違法", "適法", "合法", "魔法", "司法", "立法", "憲法改正", "不法",
+];
+
+/// Whole phrases that are not law titles even with words in front.
+/// Short deny words stay exact, so 労働組合法 is not read as 合法.
+pub(crate) const DENY_LAW_ENDING: &[&str] = &[
+    "支払方法", "決済方法", "経営手法", "特別手法", "民間療法", "治療法",
 ];
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -340,12 +346,16 @@ fn judge(
                 Some(cached_article(&law, &row, &raw.display, true, &note))
             } else {
                 let got = ask();
-                if probing && got.as_ref().is_some_and(probe_failed) {
-                    let note = currency_note(got.as_ref().unwrap());
+                let fetch_failed = got.as_ref().is_some_and(|item| {
+                    probe_failed(item)
+                        || (known_amendment && item.miss == Some(ArticleMiss::NotFound))
+                });
+                if probing && fetch_failed {
+                    let raw_note = got.as_ref().unwrap().note.clone();
                     let note = if known_amendment {
-                        as_amendment_note(&note)
+                        as_amendment_note(&raw_note)
                     } else {
-                        note
+                        currency_note(got.as_ref().unwrap())
                     };
                     let _ = db.note_probe_failure(&law.law_id, &raw.key, &note);
                     if reloading {
@@ -537,13 +547,7 @@ fn http_digits(note: &str) -> Option<String> {
 /// The update list already named a newer text and the fetch failed.
 /// That is not the "could not confirm" case, so it stays 要確認.
 fn as_amendment_note(source: &str) -> String {
-    if let Some(digits) = http_digits(source) {
-        format!("改正あり・最新本文を取得できず（HTTP {digits}）")
-    } else if source.contains("接続") || source.contains("オフライン") || source.is_empty() {
-        "改正あり・最新本文を取得できず（e-Govに接続できず）".into()
-    } else {
-        "改正あり・最新本文を取得できず".into()
-    }
+    crate::statute::lookup::amendment_failure_note(source)
 }
 
 fn stale_amendment(
@@ -637,14 +641,11 @@ fn is_line_break(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{000B}' | '\u{2028}' | '\u{2029}')
 }
 
-/// A blank line in any convention, a Word paragraph mark (`\r` not part of `\r\n`),
-/// or a Unicode paragraph separator. A single `\n` or one `\r\n` stays inside a quote.
+/// A blank line (`\n\n`, `\r\r`, `\r\n\r\n`, mixed `\r\n\r` / `\n\r\n`) or U+2029.
+/// One `\n`, one `\r`, or one `\r\n` stays inside the quote.
 fn unfinished_quote_ends(chars: &[char], i: usize) -> bool {
     let c = chars[i];
     if c == '\u{2029}' {
-        return true;
-    }
-    if c == '\r' && chars.get(i + 1) != Some(&'\n') {
         return true;
     }
     if !is_line_break(c) {
@@ -1081,7 +1082,7 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
                 continue;
             }
         }
-        let ambiguous_douhou = dou && stack.iter().any(|frame| frame.ambiguous);
+        let ambiguous_douhou = dou && douhou_is_ambiguous(&stack);
         let inherit = if dou {
             stack[frame_i].douhou.clone()
         } else {
@@ -1101,7 +1102,7 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             // quote or the enumeration anchor. Those stay on the last row.
             continue;
         } else if let Some(window) = window.as_ref() {
-            if is_generic_houritsu(&window.text) {
+            if is_generic_houritsu(&window.text) && !known_law_name(db, &window.text) {
                 continue;
             }
             if is_historical_name(&window.text) {
@@ -1255,19 +1256,50 @@ fn is_deleted_body(body: &str) -> bool {
     text == "削除" || text == "（削除）"
 }
 
+fn is_real_houritsu_title(head: &str) -> bool {
+    ["に関する", "ための", "改正する", "廃止する", "制定する", "整備する", "施行する"]
+        .iter()
+        .any(|mark| head.contains(mark))
+}
+
 fn is_generic_houritsu(text: &str) -> bool {
     let Some(head) = text.strip_suffix("法律") else {
         return false;
     };
+    if is_real_houritsu_title(head) {
+        return false;
+    }
     const WORDS: &[&str] = &[
-        "", "この", "本", "当該", "関係", "他", "同", "上記", "前記", "各", "新しい", "旧", "次の", "その",
+        "", "この", "本", "当該", "関係", "他", "同", "上記", "前記", "各", "新しい", "旧", "次の", "その", "前の",
+        "改正後の", "改正前の", "現行の", "新たな", "新", "別の", "既存の", "一般の", "特別の", "両", "上の", "あの",
+        "いずれの", "適用される", "前掲",
     ];
     if WORDS.contains(&head) {
         return true;
     }
-    // 他の法律 / 前記の法律. Do not strip の from この法律 or その法律.
-    head.strip_suffix('の')
-        .is_some_and(|stripped| WORDS.contains(&stripped))
+    // 他の法律. この法律 is listed whole so its の is not stripped first.
+    if head.strip_suffix('の').is_some_and(|stripped| WORDS.contains(&stripped)) {
+        return true;
+    }
+    head.ends_with('の') || head.ends_with('な') || head.ends_with("される")
+}
+
+fn known_law_name(db: &StatuteDb, name: &str) -> bool {
+    super::catalog::CATALOG
+        .iter()
+        .any(|entry| entry.aliases.contains(&name))
+        || db.match_law_in_text(name).ok().flatten().is_some()
+}
+
+/// A parenthesis that named its own law owns 同法. Otherwise an enclosing
+/// frame that already saw a different law makes 同法 ambiguous.
+fn douhou_is_ambiguous(stack: &[Frame]) -> bool {
+    for frame in stack.iter().rev() {
+        if frame.open_at.is_some() && frame.named {
+            return false;
+        }
+    }
+    stack.iter().any(|frame| frame.ambiguous)
 }
 
 fn looks_like_law(text: &str) -> bool {
@@ -1386,21 +1418,13 @@ fn denied(db: &StatuteDb, window: &str) -> bool {
         .strip_prefix("改正")
         .or_else(|| window.strip_prefix("現行"))
         .unwrap_or(window);
-    if super::catalog::CATALOG
-        .iter()
-        .any(|entry| entry.aliases.contains(&name))
-        || db.match_law_in_text(name).ok().flatten().is_some()
-    {
+    if known_law_name(db, name) {
         return false;
     }
-    // 支払方法 ends in 方法. 行手法 and 医療法 keep the single character before
-    // 手法 / 療法, and catalog names such as 小切手法 stay.
-    DENY_LAW_NAME.iter().any(|deny| {
-        name == *deny
-            || name
-                .strip_suffix(deny)
-                .is_some_and(|rest| rest.chars().count() >= 2)
-    })
+    if DENY_LAW_NAME.contains(&name) {
+        return true;
+    }
+    DENY_LAW_ENDING.iter().any(|deny| name.ends_with(deny))
 }
 
 fn alias_offset(window: &str, db: &StatuteDb, law: &LawRef) -> usize {
@@ -1441,11 +1465,18 @@ fn enumeration_gap(between: &str, ignore_line_breaks: bool) -> bool {
     if gap_crosses_sentence(&chars, ignore_line_breaks) {
         return false;
     }
-    let text = gap_core(&chars);
-    matches!(
-        text.as_str(),
-        "及び" | "および" | "並びに" | "ならびに" | "又は" | "または" | "若しくは" | "、" | "，" | "・" | "と"
-    )
+    is_joiner_gap(&gap_core(&chars))
+}
+
+fn is_joiner_gap(text: &str) -> bool {
+    const JOINERS: &[&str] = &[
+        "及び", "および", "並びに", "ならびに", "又は", "または", "若しくは", "、", "，", "・", "と",
+    ];
+    if JOINERS.contains(&text) {
+        return true;
+    }
+    let trimmed = text.trim_matches(|c: char| matches!(c, '、' | '，' | '・'));
+    trimmed != text && JOINERS.contains(&trimmed)
 }
 
 /// 。！？ and line breaks end a lookback, except inside a parenthetical.
@@ -1725,6 +1756,10 @@ fn leading_connector_len(text: &str) -> Option<usize> {
         if text.starts_with(conn) {
             return Some(conn.chars().count());
         }
+    }
+    // と同法. として / とは stay particles, not joiners.
+    if text.strip_prefix('と').is_some_and(|rest| rest.starts_with("同法")) {
+        return Some(1);
     }
     None
 }
@@ -2976,6 +3011,25 @@ mod tests {
         assert!(
             one[0].reason.contains("改正あり・最新本文を取得できず（HTTP 503）"),
             "{one:?}"
+        );
+        let missing = crate::statute::egov::MapEgov::new(vec![(
+            "articles;".into(),
+            Err(crate::statute::egov::EgovFailure::NotFound),
+        )]);
+        let absent = check_text(
+            &newer(&[article("709", "第709条", "古い709")]),
+            &missing,
+            "民法第709条",
+            "2026-11-13",
+            true,
+        );
+        assert_eq!(absent[0].label, "要確認", "{absent:?}");
+        assert_ne!(absent[0].status, "number", "{absent:?}");
+        assert!(
+            absent[0]
+                .reason
+                .contains("改正あり・最新本文を取得できず（e-Govに該当本文なし）"),
+            "{absent:?}"
         );
 
         let dropped = check_text(

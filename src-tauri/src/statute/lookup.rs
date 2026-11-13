@@ -190,7 +190,7 @@ fn resolve_one(
                         return amendment_miss(
                             &law,
                             &cached.num,
-                            "改正あり・最新本文を取得できず",
+                            &amendment_failure_note("e-Govで条が見つかりませんでした"),
                         );
                     }
                     hit_from_cache(db, &law, &cached, true)
@@ -394,14 +394,27 @@ fn probe_article(
             }
             hit_from_cache(db, law, cached, true)
         }
-        Err(EgovFailure::NotFound) => miss_kind(
-            law_query,
-            article_query,
-            "e-Govで条が見つかりませんでした",
-            ArticleMiss::NotFound,
-        ),
+        Err(EgovFailure::NotFound) => {
+            if known_amendment(db, law) {
+                return amendment_miss(
+                    law,
+                    display,
+                    &amendment_failure_note("e-Govで条が見つかりませんでした"),
+                );
+            }
+            miss_kind(
+                law_query,
+                article_query,
+                "e-Govで条が見つかりませんでした",
+                ArticleMiss::NotFound,
+            )
+        }
         Err(EgovFailure::Bad(message)) => {
-            miss_kind(law_query, article_query, &egov_article_note(&message), ArticleMiss::Failed)
+            let note = egov_article_note(&message);
+            if known_amendment(db, law) {
+                return amendment_miss(law, display, &amendment_failure_note(&note));
+            }
+            miss_kind(law_query, article_query, &note, ArticleMiss::Failed)
         }
     }
 }
@@ -498,6 +511,30 @@ fn known_amendment(db: &StatuteDb, law: &LawRef) -> bool {
 
 fn amendment_miss(law: &LawRef, article: &str, note: &str) -> ToolArticle {
     miss_kind(&law.name, article, note, ArticleMiss::Failed)
+}
+
+/// Button and chat use the same sentence when a known amendment could not be fetched.
+pub(crate) fn amendment_failure_note(source: &str) -> String {
+    let reason = if http_code(source).as_deref() == Some("404")
+        || source.contains("見つかりません")
+        || source.contains("該当なし")
+        || source.contains("該当本文")
+    {
+        "e-Govに該当本文なし"
+    } else if let Some(code) = http_code(source) {
+        return format!("改正あり・最新本文を取得できず（HTTP {code}）");
+    } else if source.contains("オフライン") && !source.contains("接続") {
+        "オフライン"
+    } else {
+        "e-Govに接続できず"
+    };
+    format!("改正あり・最新本文を取得できず（{reason}）")
+}
+
+fn http_code(source: &str) -> Option<String> {
+    let rest = source.split("HTTP ").nth(1)?;
+    let code: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if code.len() == 3 { Some(code) } else { None }
 }
 
 fn hit_from_cache(
@@ -1402,5 +1439,73 @@ mod tests {
         let connect = resolve_articles(&db, &OfflineEgov, &query, "2026-11-11");
         assert!(!connect[0].verified, "{:?}", connect[0].note);
         assert!(connect[0].note.contains("接続"), "{:?}", connect[0].note);
+    }
+
+    #[test]
+    fn a_known_amendment_names_http_and_a_real_404() {
+        assert_eq!(
+            amendment_failure_note("法令APIが応答しませんでした（HTTP 503）"),
+            "改正あり・最新本文を取得できず（HTTP 503）"
+        );
+        assert_eq!(
+            amendment_failure_note("e-Govで条が見つかりませんでした"),
+            "改正あり・最新本文を取得できず（e-Govに該当本文なし）"
+        );
+        assert_eq!(
+            amendment_failure_note("法令APIが応答しませんでした（HTTP 404）"),
+            "改正あり・最新本文を取得できず（e-Govに該当本文なし）"
+        );
+        let db = temp_db();
+        seed_minpo(&db, "古い本文", "2020-04-01");
+        db.set_meta("updates_through", "2026-11-11").unwrap();
+        skip_today_list(&db);
+        db.store_updates(
+            "2026-04-01",
+            "2026-11-11",
+            &[crate::statute::xmlparse::ListedUpdate {
+                law_id: "129AC0000000089".into(),
+                as_of: "2026-04-01".into(),
+                enforce_on: "2026-04-01".into(),
+                pending: false,
+            }],
+        )
+        .unwrap();
+        let missing = MapEgov::new(vec![("articles;".into(), Err(EgovFailure::NotFound))]);
+        let hits = resolve_articles(
+            &db,
+            &missing,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "555".into(),
+            }],
+            "2026-11-11",
+        );
+        assert!(!hits[0].verified, "{:?}", hits[0].note);
+        assert_eq!(
+            hits[0].note,
+            "改正あり・最新本文を取得できず（e-Govに該当本文なし）"
+        );
+        let shown = crate::statute::format_tool_result(&hits, 0);
+        assert!(!shown.contains("確認済み"), "{shown}");
+        assert!(shown.contains("e-Govに該当本文なし"), "{shown}");
+        let http = MapEgov::new(vec![(
+            "articles;".into(),
+            Err(EgovFailure::Bad("法令APIが応答しませんでした（HTTP 503）".into())),
+        )]);
+        let stale = resolve_articles(
+            &db,
+            &http,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "555".into(),
+            }],
+            "2026-11-11",
+        );
+        assert_eq!(
+            stale[0].note,
+            "改正あり・最新本文を取得できず（HTTP 503）",
+            "{:?}",
+            stale[0].note
+        );
     }
 }

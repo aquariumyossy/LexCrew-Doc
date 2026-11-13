@@ -182,6 +182,9 @@ mod tests {
         let deny = file["deny"].as_array().unwrap();
         let got: Vec<&str> = deny.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(got, crate::statute::check::DENY_LAW_NAME);
+        let ending = file["denyEnding"].as_array().unwrap();
+        let got: Vec<&str> = ending.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(got, crate::statute::check::DENY_LAW_ENDING);
     }
 }
 

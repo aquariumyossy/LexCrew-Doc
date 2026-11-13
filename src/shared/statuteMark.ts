@@ -8,6 +8,7 @@ export const TOOL_RESULT_OMITTED = "（文脈の上限に達したため、こ�
 export const TOOL_RESULT_TRUNCATION_NOTE = "…（長いので省略しました）";
 
 const DENY_LAW_NAME = catalog.deny;
+const DENY_LAW_ENDING = catalog.denyEnding;
 
 type CatalogAlias = { alias: string; id: string; canonical: string };
 
@@ -219,7 +220,7 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     }
     const enumerated = window === null && isEnumeration(between, acrossLine);
     const inherited = dou || enumerated;
-    if (dou && stack.some((item) => item.ambiguous)) {
+    if (dou && douhouIsAmbiguous(stack)) {
       if (!alreadyMarked(chars, span.end)) {
         inserts.push(span.end);
       }
@@ -360,15 +361,20 @@ function deniedToken(window: string): boolean {
   if (resolveCatalog(name)) {
     return false;
   }
-  return DENY_LAW_NAME.some((deny) => {
-    if (name === deny) {
-      return true;
-    }
-    if (!name.endsWith(deny)) {
+  if (DENY_LAW_NAME.includes(name)) {
+    return true;
+  }
+  return DENY_LAW_ENDING.some((deny) => name.endsWith(deny));
+}
+
+function douhouIsAmbiguous(stack: EnumFrame[]): boolean {
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    const frame = stack[i];
+    if (frame?.openAt != null && frame.named) {
       return false;
     }
-    return Array.from(name.slice(0, name.length - deny.length)).length >= 2;
-  });
+  }
+  return stack.some((frame) => frame.ambiguous);
 }
 
 const NAME_PARTICLES = [
@@ -571,6 +577,8 @@ function lawWindow(chars: string[], citeStart: number, floor: number): string | 
   );
   if (lead) {
     raw = raw.slice(lead.length);
+  } else if (raw.startsWith("と同法")) {
+    raw = raw.slice(1);
   }
   const name = lawNameAfterParticle(raw);
   if (Array.from(name).length < 2) {
@@ -655,17 +663,60 @@ function lawKey(name: string): string {
   return resolveCatalog(name)?.id ?? name;
 }
 
+function isRealHouritsuTitle(head: string): boolean {
+  return ["に関する", "ための", "改正する", "廃止する", "制定する", "整備する", "施行する"].some((mark) =>
+    head.includes(mark)
+  );
+}
+
 function isGenericHouritsu(name: string): boolean {
   if (!name.endsWith("法律")) {
     return false;
   }
-  const words = ["", "この", "本", "当該", "関係", "他", "同", "上記", "前記", "各", "新しい", "旧", "次の", "その"];
   const head = name.slice(0, name.length - "法律".length);
+  if (isRealHouritsuTitle(head)) {
+    return false;
+  }
+  const words = [
+    "",
+    "この",
+    "本",
+    "当該",
+    "関係",
+    "他",
+    "同",
+    "上記",
+    "前記",
+    "各",
+    "新しい",
+    "旧",
+    "次の",
+    "その",
+    "前の",
+    "改正後の",
+    "改正前の",
+    "現行の",
+    "新たな",
+    "新",
+    "別の",
+    "既存の",
+    "一般の",
+    "特別の",
+    "両",
+    "上の",
+    "あの",
+    "いずれの",
+    "適用される",
+    "前掲",
+  ];
   if (words.includes(head)) {
     return true;
   }
-  const stripped = head.replace(/の$/u, "");
-  return stripped !== head && words.includes(stripped);
+  const stripped = head.endsWith("の") ? head.slice(0, -1) : head;
+  if (stripped !== head && words.includes(stripped)) {
+    return true;
+  }
+  return head.endsWith("の") || head.endsWith("な") || head.endsWith("される");
 }
 
 function looksLikeLawName(name: string): boolean {
@@ -687,7 +738,16 @@ function isEnumeration(between: string, ignoreLineBreaks = false): boolean {
     return false;
   }
   const text = gapCore(chars);
-  return ["及び", "および", "並びに", "ならびに", "又は", "または", "若しくは", "、", "，", "・", "と"].includes(text);
+  return isJoinerGap(text);
+}
+
+function isJoinerGap(text: string): boolean {
+  const joiners = ["及び", "および", "並びに", "ならびに", "又は", "または", "若しくは", "、", "，", "・", "と"];
+  if (joiners.includes(text)) {
+    return true;
+  }
+  const trimmed = text.replace(/^[、，・]+|[、，・]+$/gu, "");
+  return trimmed !== text && joiners.includes(trimmed);
 }
 
 function gapCrossesSentence(chars: string[], ignoreLineBreaks = false): boolean {
@@ -803,9 +863,6 @@ function isLineBreak(c: string): boolean {
 function unfinishedQuoteEnds(chars: string[], index: number): boolean {
   const c = chars[index];
   if (c === "\u2029") {
-    return true;
-  }
-  if (c === "\r" && chars[index + 1] !== "\n") {
     return true;
   }
   if (!isLineBreak(c)) {

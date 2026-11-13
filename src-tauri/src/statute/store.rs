@@ -178,6 +178,24 @@ impl StatuteDb {
         Ok(meta_locked(&conn, key)?.unwrap_or_default())
     }
 
+    pub fn note_probe_failure(&self, law_id: &str, key: &str) -> Result<(), String> {
+        self.set_meta(
+            &format!("probe_fail:{law_id}:{key}"),
+            &chrono::Utc::now().timestamp().to_string(),
+        )
+    }
+
+    /// A 429 or 500 on a currency probe. The next check inside an hour reuses the saved text.
+    pub fn probe_failure_is_fresh(&self, law_id: &str, key: &str) -> bool {
+        let raw = self
+            .meta(&format!("probe_fail:{law_id}:{key}"))
+            .unwrap_or_default();
+        let Ok(checked) = raw.parse::<i64>() else {
+            return false;
+        };
+        chrono::Utc::now().timestamp().saturating_sub(checked) < 60 * 60
+    }
+
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
         let conn = self.conn.lock();
         set_meta_locked(&conn, key, value)
@@ -940,10 +958,14 @@ pub fn alias_suffix_bounded(text: &str, alias: &str) -> bool {
 const NAME_PARTICLES: &[&str] = &[
     "によれば",
     "について",
+    "ならびに",
     "による",
     "により",
     "として",
     "同じく",
+    "および",
+    "並びに",
+    "または",
     "では",
     "には",
     "とは",
@@ -951,7 +973,9 @@ const NAME_PARTICLES: &[&str] = &[
     "上記",
     "から",
     "まで",
+    "及び",
     "なお",
+    "又は",
     "より",
 ];
 

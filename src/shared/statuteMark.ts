@@ -95,7 +95,6 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     const inherited = dou || enumerated;
     let name: string | null;
     if (!span.suppl && !dou && !enumerated && (window === null || !looksLikeLawName(window))) {
-      previousEnd = span.end;
       continue;
     }
     if (dou && currentLaw === null) {
@@ -109,9 +108,9 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     } else if (window) {
       if (deniedToken(window)) {
         currentLaw = null;
-        previousEnd = span.end;
         if (span.suppl && !alreadyMarked(chars, span.end)) {
           inserts.push(span.end);
+          previousEnd = span.end;
         }
         continue;
       }
@@ -126,24 +125,31 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
         name = window;
       } else {
         currentLaw = null;
-        previousEnd = span.end;
         if (span.suppl && !alreadyMarked(chars, span.end)) {
           inserts.push(span.end);
+          previousEnd = span.end;
         }
         continue;
       }
     } else {
       currentLaw = null;
-      previousEnd = span.end;
       if (span.suppl && !alreadyMarked(chars, span.end)) {
         inserts.push(span.end);
+        previousEnd = span.end;
       }
       continue;
     }
-    if (!name) {
+    if (quoteStillOpen(chars, previousEnd, span.start)) {
+      if (!alreadyMarked(chars, span.end)) {
+        inserts.push(span.end);
+      }
       previousEnd = span.end;
+      continue;
+    }
+    if (!name) {
       if ((span.suppl || dou) && !alreadyMarked(chars, span.end)) {
         inserts.push(span.end);
+        previousEnd = span.end;
       }
       continue;
     }
@@ -214,10 +220,14 @@ function deniedToken(window: string): boolean {
 const NAME_PARTICLES = [
   "によれば",
   "について",
+  "ならびに",
   "による",
   "により",
   "として",
   "同じく",
+  "および",
+  "並びに",
+  "または",
   "では",
   "には",
   "とは",
@@ -225,7 +235,9 @@ const NAME_PARTICLES = [
   "上記",
   "から",
   "まで",
+  "及び",
   "なお",
+  "又は",
   "より",
 ];
 
@@ -323,19 +335,34 @@ function longestVerifiedSuffix(window: string, verified: VerifiedCite[]): string
   return best;
 }
 
+function isHardBoundary(c: string): boolean {
+  return c === "。" || c === "！" || c === "？" || c === "!" || c === "?" || c === "\n" || c === "\r";
+}
+
+function isHspace(c: string): boolean {
+  return c === " " || c === "\u3000" || c === "\t";
+}
+
 function lawWindow(chars: string[], citeStart: number, floor: number): string | null {
   const stop = Math.min(floor, citeStart);
   let end = citeStart;
-  while (end > stop && /\s/u.test(chars[end - 1])) {
+  while (end > stop && isHspace(chars[end - 1])) {
     end -= 1;
   }
-  end = peelGlue(chars, end, stop);
+  if (end > stop && isHardBoundary(chars[end - 1])) {
+    return null;
+  }
+  const peeledEnd = peelGlue(chars, end, stop);
+  if (peeledEnd === null) {
+    return null;
+  }
+  end = peeledEnd;
   const tail = chars.slice(Math.max(stop, end - 6), end).join("");
   if (["若しくは", "並びに", "および", "又は", "または", "及び", "、", "，", "・", "と", "か"].some((c) => tail.endsWith(c))) {
     return null;
   }
   let start = end;
-  while (start > stop && isLawChar(chars[start - 1])) {
+  while (start > stop && isLawChar(chars[start - 1]) && !isHardBoundary(chars[start - 1])) {
     start -= 1;
   }
   if (start >= end) {
@@ -352,38 +379,67 @@ function lawWindow(chars: string[], citeStart: number, floor: number): string | 
   return Array.from(name).length < 2 ? null : name;
 }
 
-function peelGlue(chars: string[], end: number, floor: number): number {
+function peelGlue(chars: string[], end: number, floor: number): number | null {
   let cursor = end;
-  while (cursor > floor) {
-    while (cursor > floor && /\s/u.test(chars[cursor - 1])) {
+  while (true) {
+    while (cursor > floor && isHspace(chars[cursor - 1])) {
       cursor -= 1;
     }
-    if (cursor > floor && chars[cursor - 1] === "の") {
+    if (cursor === floor || isHardBoundary(chars[cursor - 1])) {
+      break;
+    }
+    if (chars[cursor - 1] === "の") {
       cursor -= 1;
       continue;
     }
-    if (cursor > floor && (chars[cursor - 1] === "）" || chars[cursor - 1] === ")")) {
-      const open = chars[cursor - 1] === "）" ? "（" : "(";
-      let j = cursor - 1;
-      let openAt = -1;
-      while (j > floor) {
-        j -= 1;
-        if (chars[j] === open) {
-          openAt = j;
-          break;
-        }
-        if (chars[j] === chars[cursor - 1]) {
-          break;
-        }
+    if (chars[cursor - 1] === "）" || chars[cursor - 1] === ")") {
+      const openAt = matchingOpenSameLine(chars, cursor - 1, floor);
+      if (openAt === null) {
+        return null;
       }
-      if (openAt >= 0) {
-        cursor = openAt;
-        continue;
+      const inner = chars.slice(openAt + 1, cursor - 1).join("");
+      if (!isPromulgation(inner)) {
+        return null;
       }
+      cursor = openAt;
+      continue;
     }
     break;
   }
   return cursor;
+}
+
+function matchingOpenSameLine(chars: string[], closeAt: number, floor: number): number | null {
+  const close = chars[closeAt];
+  const open = close === "）" ? "（" : close === ")" ? "(" : "";
+  if (!open) {
+    return null;
+  }
+  let depth = 0;
+  let i = closeAt;
+  while (true) {
+    const c = chars[i];
+    if (c === "\n" || c === "\r") {
+      return null;
+    }
+    if (c === close) {
+      depth += 1;
+    } else if (c === open) {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
+    if (i === floor) {
+      return null;
+    }
+    i -= 1;
+  }
+}
+
+function isPromulgation(inner: string): boolean {
+  const kind = ["法律", "政令", "勅令", "府令", "省令", "規則", "条例"].some((name) => inner.includes(name));
+  return inner.includes("年") && kind && inner.includes("第") && inner.includes("号");
 }
 
 function looksLikeLawName(name: string): boolean {
@@ -397,12 +453,136 @@ function looksLikeLawName(name: string): boolean {
 }
 
 function isEnumeration(between: string): boolean {
-  const text = between
-    .replace(/「[^」]*」/gu, "")
-    .replace(/（[^）]*）/gu, "")
-    .replace(/\([^)]*\)/gu, "")
-    .replace(/\s/gu, "");
+  const chars = Array.from(between);
+  if (gapCrossesSentence(chars)) {
+    return false;
+  }
+  const text = gapCore(chars);
   return ["及び", "および", "並びに", "ならびに", "又は", "または", "若しくは", "、", "，", "・"].includes(text);
+}
+
+function gapCrossesSentence(chars: string[]): boolean {
+  let depth = 0;
+  let quote = false;
+  for (const c of chars) {
+    if (c === "「") {
+      quote = true;
+      continue;
+    }
+    if (c === "」") {
+      quote = false;
+      continue;
+    }
+    if (quote) {
+      continue;
+    }
+    if (c === "（" || c === "(") {
+      depth += 1;
+      continue;
+    }
+    if ((c === "）" || c === ")") && depth > 0) {
+      depth -= 1;
+      continue;
+    }
+    if (depth === 0 && isHardBoundary(c)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function gapCore(chars: string[]): string {
+  let text = "";
+  let i = 0;
+  while (i < chars.length) {
+    if (chars[i] === "「") {
+      let j = i + 1;
+      while (j < chars.length && chars[j] !== "」") {
+        j += 1;
+      }
+      if (j >= chars.length) {
+        text += chars.slice(i).join("");
+        break;
+      }
+      i = j + 1;
+      continue;
+    }
+    if (chars[i] === "（" || chars[i] === "(") {
+      const close = matchingClose(chars, i, chars.length);
+      if (close !== null) {
+        const inner = chars.slice(i + 1, close).join("");
+        if (isListMarker(inner)) {
+          text += chars[i] + inner + chars[close];
+        }
+        i = close + 1;
+        continue;
+      }
+      text += chars[i];
+      i += 1;
+      continue;
+    }
+    if (isCircled(chars[i])) {
+      text += chars[i];
+      i += 1;
+      continue;
+    }
+    if (!/\s/u.test(chars[i])) {
+      text += chars[i];
+    }
+    i += 1;
+  }
+  return text;
+}
+
+function matchingClose(chars: string[], openAt: number, limit: number): number | null {
+  const open = chars[openAt];
+  const close = open === "（" ? "）" : open === "(" ? ")" : "";
+  if (!close) {
+    return null;
+  }
+  let depth = 0;
+  for (let i = openAt; i < Math.min(limit, chars.length); i += 1) {
+    if (chars[i] === open) {
+      depth += 1;
+    } else if (chars[i] === close) {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+  return null;
+}
+
+function isListMarker(inner: string): boolean {
+  const text = inner.trim();
+  if (!text || Array.from(text).length > 3) {
+    return false;
+  }
+  if (/^[0-9０-９]+$/u.test(text)) {
+    return true;
+  }
+  if (Array.from(text).length === 1 && (/[ア-ン]/u.test(text) || isCircled(text))) {
+    return true;
+  }
+  return /^[一二三四五六七八九十百千]+$/u.test(text);
+}
+
+function isCircled(c: string): boolean {
+  return /[①-⑳❶-❿㉑-㉟]/u.test(c);
+}
+
+function quoteStillOpen(chars: string[], from: number, until: number): boolean {
+  let open = false;
+  const end = Math.min(until, chars.length);
+  for (let i = Math.min(from, end); i < end; i += 1) {
+    if (chars[i] === "「") {
+      open = true;
+    } else if (chars[i] === "」") {
+      open = false;
+    }
+  }
+  return open;
 }
 
 function isLawChar(c: string): boolean {

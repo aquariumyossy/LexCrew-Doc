@@ -122,25 +122,7 @@ fn resolve_one(
     }
     let cached = cached.expect("cached");
     let remote = db.remote_as_of(&law.law_id).ok().flatten();
-    let (from, through, count) = db.update_span().unwrap_or((None, None, 0));
-    let covered = updates_cover(
-        &law.as_of,
-        today,
-        from.as_deref(),
-        through.as_deref(),
-        count,
-    );
-    let pending_due = db.pending_due(&law.law_id, today).unwrap_or(false);
-    let action = revision_action(&RevisionInput {
-        stored_as_of: &law.as_of,
-        today,
-        remote_as_of: remote.as_deref(),
-        covered,
-        offline: *offline,
-        cached_articles: law.article_count,
-        probed_on: &cached.probed_on,
-        pending_due,
-    });
+    let action = revision_for(db, &law, &cached, today, *offline);
     match action {
         RevisionAction::Keep { offline } => hit_from_cache(&db, &law, &cached, offline),
         RevisionAction::ProbeArticle => probe_article(
@@ -562,6 +544,39 @@ fn resolve_law(
 /// must not count as "today is done". Re-check at most once per hour.
 const TODAY_LIST_INTERVAL_SECS: i64 = 60 * 60;
 const UPDATES_TODAY_CHECKED: &str = "updates_today_checked";
+
+pub(crate) fn warm_updates(db: &StatuteDb, client: &dyn EgovSource, today: &str) -> bool {
+    sync_updates(db, client, today)
+}
+
+pub(crate) fn revision_for(
+    db: &StatuteDb,
+    law: &LawRef,
+    cached: &crate::statute::store::ArticleRow,
+    today: &str,
+    offline: bool,
+) -> RevisionAction {
+    let remote = db.remote_as_of(&law.law_id).ok().flatten();
+    let (from, through, count) = db.update_span().unwrap_or((None, None, 0));
+    let covered = updates_cover(
+        &law.as_of,
+        today,
+        from.as_deref(),
+        through.as_deref(),
+        count,
+    );
+    let pending_due = db.pending_due(&law.law_id, today).unwrap_or(false);
+    revision_action(&RevisionInput {
+        stored_as_of: &law.as_of,
+        today,
+        remote_as_of: remote.as_deref(),
+        covered,
+        offline,
+        cached_articles: law.article_count,
+        probed_on: &cached.probed_on,
+        pending_due,
+    })
+}
 
 fn sync_updates(db: &StatuteDb, client: &dyn EgovSource, today: &str) -> bool {
     let Some(today_d) = parse_ymd(today) else {

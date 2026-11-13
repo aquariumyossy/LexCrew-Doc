@@ -1,0 +1,111 @@
+[
+  {
+    "id": "m1-minpo-heading",
+    "text": "関係法令：民法\n（目的）\n第1条　本契約は",
+    "rows": []
+  },
+  {
+    "id": "m1-company-heading",
+    "text": "会社法\n（定義）\n第2条　この契約において",
+    "rows": []
+  },
+  {
+    "id": "m1-two-laws",
+    "text": "関係法令：会社法、民法\n\n（定義）\n第2条",
+    "rows": []
+  },
+  {
+    "id": "m1-jurisdiction",
+    "text": "準拠法　日本法\n（管轄）\n第20条",
+    "rows": []
+  },
+  {
+    "id": "m2-quote-spans-a-sentence",
+    "text": "民法第1条「私権の話。第2条は本契約の目的である。民法第90条この文章は第九十条の条文ではない。」",
+    "rows": [
+      { "law": "民法", "key": "1" },
+      { "law": "民法", "key": "90", "label": "要確認", "reasonHas": "引用" }
+    ]
+  },
+  {
+    "id": "m3-nested-heading",
+    "text": "民法第709条（不法行為（故意））及び第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "m4-except",
+    "text": "民法第709条（第1条を除く。）及び第2条",
+    "rows": [
+      { "law": "民法", "key": "709", "label": "一致" },
+      { "law": "民法", "key": "2" }
+    ]
+  },
+  {
+    "id": "m4-defined-term",
+    "text": "民法第709条（本契約において「甲」という。本契約第8条参照）及び第710条",
+    "rows": [
+      { "law": "民法", "key": "709", "label": "一致" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "keep-promulgation",
+    "text": "民法（明治二十九年法律第八十九号）第709条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "keep-promulgation-alias",
+    "text": "会社法（平成十七年法律第八十六号。以下「法」という。）第2条",
+    "rows": [{ "law": "会社法", "key": "2" }]
+  },
+  {
+    "id": "keep-no",
+    "text": "民法の第709条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "keep-douhou-no",
+    "text": "民法第709条を準用する。同法の第90条。",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "90" }
+    ]
+  },
+  {
+    "id": "keep-flat-heading",
+    "text": "民法第709条（不法行為）及び第710条（財産以外の損害）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ],
+    "mark": "第710条（要確認）（財産以外の損害）"
+  },
+  {
+    "id": "keep-tadashi",
+    "text": "民法第709条、ただし第710条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "keep-parenthetical-aside",
+    "text": "（なお第1条は別）",
+    "rows": []
+  },
+  {
+    "id": "r5-list-marker",
+    "text": "民法第709条、（ア）第5条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "r1-period",
+    "text": "民法第709条。第2条は目的である。",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "nit-joiner-before-name",
+    "text": "本件及び民法第1条",
+    "rows": [{ "law": "民法", "key": "1" }]
+  }
+]

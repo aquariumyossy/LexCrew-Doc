@@ -60,6 +60,7 @@ struct Raw {
 }
 
 const MAX_ONLINE: usize = 50;
+const MAX_PROBES: usize = 50;
 const ONLINE_GAP_MS: u64 = 350;
 
 pub fn check_text(
@@ -69,7 +70,16 @@ pub fn check_text(
     today: &str,
     online: bool,
 ) -> Vec<CheckHit> {
-    check_text_opts(db, client, text, today, online, MAX_ONLINE, ONLINE_GAP_MS)
+    check_text_opts(
+        db,
+        client,
+        text,
+        today,
+        online,
+        MAX_ONLINE,
+        ONLINE_GAP_MS,
+        MAX_PROBES,
+    )
 }
 
 thread_local! {
@@ -99,21 +109,32 @@ pub fn check_text_opts(
     online: bool,
     max_online: usize,
     delay_ms: u64,
+    probe_cap: usize,
 ) -> Vec<CheckHit> {
     let raws = scan(db, text);
     if raws.is_empty() {
         return Vec::new();
+    }
+    let guarded = LocalNames { inner: client };
+    if online {
+        let _ = crate::statute::lookup::warm_updates(db, &guarded, today);
     }
     let budget = OnlineBudget {
         max: max_online,
         delay_ms,
         used: std::cell::Cell::new(0usize),
     };
-    let guarded = LocalNames { inner: client };
+    let probes = OnlineBudget {
+        max: probe_cap,
+        delay_ms,
+        used: std::cell::Cell::new(0usize),
+    };
     let mut out = Vec::new();
     for raw in raws {
         let occurrence = literal_occurrence(text, &raw.anchor, raw.start);
-        out.push(judge(db, &guarded, raw, today, online, &budget, occurrence));
+        out.push(judge(
+            db, &guarded, raw, today, online, &budget, &probes, occurrence,
+        ));
     }
     out
 }
@@ -174,6 +195,7 @@ fn judge(
     today: &str,
     online: bool,
     budget: &OnlineBudget,
+    probes: &OnlineBudget,
     occurrence: usize,
 ) -> CheckHit {
     let mut hit = CheckHit {
@@ -232,24 +254,46 @@ fn judge(
             hit.reason = "照合を中止しました。".into();
             return hit;
         }
-        // A saved row still goes through revision_action. The fetch budget
-        // applies only when the article is not already on disk.
-        if local.is_none() && !budget.allow() {
-            hit.reason = "件数が多いため未確認".into();
-            return hit;
-        }
         let guarded = LocalNames { inner: client };
-        resolve_without_refresh(
-            db,
-            &guarded,
-            &[ArticleQuery {
-                law: law.name.clone(),
-                article: raw.display.clone(),
-            }],
-            today,
-        )
-        .into_iter()
-        .next()
+        let ask = || {
+            resolve_without_refresh(
+                db,
+                &guarded,
+                &[ArticleQuery {
+                    law: law.name.clone(),
+                    article: raw.display.clone(),
+                }],
+                today,
+            )
+            .into_iter()
+            .next()
+        };
+        if let Some(row) = local.clone() {
+            let action = crate::statute::lookup::revision_for(db, &law, &row, today, false);
+            let probing = matches!(
+                action,
+                crate::statute::refresh::RevisionAction::ProbeArticle
+                    | crate::statute::refresh::RevisionAction::ReloadLaw { .. }
+            );
+            let cooled = db.probe_failure_is_fresh(&law.law_id, &raw.key);
+            if probing && (cooled || !probes.allow()) {
+                Some(cached_article(&law, &row, &raw.display, true))
+            } else {
+                let got = ask();
+                if probing && got.as_ref().is_some_and(|item| probe_burst(&item.note)) {
+                    let _ = db.note_probe_failure(&law.law_id, &raw.key);
+                    Some(cached_article(&law, &row, &raw.display, true))
+                } else {
+                    got
+                }
+            }
+        } else {
+            if !budget.allow() {
+                hit.reason = "件数が多いため未確認".into();
+                return hit;
+            }
+            ask()
+        }
     } else if let Some(row) = local.clone() {
         Some(ToolArticle {
             names: vec![law.name.clone()],
@@ -304,21 +348,33 @@ fn judge(
     } else {
         format!("（{}）\n{}", article.heading, article.body)
     };
+    let confirmed = article.verified
+        && !article.offline
+        && db
+            .lookup_article(&law.law_id, &raw.key)
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.probed_on == today);
     let target = match clause_text(&article.body, raw.paragraph, raw.item, &raw.item_branch) {
         Ok(text) => text,
-        Err(ClauseMiss::Paragraph(n)) => {
-            return number_miss(hit, &format!("第{n}項はありません。"));
-        }
-        Err(ClauseMiss::Item(n)) => {
-            return number_miss(hit, &format!("第{n}号はありません。"));
-        }
-        Err(ClauseMiss::Branch(item, branches)) => {
-            let tail = branches
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join("の");
-            return number_miss(hit, &format!("第{item}号の{tail}はありません。"));
+        Err(miss) => {
+            let what = match &miss {
+                ClauseMiss::Paragraph(n) => format!("第{n}項"),
+                ClauseMiss::Item(n) => format!("第{n}号"),
+                ClauseMiss::Branch(item, branches) => {
+                    let tail = branches
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join("の");
+                    format!("第{item}号の{tail}")
+                }
+            };
+            if !confirmed {
+                hit.reason = format!("保存済みの本文に{what}がありません（未確認）");
+                return hit;
+            }
+            return number_miss(hit, &format!("{what}はありません。"));
         }
     };
     if is_deleted_text(&target) {
@@ -348,6 +404,31 @@ fn judge(
     hit.status = "match".into();
     hit.label = "一致".into();
     hit
+}
+
+fn cached_article(
+    law: &LawRef,
+    row: &crate::statute::store::ArticleRow,
+    article_query: &str,
+    offline: bool,
+) -> ToolArticle {
+    ToolArticle {
+        names: vec![law.name.clone()],
+        article_num: row.num.clone(),
+        heading: row.heading.clone(),
+        body: row.body.clone(),
+        as_of: row.as_of.clone(),
+        verified: true,
+        offline,
+        note: String::new(),
+        law_query: law.name.clone(),
+        article_query: article_query.to_string(),
+        miss: None,
+    }
+}
+
+fn probe_burst(note: &str) -> bool {
+    note.contains("HTTP 429") || note.contains("HTTP 500")
 }
 
 fn number_miss(mut hit: CheckHit, reason: &str) -> CheckHit {
@@ -393,7 +474,6 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
         if let Some(window) = window.as_ref() {
             if window.text != "同法" && denied(&window.text) {
                 current = None;
-                prev_end = span.end;
                 continue;
             }
         }
@@ -408,14 +488,12 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
                 Some(Current::Law(law)) => (Some(law), String::new(), false, false),
                 Some(Current::Historical(name)) => (None, name, false, true),
                 None => {
-                    prev_end = span.end.min(chars.len());
                     continue;
                 }
             }
         } else if window.is_none() {
-            // A bare 第N条 after a sentence or ordinary words is the contract's
-            // own article, not a statute citation.
-            prev_end = span.end.min(chars.len());
+            // A bare 第N条 that is not part of this citation does not move the
+            // quote or the enumeration anchor. Those stay on the last row.
             continue;
         } else if let Some(window) = window.as_ref() {
             if is_historical_name(&window.text) {
@@ -432,14 +510,12 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
                         (None, window.text.clone(), false, false)
                     }
                     _ => {
-                        prev_end = span.end;
                         continue;
                     }
                 }
             }
         } else {
             current = None;
-            prev_end = span.end;
             continue;
         };
         let clause = read_clause(&chars, span.end, next);
@@ -587,17 +663,20 @@ struct Window {
 fn law_window(chars: &[char], cite_start: usize, floor: usize) -> Option<Window> {
     let floor = floor.min(cite_start);
     let mut end = cite_start;
-    while end > floor && chars[end - 1].is_whitespace() {
+    while end > floor && is_hspace(chars[end - 1]) {
         end -= 1;
     }
-    end = peel_glue(chars, end, floor);
+    if end > floor && is_hard_boundary(chars[end - 1]) {
+        return None;
+    }
+    end = peel_glue(chars, end, floor)?;
     if let Some(cut) = strip_connector(chars, end) {
         if cut < end && cut >= floor {
             return None;
         }
     }
     let mut start = end;
-    while start > floor && is_law_char(chars[start - 1]) {
+    while start > floor && is_law_char(chars[start - 1]) && !is_hard_boundary(chars[start - 1]) {
         start -= 1;
     }
     if start >= end {
@@ -671,38 +750,91 @@ fn denied(window: &str) -> bool {
     DENY_LAW_NAME.iter().any(|deny| name == *deny || window == *deny)
 }
 
+fn is_hard_boundary(c: char) -> bool {
+    matches!(c, '。' | '！' | '？' | '!' | '?' | '\n' | '\r')
+}
+
+fn is_hspace(c: char) -> bool {
+    matches!(c, ' ' | '\u{3000}' | '\t')
+}
+
 fn enumeration_gap(between: &str) -> bool {
-    let text = gap_core(between);
+    let chars: Vec<char> = between.chars().collect();
+    if gap_crosses_sentence(&chars) {
+        return false;
+    }
+    let text = gap_core(&chars);
     matches!(
         text.as_str(),
         "及び" | "および" | "並びに" | "ならびに" | "又は" | "または" | "若しくは" | "、" | "，" | "・"
     )
 }
 
-fn gap_core(between: &str) -> String {
-    let chars: Vec<char> = between.chars().collect();
+/// 。！？ and line breaks end a lookback, except inside a parenthetical.
+fn gap_crosses_sentence(chars: &[char]) -> bool {
+    let mut depth = 0i32;
+    let mut quote = false;
+    for &c in chars {
+        if c == '「' {
+            quote = true;
+            continue;
+        }
+        if c == '」' {
+            quote = false;
+            continue;
+        }
+        if quote {
+            continue;
+        }
+        if c == '（' || c == '(' {
+            depth += 1;
+            continue;
+        }
+        if (c == '）' || c == ')') && depth > 0 {
+            depth -= 1;
+            continue;
+        }
+        if depth == 0 && is_hard_boundary(c) {
+            return true;
+        }
+    }
+    false
+}
+
+fn gap_core(chars: &[char]) -> String {
     let mut text = String::new();
     let mut i = 0usize;
     while i < chars.len() {
         if chars[i] == '「' {
-            i += 1;
-            while i < chars.len() && chars[i] != '」' {
-                i += 1;
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '」' {
+                j += 1;
             }
-            if i < chars.len() {
-                i += 1;
+            if j >= chars.len() {
+                text.extend(chars[i..].iter());
+                break;
             }
+            i = j + 1;
             continue;
         }
         if chars[i] == '（' || chars[i] == '(' {
-            let close = if chars[i] == '（' { '）' } else { ')' };
+            if let Some(close) = matching_close(chars, i, chars.len()) {
+                let inner: String = chars[i + 1..close].iter().collect();
+                if is_list_marker(&inner) || is_circled_run(&inner) {
+                    text.push(chars[i]);
+                    text.push_str(&inner);
+                    text.push(chars[close]);
+                }
+                i = close + 1;
+                continue;
+            }
+            text.push(chars[i]);
             i += 1;
-            while i < chars.len() && chars[i] != close {
-                i += 1;
-            }
-            if i < chars.len() {
-                i += 1;
-            }
+            continue;
+        }
+        if is_circled(chars[i]) {
+            text.push(chars[i]);
+            i += 1;
             continue;
         }
         if !chars[i].is_whitespace() {
@@ -713,38 +845,114 @@ fn gap_core(between: &str) -> String {
     text
 }
 
-fn peel_glue(chars: &[char], mut end: usize, floor: usize) -> usize {
+fn matching_close(chars: &[char], open_at: usize, limit: usize) -> Option<usize> {
+    let open = chars.get(open_at).copied()?;
+    let close = match open {
+        '（' => '）',
+        '(' => ')',
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    for i in open_at..limit.min(chars.len()) {
+        if chars[i] == open {
+            depth += 1;
+        } else if chars[i] == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn is_list_marker(inner: &str) -> bool {
+    let text = inner.trim();
+    if text.is_empty() || text.chars().count() > 3 {
+        return false;
+    }
+    if text.chars().all(|c| c.is_ascii_digit() || ('０'..='９').contains(&c)) {
+        return true;
+    }
+    if text.chars().count() == 1 {
+        let c = text.chars().next().unwrap();
+        if ('ア'..='ン').contains(&c) || is_circled(c) {
+            return true;
+        }
+    }
+    parse_legal_numeral(text).is_some()
+}
+
+fn is_circled(c: char) -> bool {
+    ('①'..='⑳').contains(&c) || ('❶'..='❿').contains(&c) || ('㉑'..='㉟').contains(&c)
+}
+
+fn is_circled_run(text: &str) -> bool {
+    text.chars().all(is_circled) && !text.is_empty()
+}
+
+/// Only an enactment parenthesis may sit between a law name and 第.
+/// A heading such as （目的） blocks the name. Matching is nested and stops at a line break.
+fn peel_glue(chars: &[char], mut end: usize, floor: usize) -> Option<usize> {
     loop {
-        while end > floor && chars[end - 1].is_whitespace() {
+        while end > floor && is_hspace(chars[end - 1]) {
             end -= 1;
         }
-        if end > floor && chars[end - 1] == 'の' {
+        if end == floor || is_hard_boundary(chars[end - 1]) {
+            break;
+        }
+        if chars[end - 1] == 'の' {
             end -= 1;
             continue;
         }
-        if end > floor && matches!(chars[end - 1], '）' | ')') {
-            let close = chars[end - 1];
-            let open = if close == '）' { '（' } else { '(' };
-            let mut j = end - 1;
-            let mut open_at = None;
-            while j > floor {
-                j -= 1;
-                if chars[j] == open {
-                    open_at = Some(j);
-                    break;
-                }
-                if chars[j] == close {
-                    break;
-                }
+        if matches!(chars[end - 1], '）' | ')') {
+            let open_at = matching_open_same_line(chars, end - 1, floor)?;
+            let inner: String = chars[open_at + 1..end - 1].iter().collect();
+            if !is_promulgation(&inner) {
+                return None;
             }
-            if let Some(at) = open_at {
-                end = at;
-                continue;
-            }
+            end = open_at;
+            continue;
         }
         break;
     }
-    end
+    Some(end)
+}
+
+fn matching_open_same_line(chars: &[char], close_at: usize, floor: usize) -> Option<usize> {
+    let close = chars.get(close_at).copied()?;
+    let open = match close {
+        '）' => '（',
+        ')' => '(',
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    let mut i = close_at;
+    loop {
+        let c = chars[i];
+        if c == '\n' || c == '\r' {
+            return None;
+        }
+        if c == close {
+            depth += 1;
+        } else if c == open {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        if i == floor {
+            return None;
+        }
+        i -= 1;
+    }
+}
+
+fn is_promulgation(inner: &str) -> bool {
+    let kind = ["法律", "政令", "勅令", "府令", "省令", "規則", "条例"]
+        .iter()
+        .any(|kind| inner.contains(kind));
+    inner.contains('年') && kind && inner.contains('第') && inner.contains('号')
 }
 
 fn leading_connector_len(text: &str) -> Option<usize> {
@@ -979,7 +1187,17 @@ fn quote_nearby(chars: &[char], start: usize, limit: usize) -> bool {
     if start >= end {
         return false;
     }
-    chars[start..end].contains(&'「')
+    let mut depth = 0i32;
+    for &c in &chars[start..end] {
+        if c == '（' || c == '(' {
+            depth += 1;
+        } else if (c == '）' || c == ')') && depth > 0 {
+            depth -= 1;
+        } else if c == '「' && depth == 0 {
+            return true;
+        }
+    }
+    false
 }
 
 fn closes_paren(chars: &[char], end: usize, limit: usize) -> bool {
@@ -1387,8 +1605,9 @@ mod tests {
         );
 
         let missing_item = statuses("民法第415条第2項第9号");
-        assert_eq!(missing_item[0].label, "番号違い", "{missing_item:?}");
-        assert_eq!(missing_item[0].reason, "第9号はありません。");
+        assert_eq!(missing_item[0].label, "要確認", "{missing_item:?}");
+        assert!(missing_item[0].reason.contains("第9号"), "{missing_item:?}");
+        assert!(missing_item[0].reason.contains("未確認"), "{missing_item:?}");
     }
 
     #[test]
@@ -1527,7 +1746,8 @@ mod tests {
         let hits = statuses("民法第415条第100項。民法第415条第2項第1号の2。");
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert!(hits[0].citation.contains("100") || hits[0].citation.contains("第100項"), "{hits:?}");
-        assert_eq!(hits[0].label, "番号違い", "{hits:?}");
+        assert_eq!(hits[0].label, "要確認", "{hits:?}");
+        assert!(hits[0].reason.contains("未確認"), "{hits:?}");
         assert!(hits[1].citation.contains("号の2") || hits[1].citation.contains("の2"), "{hits:?}");
         assert_ne!(hits[1].label, "一致", "{hits:?}");
     }
@@ -1582,6 +1802,7 @@ mod tests {
             true,
             0,
             0,
+            MAX_PROBES,
         );
         assert!(hits.iter().all(|hit| hit.reason.contains("件数が多い")), "{hits:?}");
     }
@@ -1763,7 +1984,8 @@ mod tests {
         assert!(!hits[0].article_text.contains("親の本文"), "{hits:?}");
         assert_eq!(hits[1].label, "一致", "{hits:?}");
         assert!(hits[1].article_text.contains("末尾"), "{hits:?}");
-        assert_eq!(hits[2].label, "番号違い", "{hits:?}");
+        assert_eq!(hits[2].label, "要確認", "{hits:?}");
+        assert!(hits[2].reason.contains("未確認"), "{hits:?}");
         assert!(!hits[2].reason.contains("親"), "{hits:?}");
     }
 
@@ -1787,7 +2009,8 @@ mod tests {
             "2026-11-13",
             true,
             0,
-            60_000,
+            0,
+            MAX_PROBES,
         );
         assert!(started.elapsed().as_millis() < 1000, "cached check slept");
         assert_eq!(hits.len(), 3, "{hits:?}");
@@ -1870,7 +2093,8 @@ mod tests {
             "2026-11-13",
             true,
             0,
-            60_000,
+            0,
+            MAX_PROBES,
         );
         assert!(started.elapsed().as_millis() < 1000, "a cached probe slept on the budget");
         assert_eq!(hits.len(), 1, "{hits:?}");
@@ -1898,6 +2122,40 @@ mod tests {
             hits[0].article_text.contains("新しい本文"),
             chat[0].body.contains("新しい本文")
         );
+
+        let capped_db = StatuteDb::open_memory().unwrap();
+        minpo(&capped_db, &[article("555", "第555条", "古い本文")]);
+        let capped = check_text_opts(
+            &capped_db,
+            &client,
+            "民法第555条「古い本文」",
+            "2026-11-13",
+            true,
+            0,
+            0,
+            0,
+        );
+        assert!(capped[0].article_text.contains("古い本文"), "{capped:?}");
+        assert!(capped[0].offline_note.contains("改正確認"), "{capped:?}");
+        assert!(
+            !(capped[0].label == "一致" && capped[0].offline_note.is_empty()),
+            "{capped:?}"
+        );
+
+        let burst_db = StatuteDb::open_memory().unwrap();
+        minpo(&burst_db, &[article("555", "第555条", "古い本文")]);
+        let fail = crate::statute::egov::MapEgov::new(vec![(
+            "articles;".into(),
+            Err(crate::statute::egov::EgovFailure::Bad(
+                "法令APIが応答しませんでした（HTTP 500）".into(),
+            )),
+        )]);
+        let first = check_text(&burst_db, &fail, "民法第555条", "2026-11-13", true);
+        assert!(first[0].article_text.contains("古い本文"), "{first:?}");
+        assert!(first[0].offline_note.contains("改正確認"), "{first:?}");
+        let second = check_text(&burst_db, &client, "民法第555条", "2026-11-13", true);
+        assert!(second[0].article_text.contains("古い本文"), "{second:?}");
+        assert!(second[0].offline_note.contains("改正確認"), "{second:?}");
     }
 
     #[test]
@@ -2093,5 +2351,75 @@ mod tests {
         assert_ne!(hits[1].label, "一致", "{hits:?}");
         assert_eq!(hits[1].label, "要確認", "{hits:?}");
         assert!(hits[1].reason.contains("引用"), "{hits:?}");
+    }
+
+    #[test]
+    fn glue_cases_match_the_shared_table() {
+        #[derive(serde::Deserialize)]
+        struct GlueCase {
+            id: String,
+            text: String,
+            rows: Vec<GlueRow>,
+        }
+        #[derive(serde::Deserialize)]
+        struct GlueRow {
+            law: String,
+            key: String,
+            label: Option<String>,
+            #[serde(rename = "reasonHas")]
+            reason_has: Option<String>,
+        }
+        let cases: Vec<GlueCase> =
+            serde_json::from_str(include_str!("../../../src/shared/statuteGlueCases.json")).unwrap();
+        let db = db();
+        minpo(
+            &db,
+            &[
+                article("1", "第1条", "第一条の本文。"),
+                article("2", "第2条", "第二条の本文。"),
+                article("5", "第5条", "第五条の本文。"),
+                article("8", "第8条", "第八条の本文。"),
+                article("20", "第20条", "第二十条の本文。"),
+                article("90", "第90条", "第九十条の本文。"),
+                article("709", "第709条", "不法行為の本文。"),
+                article("710", "第710条", "財産以外の損害。"),
+            ],
+        );
+        db.replace_law(
+            "417AC0000000086",
+            "会社法",
+            "平成十七年法律第八十六号",
+            "2020-01-01",
+            "2020-01-01",
+            "bundle",
+            &["会社法".into()],
+            &[article("2", "第2条", "会社の第二条。")],
+        )
+        .unwrap();
+        for case in cases {
+            let hits = check_text(&db, &OfflineEgov, &case.text, "2026-11-13", false);
+            assert_eq!(hits.len(), case.rows.len(), "{} {hits:?}", case.id);
+            for (hit, row) in hits.iter().zip(case.rows.iter()) {
+                assert!(
+                    hit.citation.contains(&row.law),
+                    "{} {:?} {hit:?}",
+                    case.id,
+                    row.law
+                );
+                assert!(
+                    hit.citation.contains(&format!("第{}条", row.key))
+                        || hit.citation.contains(&row.key),
+                    "{} key {} {hit:?}",
+                    case.id,
+                    row.key
+                );
+                if let Some(label) = &row.label {
+                    assert_eq!(&hit.label, label, "{} {hit:?}", case.id);
+                }
+                if let Some(reason) = &row.reason_has {
+                    assert!(hit.reason.contains(reason), "{} {hit:?}", case.id);
+                }
+            }
+        }
     }
 }

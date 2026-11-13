@@ -1113,32 +1113,36 @@
     "text": "民法第709条。ただし会社法に基づき同法第2条",
     "rows": [
       { "law": "民法", "key": "709" },
-      { "law": "会社法", "key": "2", "label": "一致" }
-    ]
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
   },
   {
     "id": "r16-retarget-mata-kaisha",
     "text": "民法第709条。また会社法に基づき同法第2条",
     "rows": [
       { "law": "民法", "key": "709" },
-      { "law": "会社法", "key": "2", "label": "一致" }
-    ]
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
   },
   {
     "id": "r16-retarget-yotte-kaisha",
     "text": "民法第709条。よって会社法に基づき同法第2条",
     "rows": [
       { "law": "民法", "key": "709" },
-      { "law": "会社法", "key": "2", "label": "一致" }
-    ]
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
   },
   {
     "id": "r16-retarget-sunawachi-kaisha",
     "text": "民法第709条。すなわち会社法に基づき同法第2条",
     "rows": [
       { "law": "民法", "key": "709" },
-      { "law": "会社法", "key": "2", "label": "一致" }
-    ]
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
   },
   {
     "id": "r16-ambiguous-minpo",
@@ -1232,5 +1236,164 @@
       { "law": "民法", "key": "709" },
       { "law": "民法", "key": "710", "label": "一致" }
     ]
+  },
+  {
+    "id": "r17-german-civil",
+    "text": "民法第709条を参照。次に、ドイツ民法については、同法第823条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "823", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-uk-company",
+    "text": "民法第709条。英国会社法については同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-korea-commercial",
+    "text": "民法第709条。韓国商法については同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-us-copyright",
+    "text": "民法第709条。米国著作権法については同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-america-company",
+    "text": "民法第709条。アメリカ会社法については同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-france-civil",
+    "text": "民法第709条。フランス民法については同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-old-minpo",
+    "text": "民法第709条。旧民法については同法第1条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "1", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-old-shoho",
+    "text": "民法第709条。旧商法については同法第1条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "1", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-pre-amendment-minpo",
+    "text": "民法第709条。改正前民法については同法第1条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "1", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-meiji-minpo",
+    "text": "民法第709条。明治民法については同法第1条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "1", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-old-law-shoho",
+    "text": "民法第709条。旧法である商法については同法第1条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "1", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-pre-amendment-no-minpo",
+    "text": "民法第709条。改正前の民法については同法第1条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "1", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-company-then-code",
+    "text": "民法第709条。会社法及びドイツ民法典については同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-code-then-company",
+    "text": "民法第709条。ドイツ民法典及び会社法については同法第2条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "2", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r17-deny-method",
+    "text": "民法第709条。支払方法に基づき同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r17-deny-technique",
+    "text": "民法第709条。経営手法に基づき同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r17-enforcement-order",
+    "text": "会社法第2条。同法施行令第1条",
+    "rows": [
+      { "law": "会社法", "key": "2" },
+      { "law": "同法施行令", "key": "1", "label": "要確認" }
+    ]
+  },
+  {
+    "id": "r17-constitution",
+    "text": "民法第709条。憲法については同法第9条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "9", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
   }
 ]

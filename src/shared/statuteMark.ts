@@ -220,14 +220,8 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
       }
     }
     const enumerated = window === null && isEnumeration(between, acrossLine);
-    let inherited = dou || enumerated;
-    const ambiguousNow = dou && (found?.forceAmbiguous || douhouIsAmbiguous(stack));
-    if (dou && !ambiguousNow && found?.retarget) {
-      window = found.retarget;
-      dou = false;
-      inherited = enumerated;
-    }
-    if (ambiguousNow) {
+    const inherited = dou || enumerated;
+    if (dou && (found?.forceAmbiguous || douhouIsAmbiguous(stack))) {
       if (!alreadyMarked(chars, span.end)) {
         inserts.push(span.end);
       }
@@ -557,7 +551,7 @@ function lawWindow(
   chars: string[],
   citeStart: number,
   floor: number
-): { name: string; forceAmbiguous: boolean; retarget: string | null } | null {
+): { name: string; forceAmbiguous: boolean } | null {
   const stop = Math.min(floor, citeStart);
   let end = citeStart;
   while (end > stop && isHspace(chars[end - 1])) {
@@ -598,7 +592,7 @@ function lawWindow(
     return douhou;
   }
   const resolved = resolveCatalog(name)?.alias ?? (looksLikeLawName(name) ? name : null);
-  return resolved ? { name: resolved, forceAmbiguous: false, retarget: null } : null;
+  return resolved ? { name: resolved, forceAmbiguous: false } : null;
 }
 
 function isKanji(c: string): boolean {
@@ -675,27 +669,25 @@ function readDouhou(
   end: number,
   floor: number,
   name: string
-): { name: string; forceAmbiguous: boolean; retarget: string | null } | null {
+): { name: string; forceAmbiguous: boolean } | null {
   if (!name.endsWith("同法") || !douhouBoundary(name.slice(0, name.length - "同法".length))) {
     return null;
   }
   const douhouAt = end - 2;
   let look = douhouAt;
-  while (look > floor && !isHardBoundary(chars[look - 1])) {
+  while (look > floor) {
+    const previous = chars[look - 1];
+    if (isHardBoundary(previous) || previous === "）" || previous === ")" || previous === "」") {
+      break;
+    }
     look -= 1;
   }
   const wider = chars.slice(look, douhouAt).join("");
   const known = rightmostCatalog(wider);
   const unknown = unknownLawlikeEnd(wider, known);
   const acronym = acronymEnd(wider);
-  const unknownAt = [unknown, acronym].filter((at): at is number => at !== null).reduce((a, b) => Math.max(a, b), -1);
-  if (unknownAt >= 0 && (known === null || unknownAt > known.end)) {
-    return { name: "同法", forceAmbiguous: true, retarget: null };
-  }
-  if (known) {
-    return { name: "同法", forceAmbiguous: false, retarget: known.alias };
-  }
-  return { name: "同法", forceAmbiguous: false, retarget: null };
+  const lawlike = known !== null || unknown !== null || acronym !== null;
+  return { name: "同法", forceAmbiguous: lawlike };
 }
 
 function peelGlue(chars: string[], end: number, floor: number): number | null {

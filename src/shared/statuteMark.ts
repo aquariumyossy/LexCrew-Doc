@@ -1,25 +1,25 @@
 /**
  * Marks statute citations the chat did not fetch with law_article.
- * Port of Argos `statute/cite.rs`. The button does not use this; it checks
- * the document in the sidecar.
+ * Law names come from the same catalog the Rust checker uses.
  */
+import catalog from "./lawCatalog.json";
 
 export const TOOL_RESULT_OMITTED = "（文脈の上限に達したため、この結果は省略しました）";
 export const TOOL_RESULT_TRUNCATION_NOTE = "…（長いので省略しました）";
 
-const DENY_LAW_NAME = [
-  "方法",
-  "手法",
-  "療法",
-  "用法",
-  "違法",
-  "適法",
-  "合法",
-  "魔法",
-  "司法",
-  "立法",
-  "憲法改正",
-];
+const DENY_LAW_NAME = catalog.deny;
+
+type CatalogAlias = { alias: string; id: string; canonical: string };
+
+const CATALOG_ALIASES: CatalogAlias[] = catalog.laws
+  .flatMap((law) =>
+    law.aliases.map((alias) => ({
+      alias,
+      id: law.id,
+      canonical: law.aliases[0],
+    }))
+  )
+  .sort((a, b) => Array.from(b.alias).length - Array.from(a.alias).length);
 
 export type VerifiedCite = { names: string[]; key: string };
 
@@ -85,7 +85,9 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     }
     const prev = Math.min(previousEnd, span.start);
     const between = chars.slice(prev, span.start).join("");
-    const mentioned = latestLawMention(between);
+    const savedLaw = currentLaw;
+    const inside = parenDepth(chars, prev, span.start) > 0;
+    const mentioned = inside ? null : latestLawMention(between);
     if (mentioned) {
       currentLaw = mentioned;
     }
@@ -143,7 +145,11 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
       if (!alreadyMarked(chars, span.end)) {
         inserts.push(span.end);
       }
-      previousEnd = span.end;
+      if (inside) {
+        currentLaw = savedLaw;
+      } else {
+        previousEnd = span.end;
+      }
       continue;
     }
     if (!name) {
@@ -159,7 +165,7 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     }
     const suppl = span.suppl || (inherited && currentSuppl);
     currentSuppl = suppl;
-    if (!inherited) {
+    if (!inherited && !inside) {
       currentLaw = name;
     }
     const ok =
@@ -168,7 +174,11 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     if (!ok && !alreadyMarked(chars, span.end)) {
       inserts.push(span.end);
     }
-    previousEnd = span.end;
+    if (inside) {
+      currentLaw = savedLaw;
+    } else {
+      previousEnd = span.end;
+    }
   }
   if (inserts.length === 0) {
     return answer;
@@ -225,9 +235,6 @@ const NAME_PARTICLES = [
   "により",
   "として",
   "同じく",
-  "および",
-  "並びに",
-  "または",
   "では",
   "には",
   "とは",
@@ -235,11 +242,11 @@ const NAME_PARTICLES = [
   "上記",
   "から",
   "まで",
-  "及び",
   "なお",
-  "又は",
   "より",
 ];
+
+const JOINERS = ["並びに", "ならびに", "および", "または", "及び", "又は"];
 
 function prefixOk(before: string): boolean {
   if (!before) {
@@ -255,23 +262,30 @@ function prefixOk(before: string): boolean {
   if (NAME_PARTICLES.some((particle) => before.endsWith(particle))) {
     return true;
   }
-  if (sentenceInitialJoiner(before)) {
+  if (JOINERS.some((conn) => before.endsWith(conn))) {
     return true;
   }
   return /[。、，・（）「」\sはをにがとのやもへでか]/u.test(before.slice(-1));
 }
 
-function sentenceInitialJoiner(before: string): boolean {
-  for (const conn of ["並びに", "ならびに", "および", "及び", "または", "又は"]) {
-    if (!before.endsWith(conn)) {
+function resolveCatalog(window: string): CatalogAlias | null {
+  let best: CatalogAlias | null = null;
+  for (const hit of CATALOG_ALIASES) {
+    if (Array.from(hit.alias).length < 2) {
       continue;
     }
-    const rest = before.slice(0, before.length - conn.length).trimEnd();
-    if (rest.length === 0 || rest.endsWith("。") || rest.endsWith("\n")) {
-      return true;
+    if (window !== hit.alias && !window.endsWith(hit.alias)) {
+      continue;
+    }
+    const before = window.slice(0, window.length - hit.alias.length);
+    if (!prefixOk(before)) {
+      continue;
+    }
+    if (!best || Array.from(hit.alias).length > Array.from(best.alias).length) {
+      best = hit;
     }
   }
-  return false;
+  return best;
 }
 
 function lawNameAfterParticle(name: string): string {
@@ -301,23 +315,48 @@ function boundedSuffix(window: string, name: string): boolean {
 }
 
 function latestLawMention(gap: string): string | null {
-  const re = /[〃々一-龯ぁ-んァ-ンー]{1,80}(?:法|令|規則)/g;
-  let best: { end: number; name: string } | null = null;
-  for (const match of gap.matchAll(re)) {
-    const name = match[0];
-    if (name === "同法" || deniedToken(name)) {
-      continue;
-    }
-    const before = gap.slice(0, match.index ?? 0);
-    if (!prefixOk(before)) {
-      continue;
-    }
-    const end = (match.index ?? 0) + name.length;
-    if (!best || end >= best.end) {
-      best = { end, name };
+  const flat = blankInsideParens(gap);
+  let best: { end: number; len: number; name: string } | null = null;
+  for (const hit of CATALOG_ALIASES) {
+    let from = 0;
+    while (from < flat.length) {
+      const pos = flat.indexOf(hit.alias, from);
+      if (pos < 0) {
+        break;
+      }
+      const before = flat.slice(0, pos);
+      if (prefixOk(before)) {
+        const end = pos + hit.alias.length;
+        const len = Array.from(hit.alias).length;
+        if (!best || end > best.end || (end === best.end && len > best.len)) {
+          best = { end, len, name: hit.alias };
+        }
+      }
+      from = pos + Math.max(hit.alias.length, 1);
     }
   }
   return best?.name ?? null;
+}
+
+function blankInsideParens(gap: string): string {
+  const chars = Array.from(gap);
+  let depth = 0;
+  let quote = false;
+  for (let i = 0; i < chars.length; i += 1) {
+    const c = chars[i];
+    if (c === "「") {
+      quote = true;
+    } else if (c === "」") {
+      quote = false;
+    } else if (!quote && (c === "（" || c === "(")) {
+      depth += 1;
+    } else if (!quote && (c === "）" || c === ")") && depth > 0) {
+      depth -= 1;
+    } else if (depth > 0 || quote) {
+      chars[i] = " ";
+    }
+  }
+  return chars.join("");
 }
 
 function longestVerifiedSuffix(window: string, verified: VerifiedCite[]): string | null {
@@ -336,7 +375,18 @@ function longestVerifiedSuffix(window: string, verified: VerifiedCite[]): string
 }
 
 function isHardBoundary(c: string): boolean {
-  return c === "。" || c === "！" || c === "？" || c === "!" || c === "?" || c === "\n" || c === "\r";
+  return (
+    c === "。" ||
+    c === "！" ||
+    c === "？" ||
+    c === "!" ||
+    c === "?" ||
+    c === "\n" ||
+    c === "\r" ||
+    c === "\u000b" ||
+    c === "\u2028" ||
+    c === "\u2029"
+  );
 }
 
 function isHspace(c: string): boolean {
@@ -376,7 +426,10 @@ function lawWindow(chars: string[], citeStart: number, floor: number): string | 
     raw = raw.slice(lead.length);
   }
   const name = lawNameAfterParticle(raw);
-  return Array.from(name).length < 2 ? null : name;
+  if (Array.from(name).length < 2) {
+    return null;
+  }
+  return resolveCatalog(name)?.alias ?? (looksLikeLawName(name) ? name : null);
 }
 
 function peelGlue(chars: string[], end: number, floor: number): number | null {
@@ -398,7 +451,7 @@ function peelGlue(chars: string[], end: number, floor: number): number | null {
         return null;
       }
       const inner = chars.slice(openAt + 1, cursor - 1).join("");
-      if (!isPromulgation(inner)) {
+      if (!isPromulgation(inner) && !isAbbreviationNote(inner) && !sameLawAlias(chars, openAt, floor, inner)) {
         return null;
       }
       cursor = openAt;
@@ -419,7 +472,7 @@ function matchingOpenSameLine(chars: string[], closeAt: number, floor: number): 
   let i = closeAt;
   while (true) {
     const c = chars[i];
-    if (c === "\n" || c === "\r") {
+    if (isHardBoundary(c) && c !== "。" && c !== "！" && c !== "？" && c !== "!" && c !== "?") {
       return null;
     }
     if (c === close) {
@@ -440,6 +493,21 @@ function matchingOpenSameLine(chars: string[], closeAt: number, floor: number): 
 function isPromulgation(inner: string): boolean {
   const kind = ["法律", "政令", "勅令", "府令", "省令", "規則", "条例"].some((name) => inner.includes(name));
   return inner.includes("年") && kind && inner.includes("第") && inner.includes("号");
+}
+
+function isAbbreviationNote(inner: string): boolean {
+  return inner.includes("以下") && inner.includes("という");
+}
+
+function sameLawAlias(chars: string[], openAt: number, floor: number, inner: string): boolean {
+  let start = openAt;
+  while (start > floor && isLawChar(chars[start - 1]) && !isHardBoundary(chars[start - 1])) {
+    start -= 1;
+  }
+  const preceding = lawNameAfterParticle(chars.slice(start, openAt).join(""));
+  const outer = resolveCatalog(preceding);
+  const innerLaw = resolveCatalog(inner.trim());
+  return Boolean(outer && innerLaw && outer.id === innerLaw.id);
 }
 
 function looksLikeLawName(name: string): boolean {
@@ -556,13 +624,22 @@ function matchingClose(chars: string[], openAt: number, limit: number): number |
 
 function isListMarker(inner: string): boolean {
   const text = inner.trim();
-  if (!text || Array.from(text).length > 3) {
+  if (!text || Array.from(text).length > 4) {
     return false;
   }
   if (/^[0-9０-９]+$/u.test(text)) {
     return true;
   }
-  if (Array.from(text).length === 1 && (/[ア-ン]/u.test(text) || isCircled(text))) {
+  if (/^(i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii)$/iu.test(text)) {
+    return true;
+  }
+  if (Array.from(text).every((c) => /[ⅰ-ⅻⅠ-Ⅻ]/u.test(c))) {
+    return true;
+  }
+  if (
+    Array.from(text).length === 1 &&
+    (/[ア-ンぁ-ん]/u.test(text) || /[A-Za-z]/u.test(text) || isCircled(text))
+  ) {
     return true;
   }
   return /^[一二三四五六七八九十百千]+$/u.test(text);
@@ -570,6 +647,25 @@ function isListMarker(inner: string): boolean {
 
 function isCircled(c: string): boolean {
   return /[①-⑳❶-❿㉑-㉟]/u.test(c);
+}
+
+function parenDepth(chars: string[], from: number, until: number): number {
+  let depth = 0;
+  let quote = false;
+  const end = Math.min(until, chars.length);
+  for (let i = Math.min(from, end); i < end; i += 1) {
+    const c = chars[i];
+    if (c === "「") {
+      quote = true;
+    } else if (c === "」") {
+      quote = false;
+    } else if (!quote && (c === "（" || c === "(")) {
+      depth += 1;
+    } else if (!quote && (c === "）" || c === ")") && depth > 0) {
+      depth -= 1;
+    }
+  }
+  return depth;
 }
 
 function quoteStillOpen(chars: string[], from: number, until: number): boolean {

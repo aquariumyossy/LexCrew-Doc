@@ -135,6 +135,13 @@ pub static CATALOG: &[CatalogEntry] = &[
     ),
     // Full text is large. The name still resolves so a missing article can be fetched.
     entry("323AC0000000025", false, &["金融商品取引法", "金商法"]),
+    // Names that contain 及び. They are not in the packed seed; the chat and
+    // the button still have to keep the whole name, not the part after 及び.
+    entry("326CO0000000319", false, &["出入国管理及び難民認定法", "入管法"]),
+    entry("324AC0000000228", false, &["外国為替及び外国貿易法", "外為法"]),
+    entry("337AC0000000134", false, &["不当景品類及び不当表示防止法", "景表法"]),
+    entry("325AC0000000303", false, &["毒物及び劇物取締法", "毒劇法"]),
+    entry("328AC0000000014", false, &["麻薬及び向精神薬取締法", "麻向法"]),
 ];
 
 const fn entry(
@@ -146,6 +153,38 @@ const fn entry(
         law_id,
         bundle,
         aliases,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shared_json_is_this_catalog() {
+        let file: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../src/shared/lawCatalog.json"
+        ))
+        .unwrap();
+        let laws = file["laws"].as_array().unwrap();
+        assert_eq!(laws.len(), CATALOG.len());
+        for (row, entry) in laws.iter().zip(CATALOG.iter()) {
+            assert_eq!(row["id"].as_str().unwrap(), entry.law_id);
+            assert_eq!(row["bundle"].as_bool().unwrap(), entry.bundle);
+            let aliases: Vec<&str> = row["aliases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(aliases, entry.aliases);
+        }
+        let deny = file["deny"].as_array().unwrap();
+        let expected = [
+            "方法", "手法", "療法", "用法", "違法", "適法", "合法", "魔法", "司法", "立法", "憲法改正",
+        ];
+        let got: Vec<&str> = deny.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(got, expected);
     }
 }
 

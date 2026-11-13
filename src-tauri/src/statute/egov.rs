@@ -127,22 +127,27 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// What LiveEgov is willing to send. Article and full-law URLs become API v2.
+/// An update list is only a date, so the v1 URL is allowed and coverage can be
+/// recorded. Anything else, including a law-name list, is refused.
+pub fn egress_url(url: &str) -> Result<String, EgovFailure> {
+    if url.contains("/api/2/") {
+        return Ok(url.to_string());
+    }
+    if let Some(next) = v2_url(url) {
+        return Ok(next);
+    }
+    if url.contains("/updatelawlists/") {
+        return Ok(url.to_string());
+    }
+    Err(EgovFailure::Bad(
+        "法令IDと条番号以外は e-Gov に送りません".into(),
+    ))
+}
+
 impl EgovSource for LiveEgov {
     fn fetch(&self, url: &str) -> Result<String, EgovFailure> {
-        let target = if url.contains("/api/2/") {
-            url.to_string()
-        } else {
-            match v2_url(url) {
-                Some(next) => next,
-                // Law lists and update lists are not sent. Callers that need a
-                // name which is not already local get an empty catalog instead.
-                None => {
-                    return Err(EgovFailure::Bad(
-                        "法令IDと条番号以外は e-Gov に送りません".into(),
-                    ))
-                }
-            }
-        };
+        let target = egress_url(url)?;
         let response = match self.client.get(&target).send() {
             Ok(response) => response,
             Err(_) => return Err(EgovFailure::Offline),
@@ -239,5 +244,9 @@ mod tests {
         assert!(!full.contains("elm="));
         assert!(v2_url(&update_list_url("20261111")).is_none());
         assert!(v2_url(&lawlist_url(2)).is_none());
+        let update = egress_url(&update_list_url("20261111")).unwrap();
+        assert!(update.contains("/updatelawlists/20261111"));
+        assert!(egress_url(&lawlist_url(2)).is_err());
+        assert!(egress_url("https://example.test/secret").is_err());
     }
 }

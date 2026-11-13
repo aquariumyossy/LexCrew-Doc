@@ -686,7 +686,7 @@ fn note_today_checked(db: &StatuteDb) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::statute::egov::{MapEgov, OfflineEgov};
+    use crate::statute::egov::{EgovFailure, EgovSource, MapEgov, OfflineEgov};
     use crate::statute::xmlparse::ParsedArticle;
 
     fn skip_today_list(db: &StatuteDb) {
@@ -708,6 +708,27 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         StatuteDb::open_empty(&path).unwrap()
+    }
+
+    struct PolicyEgov;
+
+    impl EgovSource for PolicyEgov {
+        fn fetch(&self, url: &str) -> Result<String, EgovFailure> {
+            let target = crate::statute::egov::egress_url(url)?;
+            if target.contains("/updatelawlists/") {
+                return Err(EgovFailure::NotFound);
+            }
+            Err(EgovFailure::Offline)
+        }
+    }
+
+    #[test]
+    fn warm_updates_records_coverage_under_the_live_url_policy() {
+        let db = temp_db();
+        let stopped = warm_updates(&db, &PolicyEgov, "2026-11-13");
+        assert!(!stopped);
+        let (_from, _through, count) = db.update_span().unwrap();
+        assert!(count > 0, "update days recorded: {count}");
     }
 
     fn seed_minpo(db: &StatuteDb, body: &str, as_of: &str) {

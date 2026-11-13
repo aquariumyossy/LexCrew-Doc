@@ -25,7 +25,8 @@
     "rows": [
       { "law": "民法", "key": "1" },
       { "law": "民法", "key": "90", "label": "要確認", "reasonHas": "引用" }
-    ]
+    ],
+    "keepMark": true
   },
   {
     "id": "m3-nested-heading",
@@ -107,5 +108,95 @@
     "id": "nit-joiner-before-name",
     "text": "本件及び民法第1条",
     "rows": [{ "law": "民法", "key": "1" }]
+  },
+  {
+    "id": "m1-hiragana-i",
+    "text": "民法第709条、（い）第5条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "m1-hiragana-a",
+    "text": "民法第709条、（あ）第5条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "m1-latin",
+    "text": "民法第709条、（a）第5条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "m1-roman",
+    "text": "民法第709条、（ⅰ）第5条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "m2-heading-hou",
+    "text": "民法第709条（不法行為）及び第710条（財産以外の損害）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "m2-douhou-after-heading",
+    "text": "民法第709条（不法行為）及び同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "m3-named-inside-heading",
+    "text": "民法第709条（会社法第2条を除く。）及び第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "m4-nyukan",
+    "text": "出入国管理及び難民認定法第1条",
+    "rows": [{ "law": "出入国管理及び難民認定法", "key": "1" }]
+  },
+  {
+    "id": "m4-gaitame",
+    "text": "外国為替及び外国貿易法第1条",
+    "rows": [{ "law": "外国為替及び外国貿易法", "key": "1" }]
+  },
+  {
+    "id": "m4-keihyo",
+    "text": "不当景品類及び不当表示防止法第1条",
+    "rows": [{ "law": "不当景品類及び不当表示防止法", "key": "1" }]
+  },
+  {
+    "id": "m4-dokubutsu",
+    "text": "毒物及び劇物取締法第1条",
+    "rows": [{ "law": "毒物及び劇物取締法", "key": "1" }]
+  },
+  {
+    "id": "m4-mayaku",
+    "text": "麻薬及び向精神薬取締法第1条",
+    "rows": [{ "law": "麻薬及び向精神薬取締法", "key": "1" }]
+  },
+  {
+    "id": "m5-alias-paren",
+    "text": "労働基準法（労基法）第1条",
+    "rows": [{ "law": "労働基準法", "key": "1" }]
+  },
+  {
+    "id": "m5-same-name-paren",
+    "text": "会社法（会社法）第2条",
+    "rows": [{ "law": "会社法", "key": "2" }]
+  },
+  {
+    "id": "s3-manual-break",
+    "text": "民法\u000b第709条",
+    "rows": []
+  },
+  {
+    "id": "s4-leading-particle",
+    "text": "は会社法第2条",
+    "rows": [{ "law": "会社法", "key": "2" }]
   }
 ]

@@ -178,22 +178,36 @@ impl StatuteDb {
         Ok(meta_locked(&conn, key)?.unwrap_or_default())
     }
 
-    pub fn note_probe_failure(&self, law_id: &str, key: &str) -> Result<(), String> {
+    pub fn note_probe_failure(&self, law_id: &str, key: &str, note: &str) -> Result<(), String> {
         self.set_meta(
             &format!("probe_fail:{law_id}:{key}"),
-            &chrono::Utc::now().timestamp().to_string(),
+            &format!("{}\n{note}", chrono::Utc::now().timestamp()),
         )
     }
 
-    /// A 429 or 500 on a currency probe. The next check inside an hour reuses the saved text.
+    /// A failed currency probe. The next check inside an hour reuses the saved text.
     pub fn probe_failure_is_fresh(&self, law_id: &str, key: &str) -> bool {
         let raw = self
             .meta(&format!("probe_fail:{law_id}:{key}"))
             .unwrap_or_default();
-        let Ok(checked) = raw.parse::<i64>() else {
+        let Some(checked) = raw.lines().next() else {
+            return false;
+        };
+        let Ok(checked) = checked.parse::<i64>() else {
             return false;
         };
         chrono::Utc::now().timestamp().saturating_sub(checked) < 60 * 60
+    }
+
+    pub fn probe_failure_note(&self, law_id: &str, key: &str) -> Option<String> {
+        if !self.probe_failure_is_fresh(law_id, key) {
+            return None;
+        }
+        let raw = self
+            .meta(&format!("probe_fail:{law_id}:{key}"))
+            .unwrap_or_default();
+        let note = raw.split_once('\n').map(|(_, note)| note.to_string())?;
+        if note.is_empty() { None } else { Some(note) }
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
@@ -545,7 +559,7 @@ impl StatuteDb {
         let Some(entries) = cache.as_ref() else {
             return Ok(None);
         };
-        let mut best: Option<(usize, String, String)> = None;
+        let mut best: Option<(usize, usize, String, String)> = None;
         for hit in entries {
             let mut from = 0usize;
             while let Some(pos) = text[from..].find(&hit.alias) {
@@ -559,16 +573,16 @@ impl StatuteDb {
                     let end = abs + hit.alias.len();
                     let replace = match &best {
                         None => true,
-                        Some((at, _, _)) => end > *at,
+                        Some((at, alen, _, _)) => end > *at || (end == *at && hit.alias.len() > *alen),
                     };
                     if replace {
-                        best = Some((end, hit.law_id.clone(), hit.name.clone()));
+                        best = Some((end, hit.alias.len(), hit.law_id.clone(), hit.name.clone()));
                     }
                 }
                 from = abs + hit.alias.len().max(1);
             }
         }
-        let Some((_, law_id, name)) = best else {
+        let Some((_, _, law_id, name)) = best else {
             return Ok(None);
         };
         drop(cache);
@@ -963,9 +977,6 @@ const NAME_PARTICLES: &[&str] = &[
     "により",
     "として",
     "同じく",
-    "および",
-    "並びに",
-    "または",
     "では",
     "には",
     "とは",
@@ -973,9 +984,7 @@ const NAME_PARTICLES: &[&str] = &[
     "上記",
     "から",
     "まで",
-    "及び",
     "なお",
-    "又は",
     "より",
 ];
 
@@ -1001,25 +1010,19 @@ fn alias_prefix_ok(before: &str) -> bool {
     if NAME_PARTICLES.iter().any(|particle| before.ends_with(particle)) {
         return true;
     }
-    if sentence_initial_joiner(before) {
+    // 及び / 又は / 並びに may separate a law name (`本件及び民法`).
+    // A longer catalog name that contains the joiner still wins, because the
+    // caller keeps the longest bounded suffix.
+    if joiner_boundary(before) {
         return true;
     }
     before.chars().last().is_some_and(is_name_boundary)
 }
 
-/// 「及び民法」 at the start of a sentence. A joiner inside a longer name
-/// (`禁止及び公正取引`) is not a boundary.
-fn sentence_initial_joiner(before: &str) -> bool {
-    for conn in ["並びに", "ならびに", "および", "及び", "または", "又は"] {
-        let Some(rest) = before.strip_suffix(conn) else {
-            continue;
-        };
-        let rest = rest.trim_end();
-        if rest.is_empty() || rest.ends_with('。') || rest.ends_with('\n') {
-            return true;
-        }
-    }
-    false
+fn joiner_boundary(before: &str) -> bool {
+    ["並びに", "ならびに", "および", "または", "及び", "又は"]
+        .iter()
+        .any(|conn| before.ends_with(conn))
 }
 
 /// Drops a particle glued to the front of a law name (`契約による民法` → `民法`).

@@ -5,7 +5,8 @@ use crate::statute::egov::{
     article_url, lawdata_url, lawlist_url, update_list_url, EgovFailure, EgovSource,
 };
 use crate::statute::refresh::{
-    compact_ymd, format_ymd, parse_ymd, revision_action, updates_cover, walk_start, RevisionAction,
+    compact_ymd, format_ymd, parse_ymd, revision_action, revision_is_newer, updates_cover, walk_start,
+    RevisionAction,
     RevisionInput, UPDATE_WALK_DAYS,
 };
 use crate::statute::store::{LawRef, StatuteDb};
@@ -124,7 +125,16 @@ fn resolve_one(
     let remote = db.remote_as_of(&law.law_id).ok().flatten();
     let action = revision_for(db, &law, &cached, today, *offline);
     match action {
-        RevisionAction::Keep { offline } => hit_from_cache(&db, &law, &cached, offline),
+        RevisionAction::Keep { offline } => {
+            if offline && known_amendment(db, &law) {
+                return amendment_miss(
+                    &law,
+                    &cached.num,
+                    "改正あり・最新本文を取得できず（オフライン）",
+                );
+            }
+            hit_from_cache(db, &law, &cached, offline)
+        }
         RevisionAction::ProbeArticle => probe_article(
             db,
             client,
@@ -166,9 +176,25 @@ fn resolve_one(
                 }
                 Err(EgovFailure::Offline) => {
                     *offline = true;
+                    if known_amendment(db, &law) {
+                        return amendment_miss(
+                            &law,
+                            &cached.num,
+                            "改正あり・最新本文を取得できず（e-Govに接続できず）",
+                        );
+                    }
                     hit_from_cache(db, &law, &cached, true)
                 }
-                Err(EgovFailure::NotFound) => hit_from_cache(db, &law, &cached, true),
+                Err(EgovFailure::NotFound) => {
+                    if known_amendment(db, &law) {
+                        return amendment_miss(
+                            &law,
+                            &cached.num,
+                            "改正あり・最新本文を取得できず",
+                        );
+                    }
+                    hit_from_cache(db, &law, &cached, true)
+                }
                 Err(EgovFailure::Bad(_)) => probe_article(
                     db,
                     client,
@@ -359,6 +385,13 @@ fn probe_article(
         }
         Err(EgovFailure::Offline) => {
             *offline = true;
+            if known_amendment(db, law) {
+                return amendment_miss(
+                    law,
+                    display,
+                    "改正あり・最新本文を取得できず（e-Govに接続できず）",
+                );
+            }
             hit_from_cache(db, law, cached, true)
         }
         Err(EgovFailure::NotFound) => miss_kind(
@@ -454,6 +487,17 @@ fn fetch_article(
 ) -> Result<ParsedLaw, EgovFailure> {
     let xml = client.fetch(&article_url(law_id, display))?;
     xmlparse::parse_law_xml(&xml).map_err(|_| EgovFailure::Bad("条文XMLを読めませんでした".into()))
+}
+
+fn known_amendment(db: &StatuteDb, law: &LawRef) -> bool {
+    db.remote_as_of(&law.law_id)
+        .ok()
+        .flatten()
+        .is_some_and(|remote| revision_is_newer(&remote, &law.as_of))
+}
+
+fn amendment_miss(law: &LawRef, article: &str, note: &str) -> ToolArticle {
+    miss_kind(&law.name, article, note, ArticleMiss::Failed)
 }
 
 fn hit_from_cache(
@@ -1314,5 +1358,49 @@ mod tests {
         assert!(!hits[0].verified, "{:?}", hits[0].note);
         assert!(hits[0].note.contains("附則"), "{}", hits[0].note);
         assert!(!hits[0].body.contains("本則の本文"));
+    }
+
+    #[test]
+    fn a_known_amendment_is_not_verified_when_the_new_text_cannot_be_fetched() {
+        let db = temp_db();
+        seed_minpo(&db, "古い本文", "2020-04-01");
+        let query = [ArticleQuery {
+            law: "民法".into(),
+            article: "555".into(),
+        }];
+        let unknown = resolve_articles(&db, &OfflineEgov, &query, "2026-11-11");
+        assert!(unknown[0].verified, "{:?}", unknown[0].note);
+        assert!(unknown[0].offline);
+        let kept = crate::statute::format_tool_result(&unknown, 0);
+        assert!(kept.contains("確認済み"), "{kept}");
+        assert!(kept.contains("改正確認できず"), "{kept}");
+
+        db.store_updates(
+            "2026-04-01",
+            "2026-11-11",
+            &[crate::statute::xmlparse::ListedUpdate {
+                law_id: "129AC0000000089".into(),
+                as_of: "2026-04-01".into(),
+                enforce_on: "2026-04-01".into(),
+                pending: false,
+            }],
+        )
+        .unwrap();
+        let offline = resolve_articles(&db, &OfflineEgov, &query, "2026-11-11");
+        assert!(!offline[0].verified, "{:?}", offline[0].note);
+        assert!(
+            offline[0].note.contains("改正あり") && offline[0].note.contains("オフライン"),
+            "{:?}",
+            offline[0].note
+        );
+        let stale = crate::statute::format_tool_result(&offline, 0);
+        assert!(!stale.contains("確認済み"), "{stale}");
+        assert!(stale.contains("未確認"), "{stale}");
+
+        db.set_meta("updates_through", "2026-11-11").unwrap();
+        skip_today_list(&db);
+        let connect = resolve_articles(&db, &OfflineEgov, &query, "2026-11-11");
+        assert!(!connect[0].verified, "{:?}", connect[0].note);
+        assert!(connect[0].note.contains("接続"), "{:?}", connect[0].note);
     }
 }

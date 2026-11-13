@@ -326,7 +326,8 @@
     "text": "民法第709条（会社法第2条及び第710条",
     "rows": [
       { "law": "民法", "key": "709" },
-      { "law": "会社法", "key": "2" }
+      { "law": "会社法", "key": "2" },
+      { "law": "会社法", "key": "710" }
     ]
   },
   {
@@ -521,7 +522,7 @@
   },
   {
     "id": "generic-houritsu",
-    "text": "この法律第1条。本法律第2条。関係法律第1条。当該法律第1条。他の法律第1条。同法律第1条。上記法律第1条。新しい法律第1条。前記法律第1条。各法律第1条。",
+    "text": "この法律第1条。本法律第2条。関係法律第1条。当該法律第1条。他の法律第1条。同法律第1条。上記法律第1条。新しい法律第1条。前記法律第1条。各法律第1条。旧法律第1条。",
     "rows": []
   },
   {
@@ -577,9 +578,247 @@
   {
     "id": "line-break-between-name-and-article",
     "text": "民法第709条（会社法\n第2条）",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "m1-douhou-inside-later-paren",
+    "text": "民法第709条（会社法の適用を除く。）に基づく損害賠償（同法第710条の慰謝料を含む。）",
     "rows": [
       { "law": "民法", "key": "709" },
-      { "law": "会社法", "key": "2" }
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "m1-douhou-in-adjacent-paren",
+    "text": "民法第709条（会社法の適用を除く。）（同法第710条参照）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "m1-douhou-after-and-paren",
+    "text": "民法第709条（会社法の適用を除く。）及び（同法第710条参照）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "m1-douhou-after-enumerated-article",
+    "text": "民法第709条（会社法の適用を除く。）、第710条（同法第711条参照）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" },
+      { "law": "同法", "key": "711", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "m2-amendment-houritsu",
+    "text": "民法の一部を改正する法律第1条",
+    "rows": [{ "law": "民法の一部を改正する法律", "key": "1", "label": "要確認", "reasonHas": "特定できません" }]
+  },
+  {
+    "id": "m2-amendment-houritsu-tou",
+    "text": "国家公務員法等の一部を改正する法律第1条",
+    "rows": [{ "law": "国家公務員法等の一部を改正する法律", "key": "1", "label": "要確認", "reasonHas": "特定できません" }]
+  },
+  {
+    "id": "m2-amendment-houritsu-tou-no",
+    "text": "地方税法等の一部を改正する等の法律第1条",
+    "rows": [{ "law": "地方税法等の一部を改正する等の法律", "key": "1", "label": "要確認", "reasonHas": "特定できません" }]
+  },
+  {
+    "id": "m2-repeal-houritsu",
+    "text": "不動産登記法を廃止する法律第1条",
+    "rows": [{ "law": "不動産登記法を廃止する法律", "key": "1", "label": "要確認", "reasonHas": "特定できません" }]
+  },
+  {
+    "id": "m2-support-houritsu",
+    "text": "障害者の日常生活及び社会生活を総合的に支援するための法律第2条",
+    "rows": [{ "law": "障害者の日常生活及び社会生活を総合的に支援するための法律", "key": "2", "label": "要確認", "reasonHas": "特定できません" }]
+  },
+  {
+    "id": "m2-medical-houritsu",
+    "text": "地域における医療及び介護の総合的な確保を推進するための法律第1条",
+    "rows": [{ "law": "地域における医療及び介護の総合的な確保を推進するための法律", "key": "1", "label": "要確認", "reasonHas": "特定できません" }]
+  },
+  {
+    "id": "m2-amendment-suppl",
+    "text": "民法の一部を改正する法律附則第2条",
+    "rows": [{ "law": "民法の一部を改正する法律", "key": "2", "label": "要確認", "reasonHas": "附則" }],
+    "keepMark": true
+  },
+  {
+    "id": "m3-name-across-newline",
+    "text": "（参考：民法\n第709条）",
+    "rows": []
+  },
+  {
+    "id": "m3-name-across-cr",
+    "text": "（参考：民法\r第709条）",
+    "rows": []
+  },
+  {
+    "id": "m3-name-across-crlf",
+    "text": "（参考：民法\r\n第709条）",
+    "rows": []
+  },
+  {
+    "id": "m3-name-across-paragraph-sep",
+    "text": "（参考：民法\u2029第709条）",
+    "rows": []
+  },
+  {
+    "id": "m3-note-across-newline",
+    "text": "注記（関係法令：民法\n第1条　本契約は甲乙間の取引に適用する。）",
+    "rows": []
+  },
+  {
+    "id": "m3-note-across-newlines",
+    "text": "（注意事項\n関係法令：民法\n第1条　本契約は\n1）以上",
+    "rows": []
+  },
+  {
+    "id": "m3-enumeration-across-crlf",
+    "text": "（民法第709条、\r\n第710条）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "m4-quote-word-paragraphs",
+    "text": "民法第709条「会社法第2条を参照。\r\r民法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2", "label": "要確認", "reasonHas": "引用" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "m4-quote-crlf-blank",
+    "text": "民法第709条「会社法第2条を参照。\r\n\r\n民法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2", "label": "要確認", "reasonHas": "引用" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "m4-quote-single-cr",
+    "text": "民法第709条「会社法第2条を参照。\r民法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2", "label": "要確認", "reasonHas": "引用" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "s1-alias-inside-carveout",
+    "text": "民法第709条（会社法の適用を除く。以下「除外規定」という。）及び同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "s1-alias-only",
+    "text": "民法第709条（以下「本条」という。）及び同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "s2-promulgation-with-law",
+    "text": "民法第709条（ただし（会社法。平成十七年法律第八十六号）に該当する場合を除く。）及び同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "s2-promulgation-in-exclusion",
+    "text": "民法第709条（適用除外（会社法。平成十七年法律第八十六号））及び同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "a1-to-joiner",
+    "text": "民法第709条と第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "a1-to-not-douyou",
+    "text": "第1条と同様",
+    "rows": []
+  },
+  {
+    "id": "a1-to-not-onajiku",
+    "text": "民法第709条と同じく",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "a1-to-named-contract",
+    "text": "民法第709条と本契約第2条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "a2-unclosed-same-line",
+    "text": "（民法第709条、第710条を参照",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710" }
+    ]
+  },
+  {
+    "id": "a2-unclosed-newline",
+    "text": "（民法第709条、\n第710条を参照",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "a2-unclosed-cr",
+    "text": "（民法第709条、\r第710条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "a2-unclosed-crlf",
+    "text": "（民法第709条、\r\n第710条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "a2-unclosed-paragraph",
+    "text": "（民法第709条、\u2029第710条",
+    "rows": [{ "law": "民法", "key": "709" }]
+  },
+  {
+    "id": "a4-deny-suffix",
+    "text": "支払方法第1条。特別手法第2条。立法第1条。",
+    "rows": []
+  },
+  {
+    "id": "a4-real-suffixes",
+    "text": "小切手法第1条。取適法第1条。民法第709条。",
+    "rows": [
+      { "law": "小切手法", "key": "1" },
+      { "law": "取適法", "key": "1" },
+      { "law": "民法", "key": "709" }
     ]
   }
 ]

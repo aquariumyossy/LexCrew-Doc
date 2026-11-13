@@ -637,6 +637,38 @@ fn is_line_break(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{000B}' | '\u{2028}' | '\u{2029}')
 }
 
+/// A blank line in any convention, a Word paragraph mark (`\r` not part of `\r\n`),
+/// or a Unicode paragraph separator. A single `\n` or one `\r\n` stays inside a quote.
+fn unfinished_quote_ends(chars: &[char], i: usize) -> bool {
+    let c = chars[i];
+    if c == '\u{2029}' {
+        return true;
+    }
+    if c == '\r' && chars.get(i + 1) != Some(&'\n') {
+        return true;
+    }
+    if !is_line_break(c) {
+        return false;
+    }
+    let mut start = i;
+    while start > 0 && is_line_break(chars[start - 1]) {
+        start -= 1;
+    }
+    let slice = &chars[start..=i];
+    let mut endings = 0usize;
+    let mut j = 0usize;
+    while j < slice.len() {
+        if slice[j] == '\r' && j + 1 < slice.len() && slice[j + 1] == '\n' {
+            endings += 1;
+            j += 2;
+        } else {
+            endings += 1;
+            j += 1;
+        }
+    }
+    endings >= 2
+}
+
 fn absorb_closed_frame(stack: &mut Vec<Frame>) {
     if stack.len() <= 1 {
         return;
@@ -669,9 +701,8 @@ fn queue_note(frame: &mut Frame, chars: &[char], open: usize, close: usize, oute
         return;
     }
     let inner: String = chars[open + 1..close].iter().collect();
-    // Skip only when this parenthesis is nothing but an enactment or alias note.
-    // A larger parenthesis that merely contains one of those notes is kept.
-    if is_whole_note(&inner) {
+    // A whole note sits directly after a law name and is only 以下… or a promulgation.
+    if is_whole_note(chars, open, &inner) {
         return;
     }
     frame.pending.push(PendingNote {
@@ -681,25 +712,111 @@ fn queue_note(frame: &mut Frame, chars: &[char], open: usize, close: usize, oute
     });
 }
 
-fn is_whole_note(inner: &str) -> bool {
-    let trimmed = inner.trim().trim_matches('。').trim();
-    if trimmed.contains('（') || trimmed.contains('(') {
+fn is_whole_note(chars: &[char], open: usize, inner: &str) -> bool {
+    if open == 0 || matches!(chars.get(open - 1), Some('条' | '項' | '号')) {
         return false;
     }
-    is_promulgation(trimmed) || is_abbreviation_note(trimmed)
+    if !is_law_char(chars[open - 1]) {
+        return false;
+    }
+    let trimmed = inner.trim().trim_matches('。').trim();
+    if trimmed.starts_with("以下") {
+        return true;
+    }
+    let rest = strip_alias_clauses(&strip_promulgation_numbers(trimmed));
+    !rest.chars().any(|c| is_law_char(c) && !matches!(c, '（' | '）' | '(' | ')'))
 }
 
-fn strip_nested_notes(text: &str) -> String {
+fn is_promulgation_digit(c: char) -> bool {
+    c.is_ascii_digit()
+        || ('０'..='９').contains(&c)
+        || matches!(c, '〇' | '零' | '一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十' | '百' | '千')
+}
+
+/// End index of a promulgation number starting at `start`, such as 平成十七年法律第八十六号.
+fn promulgation_number_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    for era in ["令和", "平成", "昭和", "大正", "明治"] {
+        let era: Vec<char> = era.chars().collect();
+        if chars[i..].starts_with(&era) {
+            i += era.len();
+            break;
+        }
+    }
+    let nums = i;
+    while i < chars.len() && is_promulgation_digit(chars[i]) {
+        i += 1;
+    }
+    if i == nums || chars.get(i) != Some(&'年') {
+        return None;
+    }
+    i += 1;
+    let mut kind = false;
+    for name in ["法律", "政令", "勅令", "府令", "省令", "規則", "条例"] {
+        let name: Vec<char> = name.chars().collect();
+        if chars[i..].starts_with(&name) {
+            i += name.len();
+            kind = true;
+            break;
+        }
+    }
+    if !kind || chars.get(i) != Some(&'第') {
+        return None;
+    }
+    i += 1;
+    let nums = i;
+    while i < chars.len() && is_promulgation_digit(chars[i]) {
+        i += 1;
+    }
+    if i == nums || chars.get(i) != Some(&'号') {
+        return None;
+    }
+    Some(i + 1)
+}
+
+fn strip_promulgation_numbers(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
     let mut i = 0usize;
     while i < chars.len() {
-        if chars[i] == '（' || chars[i] == '(' {
-            if let Some(close) = matching_close(&chars, i, chars.len()) {
-                let inner: String = chars[i + 1..close].iter().collect();
-                if is_promulgation(inner.trim()) || is_abbreviation_note(inner.trim()) {
-                    i = close + 1;
-                    continue;
+        if let Some(end) = promulgation_number_end(&chars, i) {
+            i = end;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn strip_alias_clauses(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i..].starts_with(&['以', '下']) {
+            let mut j = i + 2;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if chars.get(j) == Some(&'「') {
+                j += 1;
+                while j < chars.len() && chars[j] != '」' {
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'」') {
+                    j += 1;
+                    while j < chars.len() && chars[j].is_whitespace() {
+                        j += 1;
+                    }
+                    if chars[j..].starts_with(&['と', 'い', 'う']) {
+                        j += 3;
+                        while j < chars.len() && matches!(chars[j], '。' | '、') {
+                            j += 1;
+                        }
+                        i = j;
+                        continue;
+                    }
                 }
             }
         }
@@ -707,6 +824,10 @@ fn strip_nested_notes(text: &str) -> String {
         i += 1;
     }
     out
+}
+
+fn strip_nested_notes(text: &str) -> String {
+    strip_alias_clauses(&strip_promulgation_numbers(text))
 }
 
 fn without_denied(text: &str) -> String {
@@ -752,8 +873,7 @@ fn sync_parens(
     let until = until.min(chars.len());
     while *seen < until {
         let c = chars[*seen];
-        let closes_unfinished_quote =
-            c == '\u{2029}' || (c == '\n' && *seen > 0 && chars[*seen - 1] == '\n');
+        let closes_unfinished_quote = unfinished_quote_ends(chars, *seen);
         if closes_unfinished_quote {
             while let Some(quote) = quotes.pop() {
                 if quote.saw_other {
@@ -945,24 +1065,23 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             );
         }
         let across_line = stack[frame_i].close_at.is_some();
-        let window = law_window(db, &chars, span.start, from, across_line);
-        let mut enumerated = window.is_none() && enumeration_gap(&between, across_line);
-        if enumerated && stack[frame_i].open_at.is_some() && stack[frame_i].close_at.is_none() {
-            enumerated = false;
-        }
+        let window = law_window(db, &chars, span.start, from);
+        let enumerated = window.is_none() && enumeration_gap(&between, across_line);
         let dou = window.as_ref().is_some_and(|w| w.text == "同法");
         if dou {
-            flush_pending(db, &chars, &mut stack[frame_i]);
+            for frame in stack.iter_mut() {
+                flush_pending(db, &chars, frame);
+            }
         }
         if let Some(window) = window.as_ref() {
-            if window.text != "同法" && denied(&window.text) {
+            if window.text != "同法" && denied(db, &window.text) {
                 stack[frame_i].law = None;
                 stack[frame_i].douhou = None;
                 stack[frame_i].named = false;
                 continue;
             }
         }
-        let ambiguous_douhou = dou && stack[frame_i].ambiguous;
+        let ambiguous_douhou = dou && stack.iter().any(|frame| frame.ambiguous);
         let inherit = if dou {
             stack[frame_i].douhou.clone()
         } else {
@@ -982,6 +1101,9 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
             // quote or the enumeration anchor. Those stay on the last row.
             continue;
         } else if let Some(window) = window.as_ref() {
+            if is_generic_houritsu(&window.text) {
+                continue;
+            }
             if is_historical_name(&window.text) {
                 remember_law(
                     &mut stack[frame_i],
@@ -1082,7 +1204,7 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
         {
             continue;
         }
-        let window = law_window(db, &chars, start, 0, false);
+        let window = law_window(db, &chars, start, 0);
         let law = window
             .as_ref()
             .and_then(|w| db.match_law_in_text(&w.text).ok().flatten());
@@ -1133,10 +1255,24 @@ fn is_deleted_body(body: &str) -> bool {
     text == "削除" || text == "（削除）"
 }
 
+fn is_generic_houritsu(text: &str) -> bool {
+    let Some(head) = text.strip_suffix("法律") else {
+        return false;
+    };
+    const WORDS: &[&str] = &[
+        "", "この", "本", "当該", "関係", "他", "同", "上記", "前記", "各", "新しい", "旧", "次の", "その",
+    ];
+    if WORDS.contains(&head) {
+        return true;
+    }
+    // 他の法律 / 前記の法律. Do not strip の from この法律 or その法律.
+    head.strip_suffix('の')
+        .is_some_and(|stripped| WORDS.contains(&stripped))
+}
+
 fn looks_like_law(text: &str) -> bool {
     if text.ends_with("法律") {
-        // この法律 / 本法律 are not titles. …に関する法律 is.
-        return text.ends_with("に関する法律");
+        return !is_generic_houritsu(text);
     }
     text.ends_with('法')
         || text.ends_with('令')
@@ -1163,17 +1299,10 @@ struct Window {
     text: String,
 }
 
-fn law_window(
-    db: &StatuteDb,
-    chars: &[char],
-    cite_start: usize,
-    floor: usize,
-    across_line: bool,
-) -> Option<Window> {
+fn law_window(db: &StatuteDb, chars: &[char], cite_start: usize, floor: usize) -> Option<Window> {
     let floor = floor.min(cite_start);
     let mut end = cite_start;
-    while end > floor && (is_hspace(chars[end - 1]) || (across_line && is_line_break(chars[end - 1])))
-    {
+    while end > floor && is_hspace(chars[end - 1]) {
         end -= 1;
     }
     if end > floor && is_hard_boundary(chars[end - 1]) {
@@ -1252,12 +1381,26 @@ fn is_law_char(c: char) -> bool {
     )
 }
 
-fn denied(window: &str) -> bool {
+fn denied(db: &StatuteDb, window: &str) -> bool {
     let name = window
         .strip_prefix("改正")
         .or_else(|| window.strip_prefix("現行"))
         .unwrap_or(window);
-    DENY_LAW_NAME.iter().any(|deny| name == *deny || window == *deny)
+    if super::catalog::CATALOG
+        .iter()
+        .any(|entry| entry.aliases.contains(&name))
+        || db.match_law_in_text(name).ok().flatten().is_some()
+    {
+        return false;
+    }
+    // 支払方法 ends in 方法. 行手法 and 医療法 keep the single character before
+    // 手法 / 療法, and catalog names such as 小切手法 stay.
+    DENY_LAW_NAME.iter().any(|deny| {
+        name == *deny
+            || name
+                .strip_suffix(deny)
+                .is_some_and(|rest| rest.chars().count() >= 2)
+    })
 }
 
 fn alias_offset(window: &str, db: &StatuteDb, law: &LawRef) -> usize {
@@ -1301,7 +1444,7 @@ fn enumeration_gap(between: &str, ignore_line_breaks: bool) -> bool {
     let text = gap_core(&chars);
     matches!(
         text.as_str(),
-        "及び" | "および" | "並びに" | "ならびに" | "又は" | "または" | "若しくは" | "、" | "，" | "・"
+        "及び" | "および" | "並びに" | "ならびに" | "又は" | "または" | "若しくは" | "、" | "，" | "・" | "と"
     )
 }
 
@@ -1500,8 +1643,7 @@ fn peel_glue(
         if matches!(chars[end - 1], '）' | ')') {
             let open_at = matching_open_same_line(chars, end - 1, floor)?;
             let inner: String = chars[open_at + 1..end - 1].iter().collect();
-            if !is_promulgation(&inner)
-                && !is_abbreviation_note(&inner)
+            if !paren_is_only_a_note(&inner)
                 && !same_law_alias(db, chars, open_at, floor, &inner)
             {
                 return None;
@@ -1540,15 +1682,9 @@ fn matching_open_same_line(chars: &[char], close_at: usize, floor: usize) -> Opt
     }
 }
 
-fn is_promulgation(inner: &str) -> bool {
-    let kind = ["法律", "政令", "勅令", "府令", "省令", "規則", "条例"]
-        .iter()
-        .any(|kind| inner.contains(kind));
-    inner.contains('年') && kind && inner.contains('第') && inner.contains('号')
-}
-
-fn is_abbreviation_note(inner: &str) -> bool {
-    inner.contains("以下") && inner.contains("という")
+fn paren_is_only_a_note(inner: &str) -> bool {
+    let rest = strip_alias_clauses(&strip_promulgation_numbers(inner));
+    !rest.chars().any(is_law_char)
 }
 
 fn same_law_alias(
@@ -3184,6 +3320,42 @@ mod tests {
     }
 
     #[test]
+    fn eager_and_lazy_paren_notes_find_the_same_rows() {
+        let db = db();
+        minpo(
+            &db,
+            &[
+                article("709", "第709条", "不法行為の本文。"),
+                article("710", "第710条", "財産以外の損害。"),
+            ],
+        );
+        db.replace_law(
+            "417AC0000000086",
+            "会社法",
+            "",
+            "2020-01-01",
+            "2020-01-01",
+            "bundle",
+            &["会社法".into()],
+            &[article("2", "第2条", "会社の第二条。")],
+        )
+        .unwrap();
+        let text = "民法第709条（会社法の適用を除く。）に基づく損害賠償（同法第710条の慰謝料を含む。）";
+        EAGER_NOTES.store(true, std::sync::atomic::Ordering::Relaxed);
+        let eager = check_text(&db, &OfflineEgov, text, "2026-11-13", false);
+        EAGER_NOTES.store(false, std::sync::atomic::Ordering::Relaxed);
+        let lazy = check_text(&db, &OfflineEgov, text, "2026-11-13", false);
+        let labels = |hits: &[CheckHit]| {
+            hits.iter()
+                .map(|hit| (hit.citation.clone(), hit.label.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&eager), labels(&lazy), "{eager:?} {lazy:?}");
+        assert!(lazy.iter().any(|hit| hit.reason.contains("曖昧")), "{lazy:?}");
+    }
+
+    #[test]
+    #[ignore = "about 14s in debug; compares a 148k-character scan"]
     fn perf_a_long_document_with_many_parens() {
         let path = std::env::temp_dir().join(format!(
             "guri-perf-{}-{}.db",

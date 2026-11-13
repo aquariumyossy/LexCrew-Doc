@@ -1038,7 +1038,7 @@ fn alias_prefix_ok(before: &str) -> bool {
 }
 
 fn joiner_boundary(before: &str) -> bool {
-    ["並びに", "ならびに", "および", "または", "及び", "又は"]
+    ["並びに", "ならびに", "および", "または", "及び", "又は", "と"]
         .iter()
         .any(|conn| before.ends_with(conn))
 }

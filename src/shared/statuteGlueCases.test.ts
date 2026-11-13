@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import cases from "./statuteGlueCases.json";
-import { markUnverified } from "./statuteMark";
+import { markDelivered, markUnverified } from "./statuteMark";
 
 describe("statute glue cases", () => {
   it.each(cases)("$id marks every row when nothing was fetched", (row) => {
@@ -37,6 +37,30 @@ describe("statute glue cases", () => {
     const marked = markUnverified("（民法第709条、同法第710条）", [
       { names: ["民法"], key: "709" },
       { names: ["民法"], key: "710" },
+    ]);
+    expect(marked).not.toContain("（要確認）");
+  });
+
+  it("marks the bare article after と when that article was not fetched", () => {
+    const marked = markUnverified("民法第709条と第710条", [{ names: ["民法"], key: "709" }]);
+    expect(marked).toContain("第710条（要確認）");
+    expect(marked).not.toContain("第709条（要確認）");
+  });
+
+  it("keeps a chat mark when law_article could not refresh a known amendment", () => {
+    const stale =
+      "未確認: 民法 第709条\n\n【民法 第709条】要確認\n改正あり・最新本文を取得できず（オフライン）\n\n";
+    const marked = markDelivered("民法第709条により請求する。", [
+      { name: "law_article", content: stale },
+    ]);
+    expect(marked).toContain("民法第709条（要確認）");
+  });
+
+  it("clears the chat mark when the cached text has no known amendment", () => {
+    const cached =
+      "確認済み: 民法 第709条\n\n【民法 第709条】\n改正確認できず（オフライン）。保存済みの本文を返しました。\n不法行為の本文。\n";
+    const marked = markDelivered("民法第709条により請求する。", [
+      { name: "law_article", content: cached },
     ]);
     expect(marked).not.toContain("（要確認）");
   });

@@ -132,7 +132,7 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     }
     while (seen < span.start && seen < chars.length) {
       const c = chars[seen];
-      if (c === "\u2029" || (c === "\n" && seen > 0 && chars[seen - 1] === "\n")) {
+      if (unfinishedQuoteEnds(chars, seen)) {
         while (quotes.length > 0) {
           const quote = quotes.pop();
           const frame = stack[stack.length - 1];
@@ -210,17 +210,16 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
       remember(frame, mentioned);
     }
     const acrossLine = frame.closeAt != null;
-    const window = lawWindow(chars, span.start, prev, acrossLine);
+    const window = lawWindow(chars, span.start, prev);
     const dou = window === "同法";
     if (dou) {
-      flushPending(frame, chars);
+      for (const item of stack) {
+        flushPending(item, chars);
+      }
     }
-    let enumerated = window === null && isEnumeration(between, acrossLine);
-    if (enumerated && frame.openAt != null && frame.closeAt == null) {
-      enumerated = false;
-    }
+    const enumerated = window === null && isEnumeration(between, acrossLine);
     const inherited = dou || enumerated;
-    if (dou && frame.ambiguous) {
+    if (dou && stack.some((item) => item.ambiguous)) {
       if (!alreadyMarked(chars, span.end)) {
         inserts.push(span.end);
       }
@@ -358,7 +357,18 @@ function deniedToken(window: string): boolean {
     : window.startsWith("現行")
       ? window.slice(2)
       : window;
-  return DENY_LAW_NAME.some((deny) => deny === name || deny === window);
+  if (resolveCatalog(name)) {
+    return false;
+  }
+  return DENY_LAW_NAME.some((deny) => {
+    if (name === deny) {
+      return true;
+    }
+    if (!name.endsWith(deny)) {
+      return false;
+    }
+    return Array.from(name.slice(0, name.length - deny.length)).length >= 2;
+  });
 }
 
 const NAME_PARTICLES = [
@@ -380,7 +390,7 @@ const NAME_PARTICLES = [
   "より",
 ];
 
-const JOINERS = ["並びに", "ならびに", "および", "または", "及び", "又は"];
+const JOINERS = ["並びに", "ならびに", "および", "または", "及び", "又は", "と"];
 
 function prefixOk(before: string): boolean {
   if (!before) {
@@ -449,7 +459,10 @@ function boundedSuffix(window: string, name: string): boolean {
 }
 
 function latestLawMention(gap: string): string | null {
-  const flat = blankInsideParens(gap);
+  return latestLawMentionIn(blankInsideParens(gap));
+}
+
+function latestLawMentionIn(flat: string): string | null {
   let best: { end: number; len: number; name: string } | null = null;
   for (const hit of CATALOG_ALIASES) {
     let from = 0;
@@ -527,10 +540,10 @@ function isHspace(c: string): boolean {
   return c === " " || c === "\u3000" || c === "\t";
 }
 
-function lawWindow(chars: string[], citeStart: number, floor: number, acrossLine = false): string | null {
+function lawWindow(chars: string[], citeStart: number, floor: number): string | null {
   const stop = Math.min(floor, citeStart);
   let end = citeStart;
-  while (end > stop && (isHspace(chars[end - 1]) || (acrossLine && isLineBreak(chars[end - 1])))) {
+  while (end > stop && isHspace(chars[end - 1])) {
     end -= 1;
   }
   if (end > stop && isHardBoundary(chars[end - 1])) {
@@ -585,7 +598,7 @@ function peelGlue(chars: string[], end: number, floor: number): number | null {
         return null;
       }
       const inner = chars.slice(openAt + 1, cursor - 1).join("");
-      if (!isPromulgation(inner) && !isAbbreviationNote(inner) && !sameLawAlias(chars, openAt, floor, inner)) {
+      if (!parenIsOnlyANote(inner) && !sameLawAlias(chars, openAt, floor, inner)) {
         return null;
       }
       cursor = openAt;
@@ -622,13 +635,9 @@ function matchingOpenSameLine(chars: string[], closeAt: number, floor: number): 
   }
 }
 
-function isPromulgation(inner: string): boolean {
-  const kind = ["法律", "政令", "勅令", "府令", "省令", "規則", "条例"].some((name) => inner.includes(name));
-  return inner.includes("年") && kind && inner.includes("第") && inner.includes("号");
-}
-
-function isAbbreviationNote(inner: string): boolean {
-  return inner.includes("以下") && inner.includes("という");
+function parenIsOnlyANote(inner: string): boolean {
+  const rest = stripAliasClauses(stripPromulgationNumbers(inner)).replace(/[^\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}々]/gu, "");
+  return rest.length === 0;
 }
 
 function sameLawAlias(chars: string[], openAt: number, floor: number, inner: string): boolean {
@@ -646,10 +655,22 @@ function lawKey(name: string): string {
   return resolveCatalog(name)?.id ?? name;
 }
 
+function isGenericHouritsu(name: string): boolean {
+  if (!name.endsWith("法律")) {
+    return false;
+  }
+  const words = ["", "この", "本", "当該", "関係", "他", "同", "上記", "前記", "各", "新しい", "旧", "次の", "その"];
+  const head = name.slice(0, name.length - "法律".length);
+  if (words.includes(head)) {
+    return true;
+  }
+  const stripped = head.replace(/の$/u, "");
+  return stripped !== head && words.includes(stripped);
+}
+
 function looksLikeLawName(name: string): boolean {
-  // 法律 ends in 律, not 法. Only a real title, or a catalog hit, counts.
   if (name.endsWith("法律")) {
-    return name.endsWith("に関する法律");
+    return !isGenericHouritsu(name);
   }
   return (
     name.endsWith("憲法") ||
@@ -666,7 +687,7 @@ function isEnumeration(between: string, ignoreLineBreaks = false): boolean {
     return false;
   }
   const text = gapCore(chars);
-  return ["及び", "および", "並びに", "ならびに", "又は", "または", "若しくは", "、", "，", "・"].includes(text);
+  return ["及び", "および", "並びに", "ならびに", "又は", "または", "若しくは", "、", "，", "・", "と"].includes(text);
 }
 
 function gapCrossesSentence(chars: string[], ignoreLineBreaks = false): boolean {
@@ -779,6 +800,34 @@ function isLineBreak(c: string): boolean {
   return c === "\n" || c === "\r" || c === "\u000b" || c === "\u2028" || c === "\u2029";
 }
 
+function unfinishedQuoteEnds(chars: string[], index: number): boolean {
+  const c = chars[index];
+  if (c === "\u2029") {
+    return true;
+  }
+  if (c === "\r" && chars[index + 1] !== "\n") {
+    return true;
+  }
+  if (!isLineBreak(c)) {
+    return false;
+  }
+  let start = index;
+  while (start > 0 && isLineBreak(chars[start - 1])) {
+    start -= 1;
+  }
+  const slice = chars.slice(start, index + 1);
+  let endings = 0;
+  for (let i = 0; i < slice.length; i += 1) {
+    if (slice[i] === "\r" && slice[i + 1] === "\n") {
+      endings += 1;
+      i += 1;
+    } else {
+      endings += 1;
+    }
+  }
+  return endings >= 2;
+}
+
 function absorbClosedFrame(stack: EnumFrame[]): void {
   if (stack.length <= 1) {
     return;
@@ -816,39 +865,38 @@ function queueNote(
     return;
   }
   const inner = chars.slice(open + 1, close).join("");
-  if (isWholeNote(inner)) {
+  if (isWholeNote(chars, open, inner)) {
     return;
   }
   frame.pending.push({ open, close, outerKey });
 }
 
-function isWholeNote(inner: string): boolean {
-  const trimmed = inner.trim().replace(/。+$/u, "").trim();
-  if (trimmed.includes("（") || trimmed.includes("(")) {
+function isWholeNote(chars: string[], open: number, inner: string): boolean {
+  const before = chars[open - 1];
+  if (!before || before === "条" || before === "項" || before === "号" || !isLawChar(before)) {
     return false;
   }
-  return isPromulgation(trimmed) || isAbbreviationNote(trimmed);
+  const trimmed = inner.trim().replace(/^。+|。+$/gu, "").trim();
+  if (trimmed.startsWith("以下")) {
+    return true;
+  }
+  const rest = stripAliasClauses(stripPromulgationNumbers(trimmed)).replace(/[。、（）()\s．.]/gu, "");
+  return rest.length === 0;
+}
+
+function stripPromulgationNumbers(text: string): string {
+  return text.replace(
+    /(?:令和|平成|昭和|大正|明治)?[0-9０-９〇零一二三四五六七八九十百千]+年(?:法律|政令|勅令|府令|省令|規則|条例)第[0-9０-９〇零一二三四五六七八九十百千]+号/gu,
+    ""
+  );
+}
+
+function stripAliasClauses(text: string): string {
+  return text.replace(/以下\s*「[^」]*」\s*という[。、]?/gu, "");
 }
 
 function stripNestedNotes(text: string): string {
-  const chars = Array.from(text);
-  let out = "";
-  let i = 0;
-  while (i < chars.length) {
-    if (chars[i] === "（" || chars[i] === "(") {
-      const close = matchingClose(chars, i, chars.length);
-      if (close !== null) {
-        const inner = chars.slice(i + 1, close).join("").trim();
-        if (isPromulgation(inner) || isAbbreviationNote(inner)) {
-          i = close + 1;
-          continue;
-        }
-      }
-    }
-    out += chars[i];
-    i += 1;
-  }
-  return out;
+  return stripAliasClauses(stripPromulgationNumbers(text));
 }
 
 function withoutDenied(text: string): string {
@@ -873,7 +921,7 @@ function flushPending(frame: EnumFrame, chars: string[]): void {
       break;
     }
     const raw = chars.slice(note.open + 1, note.close).join("");
-    const mentioned = latestLawMention(withoutDenied(stripNestedNotes(raw)));
+    const mentioned = latestLawMentionIn(withoutDenied(stripNestedNotes(raw)));
     if (mentioned && lawKey(mentioned) !== note.outerKey) {
       frame.ambiguous = true;
     }

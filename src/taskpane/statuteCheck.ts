@@ -41,6 +41,24 @@ export function jumpTarget(hit: Pick<StatuteHit, "anchor" | "occurrence">): {
   return { anchor: hit.anchor, occurrence: hit.occurrence };
 }
 
+/** Same count Word's literal search would use inside the checked text. */
+export function occurrenceBefore(text: string, anchor: string, start: number): number {
+  if (!anchor) {
+    return 0;
+  }
+  let count = 0;
+  let from = 0;
+  while (from < start) {
+    const at = text.indexOf(anchor, from);
+    if (at < 0 || at >= start) {
+      break;
+    }
+    count += 1;
+    from = at + anchor.length;
+  }
+  return count;
+}
+
 export function emptyCheckMessage(scope: CheckRequest["scope"]): string {
   return scope === "selection"
     ? "選択範囲に条文の引用は見当たりません。"

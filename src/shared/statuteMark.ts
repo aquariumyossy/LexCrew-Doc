@@ -85,6 +85,10 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     }
     const prev = Math.min(previousEnd, span.start);
     const between = chars.slice(prev, span.start).join("");
+    const mentioned = latestLawMention(between);
+    if (mentioned) {
+      currentLaw = mentioned;
+    }
     const inherit =
       currentLaw !== null &&
       (isConnector(between) || between.trim() === "同法" || between.endsWith("同法"));
@@ -92,11 +96,15 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     const dou = window === "同法";
     let name: string | null;
     if (dou && currentLaw === null) {
-      name = verified.find((item) => item.key === span.key)?.names[0] ?? null;
+      const laws = new Set(
+        verified.filter((item) => item.key === span.key).map((item) => item.names[0] || "")
+      );
+      laws.delete("");
+      name = laws.size === 1 ? [...laws][0] : null;
     } else if (inherit || dou) {
       name = currentLaw;
     } else if (window) {
-      if (DENY_LAW_NAME.some((deny) => window.endsWith(deny))) {
+      if (deniedToken(window)) {
         currentLaw = null;
         previousEnd = span.end;
         if (span.suppl && !alreadyMarked(chars, span.end)) {
@@ -109,7 +117,7 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
         currentLaw = found;
         currentSuppl = span.suppl;
         name = found;
-      } else if (window.endsWith("憲法") || window.endsWith("法")) {
+      } else if (window.endsWith("憲法") || window.endsWith("法") || window.endsWith("令") || window.endsWith("規則")) {
         currentLaw = window;
         currentSuppl = span.suppl;
         name = window;
@@ -131,12 +139,12 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     }
     if (!name) {
       previousEnd = span.end;
-      if (span.suppl && !alreadyMarked(chars, span.end)) {
+      if ((span.suppl || dou) && !alreadyMarked(chars, span.end)) {
         inserts.push(span.end);
       }
       continue;
     }
-    if (DENY_LAW_NAME.includes(name)) {
+    if (deniedToken(name)) {
       previousEnd = span.end;
       continue;
     }
@@ -173,23 +181,80 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
   return out;
 }
 
-/** Apply the mark to an assistant answer using law_article results already in the turn. */
-export function markAnswer(answer: string, toolResults: string[]): string {
-  const verified = toolResults.flatMap((content) => verifiedFromDelivered(content));
+export type DeliveredTool = { name: string; content: string };
+
+/** Marks only from law_article text the model actually received. */
+export function markDelivered(answer: string, tools: DeliveredTool[]): string {
+  const verified = tools
+    .filter((tool) => tool.name === "law_article")
+    .flatMap((tool) => verifiedFromDelivered(tool.content));
   return markUnverified(answer, verified);
+}
+
+/** @deprecated Use markDelivered so other tools cannot look like a statute fetch. */
+export function markAnswer(answer: string, toolResults: string[]): string {
+  return markDelivered(
+    answer,
+    toolResults.map((content) => ({ name: "law_article", content }))
+  );
+}
+
+function deniedToken(window: string): boolean {
+  const name = window.startsWith("改正")
+    ? window.slice(2)
+    : window.startsWith("現行")
+      ? window.slice(2)
+      : window;
+  return DENY_LAW_NAME.some((deny) => deny === name || deny === window);
+}
+
+function prefixOk(before: string): boolean {
+  if (!before || before.endsWith("旧") || before.endsWith("改正前")) {
+    return !before;
+  }
+  if (before.endsWith("改正") || before.endsWith("現行") || before.endsWith("新")) {
+    const rest = before.replace(/(改正|現行|新)$/u, "");
+    return rest.length === 0 || /[。、，・（）「」\sはをにがとのやもへでか]/u.test(rest.slice(-1));
+  }
+  return /[。、，・（）「」\sはをにがとのやもへでか]/u.test(before.slice(-1));
+}
+
+function boundedSuffix(window: string, name: string): boolean {
+  if (name.length < 2 || (window !== name && !window.endsWith(name))) {
+    return false;
+  }
+  return prefixOk(window.slice(0, window.length - name.length));
+}
+
+function latestLawMention(gap: string): string | null {
+  const re = /[〃々一-龯ぁ-んァ-ンー]{1,80}(?:法|令|規則)/g;
+  let best: { end: number; name: string } | null = null;
+  for (const match of gap.matchAll(re)) {
+    const name = match[0];
+    if (name === "同法" || deniedToken(name)) {
+      continue;
+    }
+    const before = gap.slice(0, match.index ?? 0);
+    if (!prefixOk(before)) {
+      continue;
+    }
+    const end = (match.index ?? 0) + name.length;
+    if (!best || end >= best.end) {
+      best = { end, name };
+    }
+  }
+  return best?.name ?? null;
 }
 
 function longestVerifiedSuffix(window: string, verified: VerifiedCite[]): string | null {
   let best: string | null = null;
   for (const item of verified) {
     for (const name of item.names) {
-      if (Array.from(name).length < 2) {
+      if (!boundedSuffix(window, name)) {
         continue;
       }
-      if (window === name || window.endsWith(name)) {
-        if (!best || Array.from(name).length > Array.from(best).length) {
-          best = name;
-        }
+      if (!best || Array.from(name).length > Array.from(best).length) {
+        best = name;
       }
     }
   }
@@ -200,6 +265,10 @@ function lawWindow(chars: string[], citeStart: number): string | null {
   let end = citeStart;
   while (end > 0 && /\s/u.test(chars[end - 1])) {
     end -= 1;
+  }
+  const tail = chars.slice(Math.max(0, end - 6), end).join("");
+  if (["若しくは", "並びに", "および", "又は", "または", "及び", "、", "，", "・", "と", "か"].some((c) => tail.endsWith(c))) {
+    return null;
   }
   let start = end;
   while (start > 0 && isLawChar(chars[start - 1])) {

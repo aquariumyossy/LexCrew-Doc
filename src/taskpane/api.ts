@@ -331,6 +331,9 @@ export async function checkStatutes(
     signal,
   });
   const data = await parseJson<{ results?: StatuteHit[]; error?: string }>(res);
+  if (res.status === 413) {
+    throw new Error("文書が長すぎて照合できません。範囲を選んでからもう一度押してください。");
+  }
   if (!res.ok) {
     throw new Error(data.error || `条文照合に失敗しました（${res.status}）。`);
   }

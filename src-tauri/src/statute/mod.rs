@@ -1,7 +1,5 @@
 //! Built-in statute database. Citations are checked here, not by an LLM.
 
-mod articles;
-mod bundle;
 mod catalog;
 mod check;
 mod cite;
@@ -13,7 +11,7 @@ mod store;
 mod xmlparse;
 
 pub use check::check_text;
-pub use cite::format_tool_result;
+pub use cite::{cap_statute_tool_text, format_tool_result};
 pub use egov::{EgovFailure, EgovSource, LiveEgov, OfflineEgov};
 pub use lookup::{resolve_articles, resolve_without_refresh, ArticleQuery};
 pub use store::StatuteDb;

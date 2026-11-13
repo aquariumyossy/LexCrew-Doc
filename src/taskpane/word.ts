@@ -1344,24 +1344,37 @@ export async function readBodyText(): Promise<string> {
   });
 }
 
-/** Select the nth exact match of a citation. Does not edit the document. */
-export async function selectTextOccurrence(needle: string, occurrence: number): Promise<boolean> {
+/**
+ * Select the nth literal hit of a citation inside the same range that was
+ * checked. Does not edit the document. Word rejects a search longer than 255
+ * characters, so the caller keeps the anchor to the citation itself.
+ */
+export async function selectTextOccurrence(
+  needle: string,
+  occurrence: number,
+  scope: "selection" | "document" = "document"
+): Promise<boolean> {
   const text = needle.trim();
-  if (!text || !isWordHost()) {
+  if (!text || text.length > 255 || !isWordHost()) {
     return false;
   }
-  return Word.run(async (context) => {
-    const hits = context.document.body.search(text, { matchCase: true, matchWholeWord: false });
-    hits.load("items");
-    await context.sync();
-    const range = hits.items[occurrence];
-    if (!range) {
-      return false;
-    }
-    range.select();
-    await context.sync();
-    return true;
-  });
+  try {
+    return await Word.run(async (context) => {
+      const range = scope === "selection" ? context.document.getSelection() : context.document.body;
+      const hits = range.search(text, { matchCase: true, matchWholeWord: false });
+      hits.load("items");
+      await context.sync();
+      const found = hits.items[occurrence];
+      if (!found) {
+        return false;
+      }
+      found.select();
+      await context.sync();
+      return true;
+    });
+  } catch {
+    return false;
+  }
 }
 
 export async function getSelectionText(): Promise<string> {

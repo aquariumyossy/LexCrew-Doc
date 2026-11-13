@@ -1,5 +1,7 @@
 use crate::argos;
-use crate::constants::{DEFAULT_MODEL, DEFAULT_TIMEOUT_MS, JSON_BODY_LIMIT, OCR_BODY_LIMIT};
+use crate::constants::{
+    DEFAULT_MODEL, DEFAULT_TIMEOUT_MS, JSON_BODY_LIMIT, OCR_BODY_LIMIT, STATUTE_BODY_LIMIT,
+};
 use crate::history::{self, NewMessage};
 use crate::llm::{self, ChatOptions};
 use crate::log;
@@ -753,7 +755,11 @@ async fn post_statute_articles(Json(body): Json<StatuteArticleRequest>) -> Respo
                 &today,
             )
         };
-        Ok(crate::statute::format_tool_result(&articles, omitted))
+        let text = crate::statute::cap_statute_tool_text(
+            &crate::statute::format_tool_result(&articles, omitted),
+            6_000,
+        );
+        Ok(text)
     })
     .await;
     match joined {
@@ -808,7 +814,10 @@ fn create_router_at(static_dir: Option<PathBuf>, connection_file: PathBuf) -> Ro
         )
         .route("/api/argos/search", post(post_argos_search))
         .route("/api/argos/file", post(post_argos_file))
-        .route("/api/statute/check", post(post_statute_check))
+        .route(
+            "/api/statute/check",
+            post(post_statute_check).layer(DefaultBodyLimit::max(STATUTE_BODY_LIMIT)),
+        )
         .route("/api/statute/articles", post(post_statute_articles))
         .route(
             "/api/conversations",

@@ -82,6 +82,8 @@ pub struct LawRef {
     pub as_of: String,
     pub checked_on: String,
     pub article_count: usize,
+    /// `bundle` means the seed has the whole law, so a missing article is a bad number.
+    pub source: String,
 }
 
 struct AliasHit {
@@ -102,6 +104,7 @@ pub struct StatuteDb {
     dirty: Mutex<IndexDirty>,
 }
 
+#[allow(dead_code)]
 impl StatuteDb {
     pub fn open(path: &Path) -> Result<Self, String> {
         let db = Self::open_empty(path)?;
@@ -459,7 +462,8 @@ impl StatuteDb {
         let row = conn
             .query_row(
                 "SELECT l.law_id, l.name, l.law_num, l.as_of, l.checked_on,
-                        (SELECT COUNT(*) FROM article a WHERE a.law_id = l.law_id)
+                        (SELECT COUNT(*) FROM article a WHERE a.law_id = l.law_id),
+                        l.source
                  FROM law l WHERE l.law_id = ?1",
                 [law_id],
                 |row| {
@@ -470,6 +474,7 @@ impl StatuteDb {
                         as_of: row.get(3)?,
                         checked_on: row.get(4)?,
                         article_count: row.get::<_, i64>(5)? as usize,
+                        source: row.get(6)?,
                     })
                 },
             )
@@ -489,6 +494,7 @@ impl StatuteDb {
                     as_of: String::new(),
                     checked_on: String::new(),
                     article_count: 0,
+                    source: String::new(),
                 })
             },
         )
@@ -509,6 +515,43 @@ impl StatuteDb {
             out.push(row.map_err(|e| e.to_string())?);
         }
         Ok(out)
+    }
+
+    /// Rightmost current-law name in `text`. Historical prefixes are ignored.
+    pub fn rightmost_law(&self, text: &str) -> Result<Option<LawRef>, String> {
+        self.ensure_alias_cache()?;
+        let cache = self.aliases.lock();
+        let Some(entries) = cache.as_ref() else {
+            return Ok(None);
+        };
+        let mut best: Option<(usize, String, String)> = None;
+        for hit in entries {
+            let mut from = 0usize;
+            while let Some(pos) = text[from..].find(&hit.alias) {
+                let abs = from + pos;
+                if !text.is_char_boundary(abs) {
+                    from = abs + 1;
+                    continue;
+                }
+                let before = &text[..abs];
+                if alias_prefix_ok(before) {
+                    let end = abs + hit.alias.len();
+                    let replace = match &best {
+                        None => true,
+                        Some((at, _, _)) => end > *at,
+                    };
+                    if replace {
+                        best = Some((end, hit.law_id.clone(), hit.name.clone()));
+                    }
+                }
+                from = abs + hit.alias.len().max(1);
+            }
+        }
+        let Some((_, law_id, name)) = best else {
+            return Ok(None);
+        };
+        drop(cache);
+        self.law_with_fallback(&law_id, &name)
     }
 
     pub fn match_law_in_text(&self, text: &str) -> Result<Option<LawRef>, String> {
@@ -534,9 +577,7 @@ impl StatuteDb {
         let Some(entries) = cache.as_ref() else {
             return Ok(None);
         };
-        let found = entries.iter().find(|hit| {
-            hit.alias.chars().count() >= 2 && norm.ends_with(hit.alias.as_str())
-        });
+        let found = entries.iter().find(|hit| alias_suffix_bounded(&norm, &hit.alias));
         let Some(found) = found else {
             return Ok(None);
         };
@@ -556,9 +597,7 @@ impl StatuteDb {
         let Some(entries) = cache.as_ref() else {
             return Ok(None);
         };
-        let found = entries
-            .iter()
-            .find(|hit| hit.alias.chars().count() >= 2 && norm.contains(hit.alias.as_str()));
+        let found = entries.iter().find(|hit| alias_suffix_bounded(&norm, &hit.alias));
         let Some(found) = found else {
             return Ok(None);
         };
@@ -604,12 +643,25 @@ impl StatuteDb {
                 .optional()
                 .map_err(|e| e.to_string())?;
             let Some(found) = found else {
-                return Ok(None);
+                drop(conn);
+                return self.law_from_split_alias(&norm);
             };
             found
         };
         drop(conn);
         self.law_ref(&id)
+    }
+
+    fn law_from_split_alias(&self, name: &str) -> Result<Option<LawRef>, String> {
+        self.ensure_alias_cache()?;
+        let cache = self.aliases.lock();
+        let Some(hit) = cache.as_ref().and_then(|entries| entries.iter().find(|hit| hit.alias == name)) else {
+            return Ok(None);
+        };
+        let law_id = hit.law_id.clone();
+        let fallback = hit.name.clone();
+        drop(cache);
+        self.law_with_fallback(&law_id, &fallback)
     }
 
     pub fn list_articles(&self) -> Result<Vec<(String, ArticleRow)>, String> {
@@ -765,11 +817,9 @@ impl StatuteDb {
         let mut map: HashMap<String, String> = HashMap::new();
         for row in rows {
             let (alias, law_id) = row.map_err(|e| e.to_string())?;
-            let alias = normalize_alias(&alias);
-            if alias.chars().count() < 2 {
-                continue;
+            for alias in split_alias_list(&alias) {
+                map.entry(alias).or_insert_with(|| law_id.clone());
             }
-            map.entry(alias).or_insert(law_id);
         }
         let mut entries: Vec<AliasHit> = map
             .into_iter()
@@ -813,7 +863,7 @@ fn insert_aliases(
         seen.push(normalize_alias(name));
     }
     for alias in aliases {
-        seen.push(normalize_alias(alias));
+        seen.extend(split_alias_list(alias));
     }
     seen.retain(|alias| alias.chars().count() >= 2);
     seen.sort();
@@ -861,6 +911,77 @@ pub fn normalize_alias(text: &str) -> String {
         .filter(|c| !c.is_whitespace() && *c != '　')
         .collect()
 }
+
+/// e-Gov sometimes stores several abbreviations in one cell (`労災法,労災保険法`).
+pub fn split_alias_list(alias: &str) -> Vec<String> {
+    alias
+        .split([',', '、', '，'])
+        .map(normalize_alias)
+        .filter(|alias| alias.chars().count() >= 2)
+        .collect()
+}
+
+/// The alias is a suffix, and the character before it is a real boundary
+/// (start, punctuation, a particle) or a known prefix such as 改正.
+/// `旧` and `改正前` are not boundaries: those names are not the current act.
+pub fn alias_suffix_bounded(text: &str, alias: &str) -> bool {
+    if alias.chars().count() < 2 || !text.ends_with(alias) {
+        return false;
+    }
+    let before = &text[..text.len() - alias.len()];
+    alias_prefix_ok(before)
+}
+
+fn alias_prefix_ok(before: &str) -> bool {
+    if before.is_empty() {
+        return true;
+    }
+    if before.ends_with('旧') || before.ends_with("改正前") {
+        return false;
+    }
+    for prefix in ["改正", "現行", "新"] {
+        if let Some(rest) = before.strip_suffix(prefix) {
+            return rest.is_empty() || rest.chars().last().is_some_and(is_name_boundary);
+        }
+    }
+    before.chars().last().is_some_and(is_name_boundary)
+}
+
+fn is_name_boundary(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '。' | '、'
+                | '，'
+                | '．'
+                | '.'
+                | '・'
+                | '（'
+                | '）'
+                | '('
+                | ')'
+                | '「'
+                | '」'
+                | '『'
+                | '』'
+                | '：'
+                | ':'
+                | '；'
+                | ';'
+                | 'は'
+                | 'を'
+                | 'に'
+                | 'が'
+                | 'と'
+                | 'の'
+                | 'や'
+                | 'も'
+                | 'へ'
+                | 'で'
+                | 'か'
+        )
+}
+
 
 const SEED_IMPORT_SQL: &str = "
 BEGIN;
@@ -957,6 +1078,7 @@ fn seed_temp_path() -> PathBuf {
 
 const SEED: &[u8] = include_bytes!("../../resources/statutes.db.gz");
 
+#[allow(dead_code)]
 pub fn gzip_file(src: &Path, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1145,6 +1267,32 @@ mod tests {
             .unwrap();
         assert_eq!(law.law_id, "129AC0000000089");
         assert!(db.match_law_in_text("第555条と会社法").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_comma_separated_alias_resolves_each_name() {
+        let (_dir, db) = temp_db();
+        let article = ParsedArticle {
+            key: "1".into(),
+            num: "第1条".into(),
+            heading: String::new(),
+            body: "本文".into(),
+            suppl: false,
+        };
+        db.replace_law(
+            "322AC0000000050",
+            "労働者災害補償保険法",
+            "",
+            "2026-11-11",
+            "2026-11-11",
+            "bundle",
+            &["労災法,労災保険法".into()],
+            &[article],
+        )
+        .unwrap();
+        let law = db.resolve_name("労災法").unwrap().expect("労災法");
+        assert_eq!(law.law_id, "322AC0000000050");
+        assert!(db.resolve_name("労災保険法").unwrap().is_some());
     }
 
     #[test]

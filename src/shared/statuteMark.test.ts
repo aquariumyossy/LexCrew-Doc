@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   markAnswer,
+  markDelivered,
   markUnverified,
   verifiedFromDelivered,
   verifiedFromToolOutput,
@@ -91,5 +92,39 @@ describe("markUnverified", () => {
     const marked = markAnswer("労基法第36条は確認した。民法第1条はまだ。", [tool]);
     expect(marked).toContain("労基法第36条は");
     expect(marked).toContain("民法第1条（要確認）");
+  });
+
+  it("does not treat a search line or a truncated law_article result as verified", () => {
+    const searchOnly = markDelivered("民法第1条は原則です。", [
+      { name: "search", content: "確認済み: 民法 第1条\n\n【民法 第1条】\n本文\n" },
+    ]);
+    expect(searchOnly).toContain("民法第1条（要確認）");
+    const cut = markDelivered("民法第1条は原則です。", [
+      {
+        name: "law_article",
+        content: "確認済み: 民法 第1条\n\n【民法 第1条】\n途中…（長いので省略しました）",
+      },
+    ]);
+    expect(cut).toContain("（要確認）");
+  });
+
+  it("marks an unbound or ambiguous 同法 and keeps real law names", () => {
+    const ambiguous = markUnverified("同法第1条。", [
+      verified(["民法"], "1"),
+      verified(["会社法"], "1"),
+    ]);
+    expect(ambiguous).toContain("（要確認）");
+    const named = markUnverified("民法第1条。会社法は重要である。同法第2条は法人です。", [
+      verified(["民法"], "1"),
+      verified(["会社法"], "2"),
+    ]);
+    expect(named).not.toContain("同法第2条（要確認）");
+    expect(named).not.toContain("第2条（要確認）");
+    for (const name of ["労働組合法", "小切手法", "行手法", "取適法", "医療法"]) {
+      const marked = markUnverified(`${name}第1条。`, []);
+      expect(marked, name).toContain("（要確認）");
+    }
+    const old = markUnverified("旧民法第1条。", [verified(["民法"], "1")]);
+    expect(old).toContain("（要確認）");
   });
 });

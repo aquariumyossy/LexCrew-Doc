@@ -8,6 +8,7 @@ pub struct CatalogEntry {
     pub law_id: &'static str,
     /// Full text is packed into the app. `false` only adds the alias so a later
     /// fetch can resolve the name.
+    #[allow(dead_code)]
     pub bundle: bool,
     pub aliases: &'static [&'static str],
 }
@@ -113,7 +114,7 @@ pub static CATALOG: &[CatalogEntry] = &[
     entry(
         "322AC0000000050",
         true,
-        &["労働者災害補償保険法", "労災保険法"],
+        &["労働者災害補償保険法", "労災保険法", "労災法"],
     ),
     entry(
         "347AC0000000113",

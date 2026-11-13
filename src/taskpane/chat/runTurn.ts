@@ -15,7 +15,7 @@ import {
   THINKING_BUDGET_UNSET_NOTICE,
   runawayThinkingChars,
 } from "../../shared/thinking";
-import { markAnswer } from "../../shared/statuteMark";
+import { DeliveredTool, markDelivered } from "../../shared/statuteMark";
 import {
   TOOL_LAW_ARTICLE,
   ToolDefinition,
@@ -353,10 +353,13 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     }
   };
 
+  let lastRequest: ChatMessage[] = [];
+
   const send = async (withTools: boolean) => {
     meter.llmCalls += 1;
     const activeTools = withTools && toolsSupported ? tools : undefined;
     const prepared = prepareRequest(messages, limit, activeTools);
+    lastRequest = prepared.messages;
     options.onRequestTokens?.(prepared.tokens);
     const body: ChatBody = {
       llmBaseUrl: settings.llmBaseUrl,
@@ -384,13 +387,29 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     }
   };
 
+  const lawToolsIn = (sent: ChatMessage[]): DeliveredTool[] => {
+    const names = new Map<string, string>();
+    for (const message of sent) {
+      for (const call of message.tool_calls || []) {
+        if (call.id) {
+          names.set(call.id, call.function?.name || "");
+        }
+      }
+    }
+    return sent
+      .filter((message) => message.role === "tool")
+      .map((message) => ({
+        name: names.get(message.tool_call_id || "") || "",
+        content: message.content || "",
+      }));
+  };
+
   const emitAssistant = async (completion: Awaited<ReturnType<typeof send>>): Promise<void> => {
     lastUsage = completion.usage;
     noteUsage(completion.usage);
-    const toolResults = messages
-      .filter((message) => message.role === "tool")
-      .map((message) => message.content || "");
-    const content = markAnswer(completion.content, toolResults);
+    const content = completion.toolCalls.length
+      ? completion.content
+      : markDelivered(completion.content, lawToolsIn(lastRequest));
     await options.onMessage({
       role: "assistant",
       content,
@@ -417,6 +436,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       return end(lastUsage);
     }
 
+    const capAlreadyUsed = lawArticleCalls >= 10;
     const completion = await send(true);
     await emitAssistant(completion);
 
@@ -491,7 +511,10 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
     const statuteOnly =
       completion.toolCalls.length > 0 &&
       completion.toolCalls.every((call) => call.function.name === TOOL_LAW_ARTICLE);
-    if (!statuteOnly) {
+    // The first 10 law_article calls do not spend the tool-round budget.
+    // Once that cap was already used before this round, further statute-only
+    // rounds count, so a model that keeps calling cannot loop forever.
+    if (!statuteOnly || capAlreadyUsed) {
       round += 1;
     }
   }

@@ -26,6 +26,7 @@ import {
   MAX_TOOL_ROUNDS,
   STALE_DOCUMENT_READ,
   TOOL_FORMAT_TEXT,
+  TOOL_LAW_ARTICLE,
   TOOL_SET_OUTLINE,
   UNLIMITED_TOOL_ROUNDS,
   toolRoundLimitNotice,
@@ -1159,5 +1160,66 @@ describe("meter and send share one fit", () => {
     const next = chatStream.mock.calls[0][0] as ChatBody;
     expect(next.messages.some((message) => message.reasoning_content)).toBe(false);
     expect(outgoingTokens(follow)).toBe(requestTokens(next.messages, next.tools));
+  });
+});
+
+describe("law_article rounds", () => {
+  it("stops after the free statute calls plus the tool-round cap", async () => {
+    const limited = { ...settings, maxToolRounds: 1 };
+    let calls = 0;
+    chatStream.mockImplementation(async () => {
+      calls += 1;
+      if (calls > 40) {
+        throw new Error("runaway");
+      }
+      return completion({
+        toolCalls: [toolCall(`c${calls}`, TOOL_LAW_ARTICLE, '{"articles":[{"law":"民法","article":"1"}]}')],
+      });
+    });
+    executeToolCall.mockResolvedValue({ content: "確認済み: 民法 第1条\n\n【民法 第1条】\n本文\n", ok: true });
+    const sent: NewMessage[] = [];
+    await runTurn({
+      settings: limited,
+      instruction: "条文",
+      attachment: attach(),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: (message) => {
+        sent.push(message);
+      },
+    });
+    expect(chatStream.mock.calls.length).toBeLessThanOrEqual(12);
+    expect(chatStream.mock.calls.length).toBeGreaterThan(10);
+    expect(sent.some((message) => (message.content || "").includes("ツール往復の上限"))).toBe(true);
+  });
+
+  it("does not mark a draft that still has tool calls, and ignores search text", async () => {
+    chatStream
+      .mockResolvedValueOnce(
+        completion({
+          content: "民法第1条を見ます。",
+          toolCalls: [toolCall("c1", "search", '{"q":"民法"}')],
+        })
+      )
+      .mockResolvedValueOnce(completion({ content: "民法第1条は原則です。" }));
+    executeToolCall.mockResolvedValue({
+      content: "確認済み: 民法 第1条\n\n【民法 第1条】\n私権\n",
+      ok: true,
+    });
+    const sent: NewMessage[] = [];
+    await runTurn({
+      settings,
+      instruction: "見て",
+      attachment: attach(),
+      history: [],
+      signal: new AbortController().signal,
+      onMessage: (message) => {
+        sent.push(message);
+      },
+    });
+    const draft = sent.find((message) => (message.content || "").includes("見ます"));
+    expect(draft?.content).not.toContain("要確認");
+    const answer = sent.filter((message) => message.role === "assistant").at(-1);
+    expect(answer?.content).toContain("（要確認）");
   });
 });

@@ -223,26 +223,13 @@ fn fetch_missing(
         );
     }
     match fetch_article(client, &law.law_id, display) {
-        Ok(parsed) => {
-            let mut articles = parsed.articles;
-            let article = if let Some(pos) = articles.iter().position(|a| a.key == key) {
-                articles.swap_remove(pos)
-            } else if articles.len() == 1 {
-                let mut article = articles.pop().expect("one article");
-                article.key = key.to_string();
-                if article.num.is_empty() {
-                    article.num = display.to_string();
-                }
-                article
-            } else {
-                return miss(
-                    law_query,
-                    article_query,
-                    "e-Gov の応答にこの条がありません。",
-                );
-            };
-            store_fetched(db, law, article, today, law_query, article_query, false)
-        }
+        Ok(parsed) => match take_requested(&parsed, key) {
+            Ok(article) if article.body.trim() == "削除" => {
+                miss(law_query, article_query, "削除された条です")
+            }
+            Ok(article) => store_fetched(db, law, article, today, law_query, article_query, false),
+            Err(note) => miss(law_query, article_query, note),
+        },
         Err(EgovFailure::Offline) => {
             *offline = true;
             miss(
@@ -251,12 +238,10 @@ fn fetch_missing(
             "法令DBに無く、オフラインのため e-Gov から取得できませんでした。",
             )
         }
-        Err(EgovFailure::NotFound) => miss(
-            law_query,
-            article_query,
-            "e-Gov 法令APIにこの条はありません。",
-        ),
-        Err(EgovFailure::Bad(message)) => miss(law_query, article_query, &message),
+        Err(EgovFailure::NotFound) => {
+            miss(law_query, article_query, "e-Govで条が見つかりませんでした")
+        }
+        Err(EgovFailure::Bad(message)) => miss(law_query, article_query, &egov_article_note(&message)),
     }
 }
 
@@ -332,22 +317,13 @@ fn probe_article(
 ) -> ToolArticle {
     match fetch_article(client, &law.law_id, display) {
         Ok(parsed) => {
-            let mut articles = parsed.articles;
-            let fresh = if let Some(pos) = articles
-                .iter()
-                .position(|article| article.key == cached.key)
-            {
-                Some(articles.swap_remove(pos))
-            } else if articles.len() == 1 {
-                articles.pop()
-            } else {
-                None
+            let fresh = match take_requested(&parsed, &cached.key) {
+                Ok(article) if article.body.trim() == "削除" => {
+                    return miss(law_query, article_query, "削除された条です");
+                }
+                Ok(article) => article,
+                Err(note) => return miss(law_query, article_query, note),
             };
-            let Some(mut fresh) = fresh else {
-                let _ = db.mark_probed(&law.law_id, &cached.key, today);
-                return hit_from_cache(db, law, cached, false);
-            };
-            fresh.key = cached.key.clone();
             if fresh.body.trim() == cached.body.trim() {
                 let _ = db.mark_probed(&law.law_id, &cached.key, today);
                 return hit_from_cache(db, law, cached, false);
@@ -389,7 +365,28 @@ fn probe_article(
             *offline = true;
             hit_from_cache(db, law, cached, true)
         }
-        Err(_) => hit_from_cache(db, law, cached, true),
+        Err(EgovFailure::NotFound) => miss(law_query, article_query, "e-Govで条が見つかりませんでした"),
+        Err(EgovFailure::Bad(message)) => miss(law_query, article_query, &egov_article_note(&message)),
+    }
+}
+
+fn take_requested(parsed: &crate::statute::xmlparse::ParsedLaw, key: &str) -> Result<ParsedArticle, &'static str> {
+    if parsed.deleted.iter().any(|item| item == key) {
+        return Err("削除された条です");
+    }
+    parsed
+        .articles
+        .iter()
+        .find(|article| article.key == key)
+        .cloned()
+        .ok_or("e-Govで条が見つかりませんでした")
+}
+
+fn egov_article_note(message: &str) -> String {
+    if message.contains("HTTP 500") || message.contains("HTTP 404") || message.contains("条文XMLを読めませんでした") {
+        "e-Govで条が見つかりませんでした".into()
+    } else {
+        message.to_string()
     }
 }
 
@@ -724,6 +721,18 @@ mod tests {
         );
         assert!(hits[0].verified, "{:?}", hits[0].note);
         assert!(hits[0].body.contains("代金を支払う"));
+        let wrong = resolve_articles(
+            &db,
+            &client,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "第9999条".into(),
+            }],
+            "2026-11-11",
+        );
+        assert!(!wrong[0].verified, "{:?}", wrong[0].note);
+        assert!(wrong[0].note.contains("見つかりません"), "{:?}", wrong[0].note);
+        assert!(db.lookup_article("129AC0000000089", "9999").unwrap().is_none());
         assert_eq!(hits[0].heading, "売買");
         let stored = db
             .lookup_article("129AC0000000089", "555")

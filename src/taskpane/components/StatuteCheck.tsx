@@ -65,6 +65,8 @@ export const StatuteCheck: React.FC<Props> = ({ disabled, inWord, online }) => {
   const [note, setNote] = React.useState("");
   const [rows, setRows] = React.useState<StatuteHit[]>([]);
   const [open, setOpen] = React.useState<number | null>(null);
+  const [scope, setScope] = React.useState<"selection" | "document">("document");
+  const abortRef = React.useRef<AbortController | null>(null);
 
   const run = async () => {
     if (!inWord) {
@@ -72,6 +74,9 @@ export const StatuteCheck: React.FC<Props> = ({ disabled, inWord, online }) => {
       setRows([]);
       return;
     }
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setRunning(true);
     setNote("");
     setOpen(null);
@@ -79,15 +84,20 @@ export const StatuteCheck: React.FC<Props> = ({ disabled, inWord, online }) => {
       const selection = await getSelectionText();
       const documentText = selection.trim() ? "" : await readBodyText();
       const request = checkRequest(selection, documentText, online);
+      setScope(request.scope);
       if (!request.text.trim()) {
         setRows([]);
         setNote(emptyCheckMessage(request.scope));
         return;
       }
-      const results = await checkStatutes(request.text, request.online);
+      const results = await checkStatutes(request.text, request.online, controller.signal);
       setRows(results);
       setNote(results.length === 0 ? emptyCheckMessage(request.scope) : "");
     } catch (error) {
+      if (controller.signal.aborted) {
+        setNote("照合を中止しました。");
+        return;
+      }
       setRows([]);
       setNote(error instanceof Error ? error.message : "条文照合に失敗しました。");
     } finally {
@@ -97,8 +107,12 @@ export const StatuteCheck: React.FC<Props> = ({ disabled, inWord, online }) => {
 
   const jump = async (row: StatuteHit) => {
     const target = jumpTarget(row);
-    const found = await selectTextOccurrence(target.anchor, target.occurrence);
-    if (!found) {
+    try {
+      const found = await selectTextOccurrence(target.anchor, target.occurrence, scope);
+      if (!found) {
+        setNote("文書の中でその引用を選べませんでした。");
+      }
+    } catch {
       setNote("文書の中でその引用を選べませんでした。");
     }
   };
@@ -109,6 +123,15 @@ export const StatuteCheck: React.FC<Props> = ({ disabled, inWord, online }) => {
         <Button appearance="secondary" size="small" disabled={disabled || running} onClick={() => void run()}>
           条文照合
         </Button>
+        {running ? (
+          <Button
+            appearance="subtle"
+            size="small"
+            onClick={() => abortRef.current?.abort()}
+          >
+            中止
+          </Button>
+        ) : null}
         {running ? <Spinner size="tiny" label="照合しています…" /> : null}
       </div>
       {note ? (

@@ -5,8 +5,10 @@ use crate::statute::xmlparse::{article_spans, parse_article_query};
 const TOOL_RESULT_OMITTED: &str = "（文脈の上限に達したため、この結果は省略しました）";
 const TOOL_RESULT_TRUNCATION_NOTE: &str = "…（長いので省略しました）";
 
+#[allow(dead_code)]
 pub const LLM_STATUTE_HINT: &str = "\
 条文を回答に書く前に law_article で、その条の本文を取得してください。1回に10条まで、1つの回答で10回までです。この回数はウェブ検索や他のツール往復には数えません。返ってきた見出しと本文だけを根拠にし、本文にない効果は書かないでください。取得できなかった条番号には「要確認」と付けてください。";
+#[allow(dead_code)]
 pub const LLM_STATUTE_SENTINEL: &str = "law_article で、その条の本文を取得";
 
 const DENY_LAW_NAME: &[&str] = &[
@@ -41,6 +43,17 @@ pub struct ToolArticle {
     pub note: String,
     pub law_query: String,
     pub article_query: String,
+}
+
+/// Keep one `law_article` reply from crowding out the rest of the tool budget.
+pub fn cap_statute_tool_text(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = chars.into_iter().take(max_chars).collect();
+    out.push_str("\n…（長いので省略しました）");
+    out
 }
 
 pub fn format_tool_result(articles: &[ToolArticle], omitted: usize) -> String {
@@ -379,6 +392,7 @@ fn already_marked(chars: &[char], end: usize) -> bool {
     rest.starts_with("（要確認）") || rest.starts_with("要確認")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +455,10 @@ mod tests {
         assert!(lines.iter().all(|line| !line.contains("財産権")));
         assert!(text.contains("見出し: 売買"));
         assert!(text.contains("時点: 2026-04-01"));
+        let huge = "あ".repeat(8_000);
+        let capped = cap_statute_tool_text(&huge, 100);
+        assert!(capped.chars().count() < 200, "{}", capped.chars().count());
+        assert!(capped.contains("…（長いので省略しました）"));
     }
 
     #[test]

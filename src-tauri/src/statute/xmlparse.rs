@@ -25,6 +25,8 @@ pub struct ParsedLaw {
     pub name: String,
     pub abbrev: String,
     pub articles: Vec<ParsedArticle>,
+    /// Article keys present only as Delete="true" (the text is not current).
+    pub deleted: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +55,7 @@ pub fn parse_law_xml(xml: &str) -> Result<ParsedLaw, String> {
             "e-Gov 法令APIの結果コードが成功ではありません ({code})"
         ));
     }
-    if parser.articles.is_empty() {
+    if parser.articles.is_empty() && parser.deleted.is_empty() {
         return Err("法令XMLに条文がありません".into());
     }
     dedupe_article_keys(&mut parser.articles);
@@ -64,6 +66,7 @@ pub fn parse_law_xml(xml: &str) -> Result<ParsedLaw, String> {
         law_num,
         abbrev: squash(&parser.abbrev),
         articles: parser.articles,
+        deleted: parser.deleted,
     })
 }
 
@@ -264,6 +267,7 @@ struct LawParser {
     law_name: String,
     abbrev: String,
     articles: Vec<ParsedArticle>,
+    deleted: Vec<String>,
     amend: u32,
     toc: u32,
     rt: u32,
@@ -480,11 +484,15 @@ impl LawParser {
         }
         let article = self.article.take().expect("article");
         if article.delete {
+            self.deleted.push(article.key);
             return;
         }
         let body = cleanup_body(&article.body);
         if body.is_empty() {
             return;
+        }
+        if body == "削除" {
+            self.deleted.push(article.key.clone());
         }
         self.articles.push(ParsedArticle {
             key: article.key,

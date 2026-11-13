@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { checkRequest, emptyCheckMessage, jumpTarget, rowLabel, type StatuteHit } from "./statuteCheck";
+import {
+  checkRequest,
+  emptyCheckMessage,
+  jumpTarget,
+  occurrenceBefore,
+  rowLabel,
+  type StatuteHit,
+} from "./statuteCheck";
 
 const hit = (over: Partial<StatuteHit> = {}): StatuteHit => ({
   citation: "民法第415条第1項",
@@ -40,6 +47,9 @@ describe("条文照合 button", () => {
     );
     const second = hit({ anchor: "民法第1条", occurrence: 1 });
     expect(jumpTarget(second)).toEqual({ anchor: "民法第1条", occurrence: 1 });
+    const body = "前文第1条。民法第1条。第1条";
+    expect(occurrenceBefore(body, "第1条", body.lastIndexOf("第1条"))).toBe(2);
+    expect(occurrenceBefore("選択の民法第415条", "民法第415条", 0)).toBe(0);
     expect(emptyCheckMessage("document")).toContain("文書");
     expect(emptyCheckMessage("selection")).toContain("選択範囲");
   });

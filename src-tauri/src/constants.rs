@@ -3,6 +3,8 @@ pub const PORT: u16 = 28765;
 pub const DEFAULT_MODEL: &str = "qwen3.8-flash-next";
 pub const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 pub const JSON_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// A whole contract is larger than the usual JSON cap. This route only.
+pub const STATUTE_BODY_LIMIT: usize = 16 * 1024 * 1024;
 /// Page images arrive base64 encoded, which grows them by 4/3, so the OCR route
 /// needs more room than the 8MB image cap. Twin of `OCR_BODY_LIMIT_BYTES`.
 pub const OCR_BODY_LIMIT: usize = 12 * 1024 * 1024;

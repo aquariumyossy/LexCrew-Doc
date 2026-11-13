@@ -898,5 +898,75 @@
       { "law": "民法", "key": "709" },
       { "law": "民法", "key": "710" }
     ]
+  },
+  {
+    "id": "r13-carveout-then-douhou",
+    "text": "（民法第709条（会社法の適用を除く。）及び同法第710条）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r13-article-carveout-then-douhou",
+    "text": "（民法第709条（会社法第2条を除く。）及び同法第710条）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "会社法", "key": "2" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r13-carveout-douhou-sentence",
+    "text": "本件は（民法第709条（会社法の適用を除く。）及び同法第710条）による。",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r13-quote-then-douhou",
+    "text": "（民法第709条「会社法」及び同法第710条）",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r13-adjacent-paren-douhou",
+    "text": "（民法第709条（会社法の適用を除く。）（同法第710条参照））",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
+  },
+  {
+    "id": "r13-to-comma-douhou",
+    "text": "民法第709条と、同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r13-oyobi-comma-douhou",
+    "text": "民法第709条及び、同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r13-tomoni-not-douhou",
+    "text": "民法第709条とともに同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "とともに同法", "key": "710", "label": "要確認" }
+    ]
   }
 ]

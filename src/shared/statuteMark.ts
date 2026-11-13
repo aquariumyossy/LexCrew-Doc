@@ -371,7 +371,7 @@ function douhouIsAmbiguous(stack: EnumFrame[]): boolean {
   for (let i = stack.length - 1; i >= 0; i -= 1) {
     const frame = stack[i];
     if (frame?.openAt != null && frame.named) {
-      return false;
+      return frame.ambiguous;
     }
   }
   return stack.some((frame) => frame.ambiguous);
@@ -572,13 +572,14 @@ function lawWindow(chars: string[], citeStart: number, floor: number): string | 
     return null;
   }
   let raw = chars.slice(start, end).join("");
+  if (raw.endsWith("同法") && raw !== "同法" && isJoinerGap(raw.slice(0, raw.length - "同法".length))) {
+    raw = "同法";
+  }
   const lead = ["若しくは", "ならびに", "並びに", "あるいは", "および", "又は", "または", "及び", "、", "，", "・"].find((c) =>
     raw.startsWith(c)
   );
   if (lead) {
     raw = raw.slice(lead.length);
-  } else if (raw.startsWith("と同法")) {
-    raw = raw.slice(1);
   }
   const name = lawNameAfterParticle(raw);
   if (Array.from(name).length < 2) {

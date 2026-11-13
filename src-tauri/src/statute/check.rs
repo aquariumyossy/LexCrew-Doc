@@ -1291,12 +1291,12 @@ fn known_law_name(db: &StatuteDb, name: &str) -> bool {
         || db.match_law_in_text(name).ok().flatten().is_some()
 }
 
-/// A parenthesis that named its own law owns 同法. Otherwise an enclosing
-/// frame that already saw a different law makes 同法 ambiguous.
+/// The innermost parenthesis that named a law owns 同法, including that
+/// frame's own ambiguity (a child carve-out or quote can set it).
 fn douhou_is_ambiguous(stack: &[Frame]) -> bool {
     for frame in stack.iter().rev() {
         if frame.open_at.is_some() && frame.named {
-            return false;
+            return frame.ambiguous;
         }
     }
     stack.iter().any(|frame| frame.ambiguous)
@@ -1740,6 +1740,12 @@ fn same_law_alias(
 }
 
 fn leading_connector_len(text: &str) -> Option<usize> {
+    // と、同法 / 及び、同法 / 、同法. とともに同法 is not a joiner.
+    if let Some(prefix) = text.strip_suffix("同法") {
+        if !prefix.is_empty() && is_joiner_gap(prefix) {
+            return Some(prefix.chars().count());
+        }
+    }
     for conn in [
         "若しくは",
         "ならびに",
@@ -1756,10 +1762,6 @@ fn leading_connector_len(text: &str) -> Option<usize> {
         if text.starts_with(conn) {
             return Some(conn.chars().count());
         }
-    }
-    // と同法. として / とは stay particles, not joiners.
-    if text.strip_prefix('と').is_some_and(|rest| rest.starts_with("同法")) {
-        return Some(1);
     }
     None
 }

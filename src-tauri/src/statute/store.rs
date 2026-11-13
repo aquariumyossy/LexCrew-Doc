@@ -942,11 +942,16 @@ const NAME_PARTICLES: &[&str] = &[
     "について",
     "による",
     "により",
+    "として",
+    "同じく",
     "では",
     "には",
     "とは",
+    "前記",
+    "上記",
     "から",
     "まで",
+    "なお",
     "より",
 ];
 
@@ -972,7 +977,25 @@ fn alias_prefix_ok(before: &str) -> bool {
     if NAME_PARTICLES.iter().any(|particle| before.ends_with(particle)) {
         return true;
     }
+    if sentence_initial_joiner(before) {
+        return true;
+    }
     before.chars().last().is_some_and(is_name_boundary)
+}
+
+/// 「及び民法」 at the start of a sentence. A joiner inside a longer name
+/// (`禁止及び公正取引`) is not a boundary.
+fn sentence_initial_joiner(before: &str) -> bool {
+    for conn in ["並びに", "ならびに", "および", "及び", "または", "又は"] {
+        let Some(rest) = before.strip_suffix(conn) else {
+            continue;
+        };
+        let rest = rest.trim_end();
+        if rest.is_empty() || rest.ends_with('。') || rest.ends_with('\n') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Drops a particle glued to the front of a law name (`契約による民法` → `民法`).

@@ -155,4 +155,54 @@ describe("markUnverified", () => {
     expect(markUnverified("損害保険法第1条", known)).toContain("（要確認）");
     expect(markUnverified("旧民法第709条", known)).toContain("（要確認）");
   });
+
+  it("keeps both citations when a heading sits between them", () => {
+    const marked = markUnverified("民法第709条（不法行為）及び第710条（財産以外の損害）", []);
+    expect(marked).toContain("第709条（要確認）");
+    expect(marked).toContain("第710条（要確認）");
+    const though = markUnverified("民法第709条、ただし第710条", [verified(["民法"], "709")]);
+    expect(though).not.toContain("第710条（要確認）");
+    expect(though).not.toContain("要確認");
+  });
+
+  it("reads a law name that is not flush with the article", () => {
+    const known = [verified(["民法"], "709"), verified(["民法"], "90")];
+    expect(markUnverified("民法の第709条", [])).toContain("（要確認）");
+    expect(markUnverified("民法の第709条", known)).not.toContain("要確認");
+    expect(markUnverified("民法第709条を準用する。同法の第90条。", [verified(["民法"], "709")])).toContain(
+      "同法の第90条（要確認）"
+    );
+    expect(markUnverified("民法（明治二十九年法律第八十九号）第709条", known)).not.toContain("要確認");
+  });
+
+  it("resolves each law when a joiner sits between two named citations", () => {
+    const known = [
+      verified(["民法"], "1"),
+      verified(["民法"], "2"),
+      verified(["民法"], "709"),
+      verified(["民法"], "710"),
+      verified(["会社法"], "2"),
+    ];
+    expect(markUnverified("民法第1条及び民法第2条", known)).not.toContain("要確認");
+    expect(markUnverified("民法第709条及び会社法第2条", known)).not.toContain("要確認");
+    expect(markUnverified("民法第709条、同法第710条", known)).not.toContain("要確認");
+  });
+
+  it("treats a lead-in as a boundary and keeps a longer law name", () => {
+    const known = [verified(["民法"], "709"), verified(["保険法"], "1")];
+    for (const sample of [
+      "として民法第709条",
+      "なお民法第709条",
+      "前記民法第709条",
+      "上記民法第709条",
+      "同じく民法第709条",
+      "及び民法第709条",
+    ]) {
+      expect(markUnverified(sample, known), sample).not.toContain("要確認");
+    }
+    expect(markUnverified("損害保険法第1条", known)).toContain("（要確認）");
+    expect(markUnverified("特別法第1条", known)).toContain("（要確認）");
+    expect(markUnverified("施行法第1条", known)).toContain("（要確認）");
+    expect(markUnverified("整備法第1条", known)).toContain("（要確認）");
+  });
 });

@@ -89,7 +89,7 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     if (mentioned) {
       currentLaw = mentioned;
     }
-    const window = lawWindow(chars, span.start);
+    const window = lawWindow(chars, span.start, Math.min(previousEnd, span.start));
     const dou = window === "同法";
     const enumerated = window === null && isEnumeration(between);
     const inherited = dou || enumerated;
@@ -211,7 +211,23 @@ function deniedToken(window: string): boolean {
   return DENY_LAW_NAME.some((deny) => deny === name || deny === window);
 }
 
-const NAME_PARTICLES = ["によれば", "について", "による", "により", "では", "には", "とは", "から", "まで", "より"];
+const NAME_PARTICLES = [
+  "によれば",
+  "について",
+  "による",
+  "により",
+  "として",
+  "同じく",
+  "では",
+  "には",
+  "とは",
+  "前記",
+  "上記",
+  "から",
+  "まで",
+  "なお",
+  "より",
+];
 
 function prefixOk(before: string): boolean {
   if (!before) {
@@ -227,7 +243,23 @@ function prefixOk(before: string): boolean {
   if (NAME_PARTICLES.some((particle) => before.endsWith(particle))) {
     return true;
   }
+  if (sentenceInitialJoiner(before)) {
+    return true;
+  }
   return /[。、，・（）「」\sはをにがとのやもへでか]/u.test(before.slice(-1));
+}
+
+function sentenceInitialJoiner(before: string): boolean {
+  for (const conn of ["並びに", "ならびに", "および", "及び", "または", "又は"]) {
+    if (!before.endsWith(conn)) {
+      continue;
+    }
+    const rest = before.slice(0, before.length - conn.length).trimEnd();
+    if (rest.length === 0 || rest.endsWith("。") || rest.endsWith("\n")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function lawNameAfterParticle(name: string): string {
@@ -291,25 +323,67 @@ function longestVerifiedSuffix(window: string, verified: VerifiedCite[]): string
   return best;
 }
 
-function lawWindow(chars: string[], citeStart: number): string | null {
+function lawWindow(chars: string[], citeStart: number, floor: number): string | null {
+  const stop = Math.min(floor, citeStart);
   let end = citeStart;
-  while (end > 0 && /\s/u.test(chars[end - 1])) {
+  while (end > stop && /\s/u.test(chars[end - 1])) {
     end -= 1;
   }
-  const tail = chars.slice(Math.max(0, end - 6), end).join("");
+  end = peelGlue(chars, end, stop);
+  const tail = chars.slice(Math.max(stop, end - 6), end).join("");
   if (["若しくは", "並びに", "および", "又は", "または", "及び", "、", "，", "・", "と", "か"].some((c) => tail.endsWith(c))) {
     return null;
   }
   let start = end;
-  while (start > 0 && isLawChar(chars[start - 1])) {
+  while (start > stop && isLawChar(chars[start - 1])) {
     start -= 1;
   }
-  if (start === end) {
+  if (start >= end) {
     return null;
   }
-  const raw = chars.slice(start, end).join("");
+  let raw = chars.slice(start, end).join("");
+  const lead = ["若しくは", "ならびに", "並びに", "あるいは", "および", "又は", "または", "及び", "、", "，", "・"].find((c) =>
+    raw.startsWith(c)
+  );
+  if (lead) {
+    raw = raw.slice(lead.length);
+  }
   const name = lawNameAfterParticle(raw);
   return Array.from(name).length < 2 ? null : name;
+}
+
+function peelGlue(chars: string[], end: number, floor: number): number {
+  let cursor = end;
+  while (cursor > floor) {
+    while (cursor > floor && /\s/u.test(chars[cursor - 1])) {
+      cursor -= 1;
+    }
+    if (cursor > floor && chars[cursor - 1] === "の") {
+      cursor -= 1;
+      continue;
+    }
+    if (cursor > floor && (chars[cursor - 1] === "）" || chars[cursor - 1] === ")")) {
+      const open = chars[cursor - 1] === "）" ? "（" : "(";
+      let j = cursor - 1;
+      let openAt = -1;
+      while (j > floor) {
+        j -= 1;
+        if (chars[j] === open) {
+          openAt = j;
+          break;
+        }
+        if (chars[j] === chars[cursor - 1]) {
+          break;
+        }
+      }
+      if (openAt >= 0) {
+        cursor = openAt;
+        continue;
+      }
+    }
+    break;
+  }
+  return cursor;
 }
 
 function looksLikeLawName(name: string): boolean {
@@ -323,7 +397,11 @@ function looksLikeLawName(name: string): boolean {
 }
 
 function isEnumeration(between: string): boolean {
-  const text = between.replace(/「[^」]*」/gu, "").replace(/\s/gu, "");
+  const text = between
+    .replace(/「[^」]*」/gu, "")
+    .replace(/（[^）]*）/gu, "")
+    .replace(/\([^)]*\)/gu, "")
+    .replace(/\s/gu, "");
   return ["及び", "および", "並びに", "ならびに", "又は", "または", "若しくは", "、", "，", "・"].includes(text);
 }
 

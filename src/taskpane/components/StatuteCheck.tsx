@@ -8,7 +8,13 @@ import {
   jumpTarget,
   rowLabel,
 } from "../statuteCheck";
-import { getSelectionText, readBodyText, rememberStatuteRange, selectTextOccurrence } from "../word";
+import {
+  getSelectionText,
+  readBodyText,
+  releaseStatuteRange,
+  rememberStatuteRange,
+  selectTextOccurrence,
+} from "../word";
 
 const useStyles = makeStyles({
   wrap: {
@@ -67,6 +73,12 @@ export const StatuteCheck: React.FC<Props> = ({ disabled, inWord, online }) => {
   const [open, setOpen] = React.useState<number | null>(null);
   const [scope, setScope] = React.useState<"selection" | "document">("document");
   const abortRef = React.useRef<AbortController | null>(null);
+
+  React.useEffect(() => {
+    return () => {
+      void releaseStatuteRange();
+    };
+  }, []);
 
   const run = async () => {
     if (!inWord) {

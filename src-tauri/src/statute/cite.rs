@@ -31,6 +31,14 @@ pub struct VerifiedCite {
     pub key: String,
 }
 
+/// Why a lookup did not return current text. Only `NotFound` may become 番号違い.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArticleMiss {
+    NotFound,
+    Deleted,
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolArticle {
     pub names: Vec<String>,
@@ -43,6 +51,8 @@ pub struct ToolArticle {
     pub note: String,
     pub law_query: String,
     pub article_query: String,
+    /// Set when `verified` is false. HTTP errors and bad XML stay `Failed`.
+    pub miss: Option<ArticleMiss>,
 }
 
 /// Keep one `law_article` reply from crowding out the rest of the tool budget.
@@ -444,6 +454,7 @@ mod tests {
             note: String::new(),
             law_query: "民法".into(),
             article_query: "555".into(),
+            miss: None,
         }];
         let text = format_tool_result(&articles, 0);
         let parsed = verified_from_tool_output(&text);

@@ -1,6 +1,6 @@
 //! DB first, then e-Gov. Offline uses the saved text and does not fail the call.
 
-use crate::statute::cite::ToolArticle;
+use crate::statute::cite::{ArticleMiss, ToolArticle};
 use crate::statute::egov::{
     article_url, lawdata_url, lawlist_url, update_list_url, EgovFailure, EgovSource,
 };
@@ -225,10 +225,10 @@ fn fetch_missing(
     match fetch_article(client, &law.law_id, display) {
         Ok(parsed) => match take_requested(&parsed, key) {
             Ok(article) if article.body.trim() == "削除" => {
-                miss(law_query, article_query, "削除された条です")
+                miss_kind(law_query, article_query, "削除された条です", ArticleMiss::Deleted)
             }
             Ok(article) => store_fetched(db, law, article, today, law_query, article_query, false),
-            Err(note) => miss(law_query, article_query, note),
+            Err(note) => miss_lookup(law_query, article_query, note),
         },
         Err(EgovFailure::Offline) => {
             *offline = true;
@@ -239,9 +239,16 @@ fn fetch_missing(
             )
         }
         Err(EgovFailure::NotFound) => {
-            miss(law_query, article_query, "e-Govで条が見つかりませんでした")
+            miss_kind(
+                law_query,
+                article_query,
+                "e-Govで条が見つかりませんでした",
+                ArticleMiss::NotFound,
+            )
         }
-        Err(EgovFailure::Bad(message)) => miss(law_query, article_query, &egov_article_note(&message)),
+        Err(EgovFailure::Bad(message)) => {
+            miss_kind(law_query, article_query, &egov_article_note(&message), ArticleMiss::Failed)
+        }
     }
 }
 
@@ -300,6 +307,7 @@ fn store_fetched(
         note: String::new(),
         law_query: law_query.to_string(),
         article_query: article_query.to_string(),
+        miss: None,
     }
 }
 
@@ -319,10 +327,15 @@ fn probe_article(
         Ok(parsed) => {
             let fresh = match take_requested(&parsed, &cached.key) {
                 Ok(article) if article.body.trim() == "削除" => {
-                    return miss(law_query, article_query, "削除された条です");
+                    return miss_kind(
+                        law_query,
+                        article_query,
+                        "削除された条です",
+                        ArticleMiss::Deleted,
+                    );
                 }
                 Ok(article) => article,
-                Err(note) => return miss(law_query, article_query, note),
+                Err(note) => return miss_lookup(law_query, article_query, note),
             };
             if fresh.body.trim() == cached.body.trim() {
                 let _ = db.mark_probed(&law.law_id, &cached.key, today);
@@ -359,14 +372,22 @@ fn probe_article(
                 note: String::new(),
                 law_query: law_query.to_string(),
                 article_query: article_query.to_string(),
+                miss: None,
             }
         }
         Err(EgovFailure::Offline) => {
             *offline = true;
             hit_from_cache(db, law, cached, true)
         }
-        Err(EgovFailure::NotFound) => miss(law_query, article_query, "e-Govで条が見つかりませんでした"),
-        Err(EgovFailure::Bad(message)) => miss(law_query, article_query, &egov_article_note(&message)),
+        Err(EgovFailure::NotFound) => miss_kind(
+            law_query,
+            article_query,
+            "e-Govで条が見つかりませんでした",
+            ArticleMiss::NotFound,
+        ),
+        Err(EgovFailure::Bad(message)) => {
+            miss_kind(law_query, article_query, &egov_article_note(&message), ArticleMiss::Failed)
+        }
     }
 }
 
@@ -383,11 +404,28 @@ fn take_requested(parsed: &crate::statute::xmlparse::ParsedLaw, key: &str) -> Re
 }
 
 fn egov_article_note(message: &str) -> String {
-    if message.contains("HTTP 500") || message.contains("HTTP 404") || message.contains("条文XMLを読めませんでした") {
-        "e-Govで条が見つかりませんでした".into()
-    } else {
-        message.to_string()
+    if let Some(code) = http_status_code(message) {
+        return format!("e-Govから取得できませんでした（HTTP {code}）");
     }
+    if message.contains("読めませんでした") {
+        return "e-Govから取得できませんでした。".into();
+    }
+    message.to_string()
+}
+
+fn http_status_code(message: &str) -> Option<String> {
+    let rest = message.split("HTTP ").nth(1)?;
+    let code: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if code.len() == 3 { Some(code) } else { None }
+}
+
+fn miss_lookup(law: &str, article: &str, note: &str) -> ToolArticle {
+    let kind = match note {
+        "削除された条です" => ArticleMiss::Deleted,
+        "e-Govで条が見つかりませんでした" => ArticleMiss::NotFound,
+        _ => ArticleMiss::Failed,
+    };
+    miss_kind(law, article, note, kind)
 }
 
 fn reload_law(
@@ -460,10 +498,15 @@ fn hit_from_cache(
         note: String::new(),
         law_query: law.name.clone(),
         article_query: row.num.clone(),
+        miss: None,
     }
 }
 
 fn miss(law: &str, article: &str, note: &str) -> ToolArticle {
+    miss_kind(law, article, note, ArticleMiss::Failed)
+}
+
+fn miss_kind(law: &str, article: &str, note: &str, kind: ArticleMiss) -> ToolArticle {
     ToolArticle {
         names: Vec::new(),
         article_num: String::new(),
@@ -475,6 +518,7 @@ fn miss(law: &str, article: &str, note: &str) -> ToolArticle {
         note: note.to_string(),
         law_query: law.to_string(),
         article_query: article.to_string(),
+        miss: Some(kind),
     }
 }
 

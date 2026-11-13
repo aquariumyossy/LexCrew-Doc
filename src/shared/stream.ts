@@ -131,11 +131,15 @@ export class StreamAccumulator {
     const toolCalls: ToolCall[] = this.tools
       .slice()
       .sort((a, b) => a.index - b.index)
-      .map((tool) => ({
-        id: tool.id.trim() || syntheticToolId(),
-        type: "function" as const,
-        function: { name: tool.name, arguments: tool.arguments },
-      }))
+      .map((tool) => {
+        const id = tool.id.trim() || syntheticToolId();
+        tool.id = id;
+        return {
+          id,
+          type: "function" as const,
+          function: { name: tool.name, arguments: tool.arguments },
+        };
+      })
       .filter((call) => call.function.name.trim());
 
     return {

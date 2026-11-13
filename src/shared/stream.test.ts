@@ -60,6 +60,20 @@ describe("StreamAccumulator", () => {
     ]);
   });
 
+  it("writes a minted tool id back onto the accumulator", () => {
+    const acc = new StreamAccumulator();
+    acc.ingest({
+      choices: [
+        {
+          finish_reason: "tool_calls",
+          delta: { tool_calls: [{ index: 0, function: { name: "search", arguments: "{}" } }] },
+        },
+      ],
+    });
+    const first = acc.finish().toolCalls[0].id;
+    expect(acc.finish().toolCalls[0].id).toBe(first);
+  });
+
   it("gives each omitted tool id its own number", () => {
     const first = new StreamAccumulator();
     first.ingest({

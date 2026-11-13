@@ -53,6 +53,14 @@ describe("loadSettings timeout migration", () => {
     expect(loadSettings().timeoutMs).toBe(300_000);
   });
 
+  it("keeps online statute checks on unless the user turned them off", () => {
+    expect(loadSettings().statuteOnline).toBe(true);
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ statuteOnline: false }));
+    expect(loadSettings().statuteOnline).toBe(false);
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ statuteOnline: true }));
+    expect(loadSettings().statuteOnline).toBe(true);
+  });
+
   it("defaults Argos to the loopback search API", () => {
     expect(loadSettings().argosBaseUrl).toBe(DEFAULT_ARGOS_BASE_URL);
     expect(loadSettings().argosApiKey).toBe("");

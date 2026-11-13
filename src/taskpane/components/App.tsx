@@ -116,6 +116,7 @@ import ChatPane, { ChatDraft } from "./ChatPane";
 import { AboutDialog } from "./AboutDialog";
 import ArgosScopePicker from "./ArgosScopePicker";
 import { FileAttachButton, FileBadges } from "./FileAttachBar";
+import { StatuteCheck } from "./StatuteCheck";
 import { PromptLibrary } from "./PromptLibrary";
 import ContextMeter from "./ContextMeter";
 import HistoryDialog from "./HistoryDialog";
@@ -1159,6 +1160,8 @@ const App: React.FC = () => {
 
       <ChatPane messages={messages} draft={draft} />
 
+      <StatuteCheck disabled={busy} inWord={inWord} online={settings.statuteOnline} />
+
       {busy && (
         <div className={styles.row}>
           <Spinner size="tiny" label={draft ? "生成中…" : `${busyLabel}を待っています…`} />
@@ -1488,6 +1491,14 @@ const App: React.FC = () => {
                     }}
                   />
                 </Field>
+                <Checkbox
+                  checked={settings.statuteOnline}
+                  onChange={(_, data) => patch({ statuteOnline: data.checked === true })}
+                  label="条文を e-Gov で確認する"
+                />
+                <Text size={200} className={styles.muted}>
+                  オフにすると同梱と保存済みの条文だけを使います。オンのときも送るのは法令IDと条番号だけです。
+                </Text>
                 <Field
                   size="small"
                   label="ツール往復の上限"

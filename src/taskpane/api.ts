@@ -11,6 +11,7 @@ import { Completion } from "../shared/stripThinking";
 import { ToolDefinition } from "../shared/tools";
 import { ChatMessage, SearchHit } from "../sidecar/types";
 import { ConnectionFields, ConnectionView } from "./connectionState";
+import { StatuteHit } from "./statuteCheck";
 
 /* global fetch, Response, RequestInit, AbortSignal */
 
@@ -298,6 +299,45 @@ export async function readImage(body: OcrBody, signal?: AbortSignal): Promise<st
     throw error;
   }
   return data.text || "";
+}
+
+export async function fetchStatuteArticles(
+  articles: { law: string; article: string }[],
+  online: boolean,
+  signal?: AbortSignal
+): Promise<string> {
+  const res = await fetch("/api/statute/articles", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ articles, online }),
+    signal,
+  });
+  const data = await parseJson<{ text?: string; error?: string }>(res);
+  if (!res.ok) {
+    throw new Error(data.error || `条文を取得できませんでした（${res.status}）。`);
+  }
+  return data.text || "";
+}
+
+export async function checkStatutes(
+  text: string,
+  online: boolean,
+  signal?: AbortSignal
+): Promise<StatuteHit[]> {
+  const res = await fetch("/api/statute/check", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, online }),
+    signal,
+  });
+  const data = await parseJson<{ results?: StatuteHit[]; error?: string }>(res);
+  if (res.status === 413) {
+    throw new Error("文書が長すぎて照合できません。範囲を選んでからもう一度押してください。");
+  }
+  if (!res.ok) {
+    throw new Error(data.error || `条文照合に失敗しました（${res.status}）。`);
+  }
+  return data.results || [];
 }
 
 export async function search(

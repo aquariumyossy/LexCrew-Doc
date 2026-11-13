@@ -1332,6 +1332,97 @@ export async function readSelectionForMeter(): Promise<MeterSelection> {
   return readSelectionAttachment();
 }
 
+export async function readBodyText(): Promise<string> {
+  if (!isWordHost()) {
+    return "";
+  }
+  return Word.run(async (context) => {
+    const body = context.document.body;
+    body.load("text");
+    await context.sync();
+    return body.text || "";
+  });
+}
+
+/**
+ * The selection that was checked. Later jumps must search this object, not
+ * whatever the caret moved to after the first jump. Document scope does not
+ * keep a range; it searches the body.
+ */
+let statuteCheckRange: Word.Range | null = null;
+
+export async function rememberStatuteRange(scope: "selection" | "document"): Promise<void> {
+  await releaseStatuteRange();
+  if (scope !== "selection" || !isWordHost()) {
+    return;
+  }
+  await Word.run(async (context) => {
+    const range = context.document.getSelection();
+    range.track();
+    await context.sync();
+    statuteCheckRange = range;
+  });
+}
+
+export async function releaseStatuteRange(): Promise<void> {
+  const tracked = statuteCheckRange;
+  if (!tracked) {
+    return;
+  }
+  statuteCheckRange = null;
+  try {
+    await Word.run(tracked, async (context) => {
+      tracked.untrack();
+      await context.sync();
+    });
+  } catch {
+    // The document may already have closed.
+  }
+}
+
+/**
+ * Select the nth literal hit of a citation inside the same range that was
+ * checked. Does not edit the document. Word rejects a search longer than 255
+ * characters, so the caller keeps the anchor to the citation itself.
+ */
+export async function selectTextOccurrence(
+  needle: string,
+  occurrence: number,
+  scope: "selection" | "document" = "document"
+): Promise<boolean> {
+  const text = needle.trim();
+  if (!text || text.length > 255 || !isWordHost()) {
+    return false;
+  }
+  const pick = async (
+    context: Word.RequestContext,
+    range: { search: Word.Range["search"] }
+  ): Promise<boolean> => {
+    const hits = range.search(text, { matchCase: true, matchWholeWord: false });
+    hits.load("items");
+    await context.sync();
+    const found = hits.items[occurrence];
+    if (!found) {
+      return false;
+    }
+    found.select();
+    await context.sync();
+    return true;
+  };
+  try {
+    if (scope === "selection" && statuteCheckRange) {
+      const tracked = statuteCheckRange;
+      return await Word.run(tracked, async (context) => pick(context, tracked));
+    }
+    return await Word.run(async (context) => {
+      const range = scope === "selection" ? context.document.getSelection() : context.document.body;
+      return pick(context, range);
+    });
+  } catch {
+    return false;
+  }
+}
+
 export async function getSelectionText(): Promise<string> {
   return Word.run(async (context) => {
     const range = context.document.getSelection();

@@ -60,6 +60,45 @@ describe("StreamAccumulator", () => {
     ]);
   });
 
+  it("writes a minted tool id back onto the accumulator", () => {
+    const acc = new StreamAccumulator();
+    acc.ingest({
+      choices: [
+        {
+          finish_reason: "tool_calls",
+          delta: { tool_calls: [{ index: 0, function: { name: "search", arguments: "{}" } }] },
+        },
+      ],
+    });
+    const first = acc.finish().toolCalls[0].id;
+    expect(acc.finish().toolCalls[0].id).toBe(first);
+  });
+
+  it("gives each omitted tool id its own number", () => {
+    const first = new StreamAccumulator();
+    first.ingest({
+      choices: [
+        {
+          finish_reason: "tool_calls",
+          delta: { tool_calls: [{ index: 0, function: { name: "search", arguments: "{}" } }] },
+        },
+      ],
+    });
+    const second = new StreamAccumulator();
+    second.ingest({
+      choices: [
+        {
+          finish_reason: "tool_calls",
+          delta: { tool_calls: [{ index: 0, function: { name: "search", arguments: "{}" } }] },
+        },
+      ],
+    });
+    const a = first.finish().toolCalls[0].id;
+    const b = second.finish().toolCalls[0].id;
+    expect(a).toMatch(/^call_s\d+$/);
+    expect(b).not.toBe(a);
+  });
+
   it("treats a full JSON message as a one-shot chunk", () => {
     const acc = new StreamAccumulator();
     acc.ingest({

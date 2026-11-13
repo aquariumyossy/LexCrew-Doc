@@ -1,5 +1,7 @@
 use crate::argos;
-use crate::constants::{DEFAULT_MODEL, DEFAULT_TIMEOUT_MS, JSON_BODY_LIMIT, OCR_BODY_LIMIT};
+use crate::constants::{
+    DEFAULT_MODEL, DEFAULT_TIMEOUT_MS, JSON_BODY_LIMIT, OCR_BODY_LIMIT, STATUTE_BODY_LIMIT,
+};
 use crate::history::{self, NewMessage};
 use crate::llm::{self, ChatOptions};
 use crate::log;
@@ -643,6 +645,170 @@ fn default_connection_file() -> PathBuf {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct StatuteCheckRequest {
+    #[serde(default)]
+    text: String,
+    /// Missing means online, matching the task-pane default.
+    #[serde(default)]
+    online: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StatuteArticleRequest {
+    #[serde(default)]
+    articles: Vec<StatuteArticleQuery>,
+    #[serde(default)]
+    law: String,
+    #[serde(default)]
+    article: String,
+    #[serde(default)]
+    online: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StatuteArticleQuery {
+    #[serde(default)]
+    law: String,
+    #[serde(default)]
+    article: String,
+}
+
+fn statute_today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn statute_online(flag: Option<bool>) -> bool {
+    flag.unwrap_or(true)
+}
+
+/// Set when the HTTP handler is dropped, including a client disconnect.
+/// The blocking check reads the flag between e-Gov calls.
+struct StopFetch(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopFetch {
+    fn drop(&mut self) {
+        self.0
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+async fn post_statute_check(Json(body): Json<StatuteCheckRequest>) -> Response {
+    let text = body.text;
+    let online = statute_online(body.online);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = StopFetch(cancel.clone());
+    let flag = cancel.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        crate::statute::set_check_cancel(Some(flag));
+        let outcome = (|| {
+            let service = crate::statute::shared();
+            if !service.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("法令DBを開けませんでした。".to_string());
+            }
+            let today = statute_today();
+            Ok(crate::statute::check_text(
+                &service.db,
+                service.client.as_ref(),
+                &text,
+                &today,
+                online,
+            ))
+        })();
+        crate::statute::set_check_cancel(None);
+        outcome
+    })
+    .await;
+    // Keep `stop` alive until the blocking check returns. Dropping this
+    // future on a client disconnect sets the flag and the loop stops fetching.
+    drop(stop);
+    match joined {
+        Ok(Ok(results)) => Json(json!({ "results": results })).into_response(),
+        Ok(Err(error)) => json_error(StatusCode::SERVICE_UNAVAILABLE, &error, None),
+        Err(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "条文照合を完了できませんでした。",
+            None,
+        ),
+    }
+}
+
+async fn post_statute_articles(Json(body): Json<StatuteArticleRequest>) -> Response {
+    let mut queries = Vec::new();
+    for item in body.articles {
+        let law = item.law.trim().to_string();
+        let article = item.article.trim().to_string();
+        if law.is_empty() && article.is_empty() {
+            continue;
+        }
+        queries.push(crate::statute::ArticleQuery { law, article });
+    }
+    if queries.is_empty() {
+        let law = body.law.trim().to_string();
+        let article = body.article.trim().to_string();
+        if !law.is_empty() || !article.is_empty() {
+            queries.push(crate::statute::ArticleQuery { law, article });
+        }
+    }
+    if queries.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "law と article を指定してください。例: 民法 415。",
+            None,
+        );
+    }
+    let online = statute_online(body.online);
+    let omitted = queries.len().saturating_sub(10);
+    queries.truncate(10);
+    let joined = tokio::task::spawn_blocking(move || {
+        let service = crate::statute::shared();
+        if !service.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("法令DBを開けませんでした。".to_string());
+        }
+        let today = statute_today();
+        let guarded = StatuteNames { inner: service.client.as_ref() };
+        let articles = if online {
+            crate::statute::resolve_without_refresh(&service.db, &guarded, &queries, &today)
+        } else {
+            crate::statute::resolve_articles(
+                &service.db,
+                &crate::statute::OfflineEgov,
+                &queries,
+                &today,
+            )
+        };
+        let text = crate::statute::cap_statute_tool_text(
+            &crate::statute::format_tool_result(&articles, omitted),
+            6_000,
+        );
+        Ok(text)
+    })
+    .await;
+    match joined {
+        Ok(Ok(text)) => Json(json!({ "text": text })).into_response(),
+        Ok(Err(error)) => json_error(StatusCode::SERVICE_UNAVAILABLE, &error, None),
+        Err(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "条文を取得できませんでした。",
+            None,
+        ),
+    }
+}
+
+/// Keeps a law-name catalog request on this machine. Article fetches still go out.
+struct StatuteNames<'a> {
+    inner: &'a dyn crate::statute::EgovSource,
+}
+
+impl crate::statute::EgovSource for StatuteNames<'_> {
+    fn fetch(&self, url: &str) -> Result<String, crate::statute::EgovFailure> {
+        if url.contains("/lawlists/") {
+            return Ok("<DataRoot></DataRoot>".into());
+        }
+        self.inner.fetch(url)
+    }
+}
+
 pub fn create_router(static_dir: Option<PathBuf>) -> Router {
     create_router_at(static_dir, default_connection_file())
 }
@@ -670,6 +836,11 @@ fn create_router_at(static_dir: Option<PathBuf>, connection_file: PathBuf) -> Ro
         )
         .route("/api/argos/search", post(post_argos_search))
         .route("/api/argos/file", post(post_argos_file))
+        .route(
+            "/api/statute/check",
+            post(post_statute_check).layer(DefaultBodyLimit::max(STATUTE_BODY_LIMIT)),
+        )
+        .route("/api/statute/articles", post(post_statute_articles))
         .route(
             "/api/conversations",
             get(get_conversations).post(post_conversations),

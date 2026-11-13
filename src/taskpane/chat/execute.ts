@@ -20,6 +20,7 @@ import {
   TOOL_INSERT_BLANK_BEFORE,
   TOOL_INSERT_BLOCKS,
   TOOL_INSERT_CITATION,
+  TOOL_LAW_ARTICLE,
   TOOL_INSERT_COMMENT,
   TOOL_READ_INDEXED_FILE,
   TOOL_READ_PARAGRAPHS,
@@ -32,7 +33,7 @@ import {
   ToolCall,
   parseToolArguments,
 } from "../../shared/tools";
-import { readArgosFile, search, searchArgosIndex } from "../api";
+import { fetchStatuteArticles, readArgosFile, search, searchArgosIndex } from "../api";
 import { ABORTED_TOOL_RESULT } from "./context";
 import { sliceIndexedText } from "../../shared/indexedRead";
 import { Settings } from "../settings";
@@ -259,6 +260,15 @@ export async function executeToolCall(
     switch (invocation.name) {
       case TOOL_SEARCH:
         return await runSearch(invocation.args.q, settings, signal);
+
+      case TOOL_LAW_ARTICLE: {
+        const text = await fetchStatuteArticles(
+          invocation.args.articles,
+          settings.statuteOnline,
+          signal
+        );
+        return { content: text, ok: true };
+      }
 
       case TOOL_SEARCH_INDEX:
         return await runIndexSearch(

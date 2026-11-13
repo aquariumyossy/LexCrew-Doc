@@ -23,7 +23,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 dirs = "6"
 rcgen = "0.13"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
 futures-util = "0.3"
 rustls = "0.23"
 serde = { version = "1", features = ["derive"] }
@@ -33,6 +33,10 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"]
 tower-http = { version = "0.6", features = ["fs", "set-header"] }
 url = "2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+quick-xml = "0.37"
+flate2 = "1"
+parking_lot = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

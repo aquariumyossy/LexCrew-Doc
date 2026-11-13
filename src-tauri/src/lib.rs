@@ -13,6 +13,7 @@ mod ocr;
 mod paths;
 mod registry;
 mod search;
+mod statute;
 mod thinking;
 
 use serde_json::json;

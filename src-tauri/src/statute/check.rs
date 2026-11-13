@@ -678,10 +678,16 @@ fn absorb_closed_frame(stack: &mut Vec<Frame>) {
     let Some(outer) = stack.last_mut() else {
         return;
     };
-    if inner.saw_other_law {
+    if inner.ambiguous || inner.saw_other_law {
         outer.ambiguous = true;
-        outer.saw_other_law = true;
-    } else if inner.named {
+        if inner.saw_other_law {
+            outer.saw_other_law = true;
+        }
+    }
+    if !outer.ambiguous && !inner.pending.is_empty() {
+        outer.pending.extend(inner.pending);
+    }
+    if inner.named && !inner.saw_other_law {
         if outer.law.is_none() {
             outer.law = inner.law.clone();
         }
@@ -949,14 +955,14 @@ fn sync_parens(
             });
         } else if quotes.is_empty() && (c == '）' || c == ')') && stack.len() > 1 {
             let open_at = stack.last().and_then(|frame| frame.open_at);
-            let outer_id = stack
-                .get(stack.len().saturating_sub(2))
-                .and_then(|frame| match &frame.law {
-                    Some(Current::Law(law)) => Some(law.law_id.clone()),
-                    _ => None,
-                });
             let close_at = *seen;
             absorb_closed_frame(stack);
+            // Read the law after absorb. A parenthesis that opened with no
+            // outer law still has the law it just copied onto the parent.
+            let outer_id = stack.last().and_then(|frame| match &frame.law {
+                Some(Current::Law(law)) => Some(law.law_id.clone()),
+                _ => None,
+            });
             if let (Some(open_at), Some(outer_id)) = (open_at, outer_id) {
                 if let Some(frame) = stack.last_mut() {
                     if !frame.ambiguous {

@@ -194,9 +194,9 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
         });
       } else if (quotes.length === 0 && (c === "）" || c === ")") && stack.length > 1) {
         const openAt = stack[stack.length - 1]?.openAt;
-        const outerKey = stack[stack.length - 2]?.law ? lawKey(stack[stack.length - 2].law as string) : null;
         absorbClosedFrame(stack);
         const frame = stack[stack.length - 1];
+        const outerKey = frame?.law ? lawKey(frame.law) : null;
         if (openAt != null && outerKey && frame && !frame.ambiguous) {
           queueNote(frame, chars, openAt, seen, outerKey);
         }
@@ -895,10 +895,16 @@ function absorbClosedFrame(stack: EnumFrame[]): void {
   if (!inner || !outer) {
     return;
   }
-  if (inner.sawOther) {
+  if (inner.ambiguous || inner.sawOther) {
     outer.ambiguous = true;
-    outer.sawOther = true;
-  } else if (inner.named) {
+    if (inner.sawOther) {
+      outer.sawOther = true;
+    }
+  }
+  if (!outer.ambiguous && inner.pending.length > 0) {
+    outer.pending.push(...inner.pending);
+  }
+  if (inner.named && !inner.sawOther) {
     if (inner.douhou) {
       outer.douhou = inner.douhou;
     }

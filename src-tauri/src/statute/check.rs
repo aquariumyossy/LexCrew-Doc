@@ -17,6 +17,13 @@ use crate::statute::xmlparse::article_spans;
 
 pub const SOURCE_LABEL: &str = "e-Gov法令検索";
 pub const OFFLINE_NOTE: &str = "改正確認できず（オフライン）";
+
+#[cfg(test)]
+pub(crate) static RIGHTMOST_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static EAGER_NOTES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// A cached match we could not re-check stays 一致, with a note that says why.
 /// Change this one string if that result should become 要確認 instead.
 const UNCONFIRMED_MATCH_LABEL: &str = "一致";
@@ -595,6 +602,16 @@ struct Frame {
     saw_other_law: bool,
     /// 同法 here must not be resolved to either candidate.
     ambiguous: bool,
+    /// Matching `）`, if this parenthesis closes at all. Line breaks do not end it.
+    close_at: Option<usize>,
+    /// Parens and quotes whose law names are read only if a later 同法 needs them.
+    pending: Vec<PendingNote>,
+}
+
+struct PendingNote {
+    open: usize,
+    close: usize,
+    outer_id: String,
 }
 
 struct OpenQuote {
@@ -602,6 +619,7 @@ struct OpenQuote {
     saw_other: bool,
     /// This 「 opened after a citation, so every article inside it is unfinished quotation.
     marks_inner: bool,
+    start: usize,
 }
 
 fn same_current(left: &Current, right: &Current) -> bool {
@@ -646,31 +664,85 @@ fn absorb_closed_frame(stack: &mut Vec<Frame>) {
     }
 }
 
-fn paren_text_names_other(
-    db: &StatuteDb,
-    chars: &[char],
-    open_at: usize,
-    close_at: usize,
-    outer: Option<&Current>,
-) -> bool {
-    let Some(Current::Law(outer)) = outer else {
-        return false;
-    };
-    if close_at <= open_at + 1 {
+fn queue_note(frame: &mut Frame, chars: &[char], open: usize, close: usize, outer_id: &str) {
+    if close <= open + 1 || close > chars.len() {
+        return;
+    }
+    let inner: String = chars[open + 1..close].iter().collect();
+    // Skip only when this parenthesis is nothing but an enactment or alias note.
+    // A larger parenthesis that merely contains one of those notes is kept.
+    if is_whole_note(&inner) {
+        return;
+    }
+    frame.pending.push(PendingNote {
+        open,
+        close,
+        outer_id: outer_id.to_string(),
+    });
+}
+
+fn is_whole_note(inner: &str) -> bool {
+    let trimmed = inner.trim().trim_matches('。').trim();
+    if trimmed.contains('（') || trimmed.contains('(') {
         return false;
     }
-    let inner: String = chars[open_at + 1..close_at].iter().collect();
-    if is_promulgation(&inner) || is_abbreviation_note(&inner) {
-        return false;
+    is_promulgation(trimmed) || is_abbreviation_note(trimmed)
+}
+
+fn strip_nested_notes(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '（' || chars[i] == '(' {
+            if let Some(close) = matching_close(&chars, i, chars.len()) {
+                let inner: String = chars[i + 1..close].iter().collect();
+                if is_promulgation(inner.trim()) || is_abbreviation_note(inner.trim()) {
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
     }
-    let Some(found) = db.rightmost_law(&inner).ok().flatten() else {
-        return false;
-    };
-    found.law_id != outer.law_id
+    out
+}
+
+fn without_denied(text: &str) -> String {
+    let mut out = text.to_string();
+    for deny in DENY_LAW_NAME {
+        if out.contains(deny) {
+            out = out.replace(deny, " ");
+        }
+    }
+    out
+}
+
+fn flush_pending(db: &StatuteDb, chars: &[char], frame: &mut Frame) {
+    if frame.ambiguous {
+        frame.pending.clear();
+        return;
+    }
+    let notes = std::mem::take(&mut frame.pending);
+    for note in notes {
+        if frame.ambiguous {
+            break;
+        }
+        if note.close <= note.open + 1 || note.close > chars.len() {
+            continue;
+        }
+        let raw: String = chars[note.open + 1..note.close].iter().collect();
+        let visible = without_denied(&strip_nested_notes(&raw));
+        if let Some(found) = db.rightmost_law(&visible).ok().flatten() {
+            if found.law_id != note.outer_id {
+                frame.ambiguous = true;
+            }
+        }
+    }
 }
 
 fn sync_parens(
-    db: &StatuteDb,
     stack: &mut Vec<Frame>,
     quotes: &mut Vec<OpenQuote>,
     chars: &[char],
@@ -680,6 +752,23 @@ fn sync_parens(
     let until = until.min(chars.len());
     while *seen < until {
         let c = chars[*seen];
+        let closes_unfinished_quote =
+            c == '\u{2029}' || (c == '\n' && *seen > 0 && chars[*seen - 1] == '\n');
+        if closes_unfinished_quote {
+            while let Some(quote) = quotes.pop() {
+                if quote.saw_other {
+                    if let Some(frame) = stack.last_mut() {
+                        frame.ambiguous = true;
+                    }
+                } else if let Some(Current::Law(law)) = &quote.outer {
+                    if let Some(frame) = stack.last_mut() {
+                        if !frame.ambiguous {
+                            queue_note(frame, chars, quote.start, *seen, &law.law_id);
+                        }
+                    }
+                }
+            }
+        }
         if c == '「' {
             let outer = stack.last().and_then(|frame| frame.law.clone());
             let marks_inner = stack.last().is_some_and(|frame| frame.law.is_some());
@@ -687,6 +776,7 @@ fn sync_parens(
                 outer,
                 saw_other: false,
                 marks_inner,
+                start: *seen,
             });
         } else if c == '」' {
             if let Some(quote) = quotes.pop() {
@@ -694,15 +784,30 @@ fn sync_parens(
                     if let Some(frame) = stack.last_mut() {
                         frame.ambiguous = true;
                     }
+                } else if let Some(Current::Law(law)) = &quote.outer {
+                    if let Some(frame) = stack.last_mut() {
+                        if !frame.ambiguous {
+                            queue_note(frame, chars, quote.start, *seen, &law.law_id);
+                        }
+                    }
                 }
             }
         } else if quotes.is_empty() && is_line_break(c) {
             while stack.len() > 1 {
+                let closes_later = stack
+                    .last()
+                    .and_then(|frame| frame.close_at)
+                    .is_some_and(|at| at > *seen);
+                if closes_later {
+                    break;
+                }
                 absorb_closed_frame(stack);
             }
-            // The next citation must not read a law name out of the abandoned parenthesis.
-            if let Some(frame) = stack.last_mut() {
-                frame.prev_end = *seen + 1;
+            // A parenthesis that never closes must not lend its interior to the next line.
+            if stack.len() == 1 {
+                if let Some(frame) = stack.last_mut() {
+                    frame.prev_end = *seen + 1;
+                }
             }
         } else if quotes.is_empty() && (c == '（' || c == '(') {
             let (douhou, opened_with, ambiguous) = match stack.last() {
@@ -718,18 +823,23 @@ fn sync_parens(
                 named: false,
                 saw_other_law: false,
                 ambiguous,
+                close_at: matching_close(chars, *seen, chars.len()),
+                pending: Vec::new(),
             });
         } else if quotes.is_empty() && (c == '）' || c == ')') && stack.len() > 1 {
             let open_at = stack.last().and_then(|frame| frame.open_at);
-            let outer_law = stack
+            let outer_id = stack
                 .get(stack.len().saturating_sub(2))
-                .and_then(|frame| frame.law.clone());
+                .and_then(|frame| match &frame.law {
+                    Some(Current::Law(law)) => Some(law.law_id.clone()),
+                    _ => None,
+                });
             let close_at = *seen;
             absorb_closed_frame(stack);
-            if let Some(open_at) = open_at {
-                if paren_text_names_other(db, chars, open_at, close_at, outer_law.as_ref()) {
-                    if let Some(frame) = stack.last_mut() {
-                        frame.ambiguous = true;
+            if let (Some(open_at), Some(outer_id)) = (open_at, outer_id) {
+                if let Some(frame) = stack.last_mut() {
+                    if !frame.ambiguous {
+                        queue_note(frame, chars, open_at, close_at, &outer_id);
                     }
                 }
             }
@@ -793,6 +903,7 @@ fn remember_law(frame: &mut Frame, current: Current, quotes: &mut [OpenQuote]) {
     frame.law = Some(current);
     frame.named = true;
     frame.ambiguous = false;
+    frame.pending.clear();
 }
 
 fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
@@ -807,14 +918,20 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
         named: false,
         saw_other_law: false,
         ambiguous: false,
+        close_at: None,
+        pending: Vec::new(),
     }];
     let mut quotes: Vec<OpenQuote> = Vec::new();
     let mut seen = 0usize;
     let mut raws = Vec::new();
     for (index, span) in spans.iter().enumerate() {
         let next = spans.get(index + 1).map(|s| s.start).unwrap_or(chars.len());
-        sync_parens(db, &mut stack, &mut quotes, &chars, &mut seen, span.start);
+        sync_parens(&mut stack, &mut quotes, &chars, &mut seen, span.start);
         let frame_i = stack.len() - 1;
+        #[cfg(test)]
+        if EAGER_NOTES.load(std::sync::atomic::Ordering::Relaxed) {
+            flush_pending(db, &chars, &mut stack[frame_i]);
+        }
         let from = stack[frame_i].prev_end.min(span.start);
         let between: String = chars[from..span.start].iter().collect();
         let visible = gap_core(&chars[from..span.start]);
@@ -827,16 +944,16 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
                 &mut quotes,
             );
         }
-        let window = law_window(db, &chars, span.start, from);
-        let mut enumerated = window.is_none() && enumeration_gap(&between);
-        if enumerated {
-            if let Some(open_at) = stack[frame_i].open_at {
-                if !paren_closes_in_sentence(&chars, open_at) {
-                    enumerated = false;
-                }
-            }
+        let across_line = stack[frame_i].close_at.is_some();
+        let window = law_window(db, &chars, span.start, from, across_line);
+        let mut enumerated = window.is_none() && enumeration_gap(&between, across_line);
+        if enumerated && stack[frame_i].open_at.is_some() && stack[frame_i].close_at.is_none() {
+            enumerated = false;
         }
         let dou = window.as_ref().is_some_and(|w| w.text == "同法");
+        if dou {
+            flush_pending(db, &chars, &mut stack[frame_i]);
+        }
         if let Some(window) = window.as_ref() {
             if window.text != "同法" && denied(&window.text) {
                 stack[frame_i].law = None;
@@ -965,7 +1082,7 @@ fn scan(db: &StatuteDb, text: &str) -> Vec<Raw> {
         {
             continue;
         }
-        let window = law_window(db, &chars, start, 0);
+        let window = law_window(db, &chars, start, 0, false);
         let law = window
             .as_ref()
             .and_then(|w| db.match_law_in_text(&w.text).ok().flatten());
@@ -1017,8 +1134,11 @@ fn is_deleted_body(body: &str) -> bool {
 }
 
 fn looks_like_law(text: &str) -> bool {
-    text.ends_with("法律")
-        || text.ends_with('法')
+    if text.ends_with("法律") {
+        // この法律 / 本法律 are not titles. …に関する法律 is.
+        return text.ends_with("に関する法律");
+    }
+    text.ends_with('法')
         || text.ends_with('令')
         || text.ends_with("規則")
         || text.ends_with("憲法")
@@ -1043,10 +1163,17 @@ struct Window {
     text: String,
 }
 
-fn law_window(db: &StatuteDb, chars: &[char], cite_start: usize, floor: usize) -> Option<Window> {
+fn law_window(
+    db: &StatuteDb,
+    chars: &[char],
+    cite_start: usize,
+    floor: usize,
+    across_line: bool,
+) -> Option<Window> {
     let floor = floor.min(cite_start);
     let mut end = cite_start;
-    while end > floor && is_hspace(chars[end - 1]) {
+    while end > floor && (is_hspace(chars[end - 1]) || (across_line && is_line_break(chars[end - 1])))
+    {
         end -= 1;
     }
     if end > floor && is_hard_boundary(chars[end - 1]) {
@@ -1166,9 +1293,9 @@ fn is_hspace(c: char) -> bool {
     matches!(c, ' ' | '\u{3000}' | '\t')
 }
 
-fn enumeration_gap(between: &str) -> bool {
+fn enumeration_gap(between: &str, ignore_line_breaks: bool) -> bool {
     let chars: Vec<char> = between.chars().collect();
-    if gap_crosses_sentence(&chars) {
+    if gap_crosses_sentence(&chars, ignore_line_breaks) {
         return false;
     }
     let text = gap_core(&chars);
@@ -1179,7 +1306,7 @@ fn enumeration_gap(between: &str) -> bool {
 }
 
 /// 。！？ and line breaks end a lookback, except inside a parenthetical.
-fn gap_crosses_sentence(chars: &[char]) -> bool {
+fn gap_crosses_sentence(chars: &[char], ignore_line_breaks: bool) -> bool {
     let mut depth = 0i32;
     let mut quote = false;
     for &c in chars {
@@ -1203,6 +1330,9 @@ fn gap_crosses_sentence(chars: &[char]) -> bool {
             continue;
         }
         if depth == 0 && is_hard_boundary(c) {
+            if ignore_line_breaks && is_line_break(c) {
+                continue;
+            }
             return true;
         }
     }
@@ -1464,7 +1594,7 @@ fn leading_connector_len(text: &str) -> Option<usize> {
 }
 
 fn is_connector(text: &str) -> bool {
-    enumeration_gap(text)
+    enumeration_gap(text, false)
 }
 
 struct ClauseRead {
@@ -3051,5 +3181,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn perf_a_long_document_with_many_parens() {
+        let path = std::env::temp_dir().join(format!(
+            "guri-perf-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = StatuteDb::open(&path).unwrap();
+        let unit = "民法第1条（目的）この契約は定める。（定義）用語は次のとおり。（適用）この契約に定めのない事項は、民法の定めるところによる。\n";
+        let mut text = String::new();
+        while text.chars().count() < 148_000 {
+            text.push_str(unit);
+        }
+        let time = |eager: bool| {
+            RIGHTMOST_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+            EAGER_NOTES.store(eager, std::sync::atomic::Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            let hits = check_text(&db, &OfflineEgov, &text, "2026-11-13", false);
+            let ms = started.elapsed().as_millis();
+            eprintln!(
+                "PERF eager={eager} chars={} hits={} ms={ms} rightmost={}",
+                text.chars().count(),
+                hits.len(),
+                RIGHTMOST_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+            );
+            ms
+        };
+        let before = time(true);
+        let after = time(false);
+        EAGER_NOTES.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            after * 2 < before || after < before,
+            "lazy scan was not faster: {after} ms vs eager {before} ms"
+        );
     }
 }

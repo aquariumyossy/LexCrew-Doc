@@ -104,6 +104,7 @@ pub struct IndexDirty {
 pub struct StatuteDb {
     conn: Mutex<Connection>,
     aliases: Mutex<Option<Vec<AliasHit>>>,
+    law_cache: Mutex<HashMap<String, LawRef>>,
     dirty: Mutex<IndexDirty>,
 }
 
@@ -126,6 +127,7 @@ impl StatuteDb {
         Ok(Self {
             conn: Mutex::new(conn),
             aliases: Mutex::new(None),
+            law_cache: Mutex::new(HashMap::new()),
             dirty: Mutex::new(IndexDirty::default()),
         })
     }
@@ -136,6 +138,7 @@ impl StatuteDb {
         Ok(Self {
             conn: Mutex::new(conn),
             aliases: Mutex::new(None),
+            law_cache: Mutex::new(HashMap::new()),
             dirty: Mutex::new(IndexDirty::default()),
         })
     }
@@ -421,6 +424,7 @@ impl StatuteDb {
         .map_err(|e| e.to_string())?;
         bump_rev_locked(&conn)?;
         drop(conn);
+        self.law_cache.lock().remove(law_id);
         self.note_dirty(law_id, Vec::new());
         Ok(())
     }
@@ -493,6 +497,17 @@ impl StatuteDb {
     }
 
     pub fn law_ref(&self, law_id: &str) -> Result<Option<LawRef>, String> {
+        if let Some(hit) = self.law_cache.lock().get(law_id) {
+            return Ok(Some(hit.clone()));
+        }
+        let found = self.law_ref_db(law_id)?;
+        if let Some(law) = &found {
+            self.law_cache.lock().insert(law.law_id.clone(), law.clone());
+        }
+        Ok(found)
+    }
+
+    fn law_ref_db(&self, law_id: &str) -> Result<Option<LawRef>, String> {
         let conn = self.conn.lock();
         let row = conn
             .query_row(
@@ -554,6 +569,8 @@ impl StatuteDb {
 
     /// Rightmost current-law name in `text`. Historical prefixes are ignored.
     pub fn rightmost_law(&self, text: &str) -> Result<Option<LawRef>, String> {
+        #[cfg(test)]
+        crate::statute::check::RIGHTMOST_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.ensure_alias_cache()?;
         let cache = self.aliases.lock();
         let Some(entries) = cache.as_ref() else {
@@ -878,6 +895,7 @@ impl StatuteDb {
 
     fn invalidate_aliases(&self) {
         *self.aliases.lock() = None;
+        self.law_cache.lock().clear();
     }
 }
 

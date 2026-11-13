@@ -81,10 +81,12 @@ type EnumFrame = {
   named: boolean;
   sawOther: boolean;
   ambiguous: boolean;
+  closeAt: number | null;
+  pending: { open: number; close: number; outerKey: string }[];
   suppl: boolean;
 };
 
-type OpenQuote = { outer: string | null; sawOther: boolean; marksInner: boolean };
+type OpenQuote = { outer: string | null; sawOther: boolean; marksInner: boolean; start: number };
 
 export function markUnverified(answer: string, verified: VerifiedCite[]): string {
   const chars = Array.from(answer);
@@ -100,6 +102,8 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
       named: false,
       sawOther: false,
       ambiguous: false,
+      closeAt: null,
+      pending: [],
       suppl: false,
     },
   ];
@@ -120,6 +124,7 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     frame.douhou = name;
     frame.named = true;
     frame.ambiguous = false;
+    frame.pending = [];
   };
   for (const span of spans) {
     if (span.start > chars.length || span.end > chars.length || span.start > span.end) {
@@ -127,30 +132,49 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     }
     while (seen < span.start && seen < chars.length) {
       const c = chars[seen];
+      if (c === "\u2029" || (c === "\n" && seen > 0 && chars[seen - 1] === "\n")) {
+        while (quotes.length > 0) {
+          const quote = quotes.pop();
+          const frame = stack[stack.length - 1];
+          if (quote && frame) {
+            if (quote.sawOther) {
+              frame.ambiguous = true;
+            } else if (quote.outer && !frame.ambiguous) {
+              queueNote(frame, chars, quote.start, seen, quote.outer);
+            }
+          }
+        }
+      }
       if (c === "「") {
         const frame = stack[stack.length - 1];
         quotes.push({
           outer: frame?.law ? lawKey(frame.law) : null,
           sawOther: false,
           marksInner: Boolean(frame?.law),
+          start: seen,
         });
         lastQuote = { at: seen, open: true };
       } else if (c === "」") {
         const quote = quotes.pop();
-        if (quote?.sawOther) {
-          const frame = stack[stack.length - 1];
-          if (frame) {
+        const frame = stack[stack.length - 1];
+        if (quote && frame) {
+          if (quote.sawOther) {
             frame.ambiguous = true;
+          } else if (quote.outer && !frame.ambiguous) {
+            queueNote(frame, chars, quote.start, seen, quote.outer);
           }
         }
         lastQuote = { at: seen, open: false };
       } else if (quotes.length === 0 && isLineBreak(c)) {
         while (stack.length > 1) {
+          const closesLater = (stack[stack.length - 1]?.closeAt ?? -1) > seen;
+          if (closesLater) {
+            break;
+          }
           absorbClosedFrame(stack);
         }
-        const frame = stack[stack.length - 1];
-        if (frame) {
-          frame.prevEnd = seen + 1;
+        if (stack.length === 1 && stack[0]) {
+          stack[0].prevEnd = seen + 1;
         }
       } else if (quotes.length === 0 && (c === "（" || c === "(")) {
         const outer = stack[stack.length - 1];
@@ -163,17 +187,17 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
           named: false,
           sawOther: false,
           ambiguous: outer?.ambiguous ?? false,
+          closeAt: matchingClose(chars, seen, chars.length),
+          pending: [],
           suppl: false,
         });
       } else if (quotes.length === 0 && (c === "）" || c === ")") && stack.length > 1) {
         const openAt = stack[stack.length - 1]?.openAt;
-        const outerLaw = stack[stack.length - 2]?.law ?? null;
+        const outerKey = stack[stack.length - 2]?.law ? lawKey(stack[stack.length - 2].law as string) : null;
         absorbClosedFrame(stack);
-        if (openAt != null && parenTextNamesOther(chars, openAt, seen, outerLaw)) {
-          const frame = stack[stack.length - 1];
-          if (frame) {
-            frame.ambiguous = true;
-          }
+        const frame = stack[stack.length - 1];
+        if (openAt != null && outerKey && frame && !frame.ambiguous) {
+          queueNote(frame, chars, openAt, seen, outerKey);
         }
       }
       seen += 1;
@@ -185,10 +209,14 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     if (mentioned) {
       remember(frame, mentioned);
     }
-    const window = lawWindow(chars, span.start, prev);
+    const acrossLine = frame.closeAt != null;
+    const window = lawWindow(chars, span.start, prev, acrossLine);
     const dou = window === "同法";
-    let enumerated = window === null && isEnumeration(between);
-    if (enumerated && frame.openAt != null && !parenClosesInSentence(chars, frame.openAt)) {
+    if (dou) {
+      flushPending(frame, chars);
+    }
+    let enumerated = window === null && isEnumeration(between, acrossLine);
+    if (enumerated && frame.openAt != null && frame.closeAt == null) {
       enumerated = false;
     }
     const inherited = dou || enumerated;
@@ -229,13 +257,7 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
         remember(frame, found);
         frame.suppl = span.suppl;
         name = found;
-      } else if (
-        window.endsWith("法律") ||
-        window.endsWith("憲法") ||
-        window.endsWith("法") ||
-        window.endsWith("令") ||
-        window.endsWith("規則")
-      ) {
+      } else if (looksLikeLawName(window)) {
         remember(frame, window);
         frame.suppl = span.suppl;
         name = window;
@@ -505,10 +527,10 @@ function isHspace(c: string): boolean {
   return c === " " || c === "\u3000" || c === "\t";
 }
 
-function lawWindow(chars: string[], citeStart: number, floor: number): string | null {
+function lawWindow(chars: string[], citeStart: number, floor: number, acrossLine = false): string | null {
   const stop = Math.min(floor, citeStart);
   let end = citeStart;
-  while (end > stop && isHspace(chars[end - 1])) {
+  while (end > stop && (isHspace(chars[end - 1]) || (acrossLine && isLineBreak(chars[end - 1])))) {
     end -= 1;
   }
   if (end > stop && isHardBoundary(chars[end - 1])) {
@@ -625,8 +647,11 @@ function lawKey(name: string): string {
 }
 
 function looksLikeLawName(name: string): boolean {
+  // 法律 ends in 律, not 法. Only a real title, or a catalog hit, counts.
+  if (name.endsWith("法律")) {
+    return name.endsWith("に関する法律");
+  }
   return (
-    name.endsWith("法律") ||
     name.endsWith("憲法") ||
     name.endsWith("法") ||
     name.endsWith("令") ||
@@ -635,16 +660,16 @@ function looksLikeLawName(name: string): boolean {
   );
 }
 
-function isEnumeration(between: string): boolean {
+function isEnumeration(between: string, ignoreLineBreaks = false): boolean {
   const chars = Array.from(between);
-  if (gapCrossesSentence(chars)) {
+  if (gapCrossesSentence(chars, ignoreLineBreaks)) {
     return false;
   }
   const text = gapCore(chars);
   return ["及び", "および", "並びに", "ならびに", "又は", "または", "若しくは", "、", "，", "・"].includes(text);
 }
 
-function gapCrossesSentence(chars: string[]): boolean {
+function gapCrossesSentence(chars: string[], ignoreLineBreaks = false): boolean {
   let depth = 0;
   let quote = false;
   for (const c of chars) {
@@ -668,6 +693,9 @@ function gapCrossesSentence(chars: string[]): boolean {
       continue;
     }
     if (depth === 0 && isHardBoundary(c)) {
+      if (ignoreLineBreaks && isLineBreak(c)) {
+        continue;
+      }
       return true;
     }
   }
@@ -777,16 +805,79 @@ function absorbClosedFrame(stack: EnumFrame[]): void {
   }
 }
 
-function parenTextNamesOther(chars: string[], openAt: number, closeAt: number, outerLaw: string | null): boolean {
-  if (!outerLaw || closeAt <= openAt + 1) {
+function queueNote(
+  frame: EnumFrame,
+  chars: string[],
+  open: number,
+  close: number,
+  outerKey: string
+): void {
+  if (close <= open + 1) {
+    return;
+  }
+  const inner = chars.slice(open + 1, close).join("");
+  if (isWholeNote(inner)) {
+    return;
+  }
+  frame.pending.push({ open, close, outerKey });
+}
+
+function isWholeNote(inner: string): boolean {
+  const trimmed = inner.trim().replace(/。+$/u, "").trim();
+  if (trimmed.includes("（") || trimmed.includes("(")) {
     return false;
   }
-  const inner = chars.slice(openAt + 1, closeAt).join("");
-  if (isPromulgation(inner) || isAbbreviationNote(inner)) {
-    return false;
+  return isPromulgation(trimmed) || isAbbreviationNote(trimmed);
+}
+
+function stripNestedNotes(text: string): string {
+  const chars = Array.from(text);
+  let out = "";
+  let i = 0;
+  while (i < chars.length) {
+    if (chars[i] === "（" || chars[i] === "(") {
+      const close = matchingClose(chars, i, chars.length);
+      if (close !== null) {
+        const inner = chars.slice(i + 1, close).join("").trim();
+        if (isPromulgation(inner) || isAbbreviationNote(inner)) {
+          i = close + 1;
+          continue;
+        }
+      }
+    }
+    out += chars[i];
+    i += 1;
   }
-  const mentioned = latestLawMention(inner);
-  return Boolean(mentioned && lawKey(mentioned) !== lawKey(outerLaw));
+  return out;
+}
+
+function withoutDenied(text: string): string {
+  let out = text;
+  for (const deny of DENY_LAW_NAME) {
+    if (out.includes(deny)) {
+      out = out.split(deny).join(" ");
+    }
+  }
+  return out;
+}
+
+function flushPending(frame: EnumFrame, chars: string[]): void {
+  if (frame.ambiguous) {
+    frame.pending = [];
+    return;
+  }
+  const notes = frame.pending;
+  frame.pending = [];
+  for (const note of notes) {
+    if (frame.ambiguous) {
+      break;
+    }
+    const raw = chars.slice(note.open + 1, note.close).join("");
+    const mentioned = latestLawMention(withoutDenied(stripNestedNotes(raw)));
+    if (mentioned && lawKey(mentioned) !== note.outerKey) {
+      frame.ambiguous = true;
+    }
+  }
 }
 
 function parenClosesInSentence(chars: string[], openAt: number): boolean {

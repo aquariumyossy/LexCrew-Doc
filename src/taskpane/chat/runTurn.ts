@@ -15,7 +15,9 @@ import {
   THINKING_BUDGET_UNSET_NOTICE,
   runawayThinkingChars,
 } from "../../shared/thinking";
+import { markAnswer } from "../../shared/statuteMark";
 import {
+  TOOL_LAW_ARTICLE,
   ToolDefinition,
   UNLIMITED_TOOL_ROUNDS,
   buildTools,
@@ -385,16 +387,20 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   const emitAssistant = async (completion: Awaited<ReturnType<typeof send>>): Promise<void> => {
     lastUsage = completion.usage;
     noteUsage(completion.usage);
+    const toolResults = messages
+      .filter((message) => message.role === "tool")
+      .map((message) => message.content || "");
+    const content = markAnswer(completion.content, toolResults);
     await options.onMessage({
       role: "assistant",
-      content: completion.content,
+      content,
       reasoningContent: completion.reasoningContent,
       toolCalls: completion.toolCalls,
       usage: completion.usage,
     });
     messages.push({
       role: "assistant",
-      content: completion.content,
+      content,
       // Kept inside the turn: Qwen expects its own reasoning back with the tool replies.
       reasoning_content: completion.reasoningContent || undefined,
       tool_calls: completion.toolCalls.length ? completion.toolCalls : undefined,
@@ -402,6 +408,7 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
   };
 
   const maxRounds = settings.maxToolRounds;
+  let lawArticleCalls = 0;
   while (true) {
     if (maxRounds !== UNLIMITED_TOOL_ROUNDS && round >= maxRounds) {
       const notice = toolRoundLimitNotice(maxRounds);
@@ -431,15 +438,26 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
         const toolContents = messages
           .filter((message) => message.role === "tool")
           .map((message) => message.content || "");
-        const outcome = await executeToolCall(call, settings, signal, {
-          argosPathPrefixes: options.argosPathPrefixes,
-          indexedReadChars: indexedReadCharLimit(limit, toolContents, tools),
-          hasBody,
-          userMessagesText,
-        });
+        const outcome = await (async () => {
+          if (call.function.name === TOOL_LAW_ARTICLE && lawArticleCalls >= 10) {
+            return {
+              content: "law_article は1つの回答で10回までです。残りの条は要確認と書いてください。",
+              ok: true,
+            };
+          }
+          return executeToolCall(call, settings, signal, {
+            argosPathPrefixes: options.argosPathPrefixes,
+            indexedReadChars: indexedReadCharLimit(limit, toolContents, tools),
+            hasBody,
+            userMessagesText,
+          });
+        })();
         await options.onMessage({ role: "tool", content: outcome.content, toolCallId: call.id });
         messages.push({ role: "tool", content: outcome.content, tool_call_id: call.id });
         answeredThisRound.add(call.id);
+        if (call.function.name === TOOL_LAW_ARTICLE) {
+          lawArticleCalls += 1;
+        }
         if (outcome.numbered && !numbersHandedOut) {
           numbersHandedOut = true;
           tools = offeredTools();
@@ -470,6 +488,11 @@ export async function runTurn(options: RunTurnOptions): Promise<TurnResult> {
       }
       throw error;
     }
-    round += 1;
+    const statuteOnly =
+      completion.toolCalls.length > 0 &&
+      completion.toolCalls.every((call) => call.function.name === TOOL_LAW_ARTICLE);
+    if (!statuteOnly) {
+      round += 1;
+    }
   }
 }

@@ -40,6 +40,8 @@ export type Settings = {
   /** 0 means no cap. */
   maxToolRounds: number;
   uiFontSize: UiFontSize;
+  /** When false, statute checks stay on the bundled copy and the local cache. */
+  statuteOnline: boolean;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -58,6 +60,7 @@ export const DEFAULT_SETTINGS: Settings = {
   contextLimit: DEFAULT_CONTEXT_LIMIT,
   maxToolRounds: MAX_TOOL_ROUNDS,
   uiFontSize: "medium",
+  statuteOnline: true,
 };
 
 export const FONT_CHOICES = [DEFAULT_FONT_NAME, FALLBACK_FONT_NAME];
@@ -112,6 +115,7 @@ export function loadSettings(): Settings {
       contextLimit: migrateContextLimit(merged.contextLimit),
       maxToolRounds: normalizeMaxToolRounds(merged.maxToolRounds),
       uiFontSize: normalizeUiFontSize(parsed.uiFontSize),
+      statuteOnline: merged.statuteOnline !== false,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };

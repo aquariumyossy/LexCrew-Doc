@@ -1332,6 +1332,38 @@ export async function readSelectionForMeter(): Promise<MeterSelection> {
   return readSelectionAttachment();
 }
 
+export async function readBodyText(): Promise<string> {
+  if (!isWordHost()) {
+    return "";
+  }
+  return Word.run(async (context) => {
+    const body = context.document.body;
+    body.load("text");
+    await context.sync();
+    return body.text || "";
+  });
+}
+
+/** Select the nth exact match of a citation. Does not edit the document. */
+export async function selectTextOccurrence(needle: string, occurrence: number): Promise<boolean> {
+  const text = needle.trim();
+  if (!text || !isWordHost()) {
+    return false;
+  }
+  return Word.run(async (context) => {
+    const hits = context.document.body.search(text, { matchCase: true, matchWholeWord: false });
+    hits.load("items");
+    await context.sync();
+    const range = hits.items[occurrence];
+    if (!range) {
+      return false;
+    }
+    range.select();
+    await context.sync();
+    return true;
+  });
+}
+
 export async function getSelectionText(): Promise<string> {
   return Word.run(async (context) => {
     const range = context.document.getSelection();

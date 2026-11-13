@@ -38,7 +38,8 @@
     ],
     "resources": {
       "../dist": "taskpane",
-      "../manifest.xml": "manifest.xml"
+      "../manifest.xml": "manifest.xml",
+      "resources/statutes.db.gz": "statutes.db.gz"
     },
     "windows": {
       "webviewInstallMode": {

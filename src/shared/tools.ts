@@ -6,6 +6,7 @@ import { ListStyle, isListStyle, listStyleEnum, listStyleToolDescription } from 
 export type { ListStyle } from "./listStyles";
 
 export const TOOL_SEARCH = "search";
+export const TOOL_LAW_ARTICLE = "law_article";
 export const TOOL_SEARCH_INDEX = "search_index";
 export const TOOL_GET_SELECTION = "get_selection";
 export const TOOL_REPLACE_SELECTION = "replace_selection";
@@ -278,8 +279,13 @@ export type ReadIndexedFileArgs = {
   offset?: number;
 };
 
+export type LawArticleQuery = { law: string; article: string };
+
+export type LawArticleArgs = { articles: LawArticleQuery[] };
+
 export type ToolInvocation =
   | { name: typeof TOOL_SEARCH; args: SearchArgs }
+  | { name: typeof TOOL_LAW_ARTICLE; args: LawArticleArgs }
   | { name: typeof TOOL_SEARCH_INDEX; args: SearchIndexArgs }
   | { name: typeof TOOL_GET_SELECTION; args: GetSelectionArgs }
   | { name: typeof TOOL_REPLACE_SELECTION; args: ReplaceSelectionArgs }
@@ -355,14 +361,49 @@ function targetHints(selection: boolean, numbered: boolean, inserted = false): T
   };
 }
 
+function lawArticleTool(): ToolDefinition {
+  return {
+    type: "function",
+    function: {
+      name: TOOL_LAW_ARTICLE,
+      description:
+        "e-Gov の現行条文を、法令名と条番号で取得する。回答に条文を書く前に、その条の本文を取る。" +
+        "1回に10条まで、1つの回答で10回まで。この回数はウェブ検索や他のツール往復には数えない。" +
+        "返ってきた見出しと本文だけを根拠にする。本文にない効果は書かない。" +
+        "本文を言い換えるときは「参考」と書く。取得できなかった条は要確認と書く。" +
+        "附則・別表・判例はこのツールでは取れないので要確認と書く。" +
+        "law は法令名（民法、民訴法、労基法など）。article は条番号（415、第415条、第3条の2）。",
+      parameters: {
+        type: "object",
+        properties: {
+          articles: {
+            type: "array",
+            description: "取る条。最大10件。",
+            items: {
+              type: "object",
+              properties: {
+                law: stringParam("法令名。民法、民訴法、労基法など。"),
+                article: stringParam("条番号。415、第415条、第3条の2。"),
+              },
+              required: ["law", "article"],
+            },
+          },
+        },
+        required: ["articles"],
+      },
+    },
+  };
+}
+
 function searchTool(): ToolDefinition {
   return {
     type: "function",
     function: {
       name: TOOL_SEARCH,
       description:
-        "SearXNG で公開ウェブを検索する。条文・判例・用語を確かめたいときに使う。" +
-        "検索語は単語を空白区切りで並べる（例:『民法 第415条 損害賠償』）。" +
+        "SearXNG で公開ウェブを検索する。判例・ニュース・用語を探すときに使う。" +
+        "法令の条文は law_article を使う。この検索では条文の文言を確かめない。" +
+        "検索語は単語を空白区切りで並べる（例:『最高裁 令和5年 売買』）。" +
         "結果は候補であり、本文に入れるのは insert_citation を呼んだときだけ。",
       parameters: {
         type: "object",
@@ -1180,7 +1221,7 @@ export function buildTools(options: ToolSetOptions = {}): ToolDefinition[] {
   const numbered = Boolean(options.numbered);
   const inserted = !numbered && Boolean(options.insertedNumbers);
   const target = targetHints(selection, numbered, inserted);
-  const tools: ToolDefinition[] = [];
+  const tools: ToolDefinition[] = [lawArticleTool()];
   if (options.search) {
     tools.push(searchTool());
   }
@@ -2069,6 +2110,36 @@ function parseDeleteShape(row: Record<string, unknown>): ParsedTool {
   return { ok: true, call: { name: TOOL_DELETE_SHAPE, args: { shapes } } };
 }
 
+function parseLawArticle(row: Record<string, unknown>): ParsedTool {
+  const articles: LawArticleQuery[] = [];
+  const raw = row.articles;
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const record = asRecord(item);
+      if (!record) {
+        continue;
+      }
+      const law = text(record, "law").trim();
+      const article = text(record, "article").trim();
+      if (!law && !article) {
+        continue;
+      }
+      articles.push({ law, article });
+    }
+  }
+  if (articles.length === 0) {
+    const law = text(row, "law").trim();
+    const article = text(row, "article").trim();
+    if (law || article) {
+      articles.push({ law, article });
+    }
+  }
+  if (articles.length === 0) {
+    return { ok: false, error: "law と article を指定してください。例: 民法 415。" };
+  }
+  return { ok: true, call: { name: TOOL_LAW_ARTICLE, args: { articles: articles.slice(0, 10) } } };
+}
+
 export function parseToolArguments(name: string, rawArguments: string): ParsedTool {
   const raw = (rawArguments || "").trim();
   let parsed: unknown = {};
@@ -2095,6 +2166,8 @@ export function parseToolArguments(name: string, rawArguments: string): ParsedTo
       }
       return { ok: true, call: { name: TOOL_SEARCH, args: { q } } };
     }
+    case TOOL_LAW_ARTICLE:
+      return parseLawArticle(row);
     case TOOL_SEARCH_INDEX: {
       const q = text(row, "q").trim();
       if (!q) {
@@ -2502,6 +2575,16 @@ export function describeToolCall(name: string, rawArguments: string): string {
   switch (call.name) {
     case TOOL_SEARCH:
       return `検索「${shorten(call.args.q, 20)}」`;
+    case TOOL_LAW_ARTICLE: {
+      const first = call.args.articles[0];
+      if (!first) {
+        return "条文を取得";
+      }
+      if (call.args.articles.length === 1) {
+        return `条文「${shorten(`${first.law} ${first.article}`, 24)}」`;
+      }
+      return `条文を${call.args.articles.length}件取得`;
+    }
     case TOOL_SEARCH_INDEX:
       return `索引「${shorten(call.args.q, 20)}」`;
     case TOOL_GET_SELECTION:

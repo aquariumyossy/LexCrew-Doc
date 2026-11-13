@@ -1052,11 +1052,60 @@
     ]
   },
   {
-    "id": "r13-tomoni-not-douhou",
+    "id": "r15-douhou-after-prose",
+    "text": "民法第709条に基づき同法第710条の責任を負う。",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r15-douhou-after-named-party",
+    "text": "甲は民法第709条に基づき、同法第710条の責任を負う。",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r15-douhou-after-niyori",
+    "text": "民法第709条により、同法第710条を適用する。",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r15-douhou-after-tomoni",
     "text": "民法第709条とともに同法第710条",
     "rows": [
       { "law": "民法", "key": "709" },
-      { "law": "とともに同法", "key": "710", "label": "要確認" }
+      { "law": "民法", "key": "710", "label": "一致" }
     ]
+  },
+  {
+    "id": "r15-douhou-after-tadashi",
+    "text": "民法第709条。ただし、同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r15-douhou-after-mata",
+    "text": "民法第709条。また、同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "民法", "key": "710", "label": "一致" }
+    ]
+  },
+  {
+    "id": "r15-douhou-after-carveout-prose",
+    "text": "民法第709条（会社法の適用を除く。）に基づき同法第710条",
+    "rows": [
+      { "law": "民法", "key": "709" },
+      { "law": "同法", "key": "710", "label": "要確認", "reasonHas": "曖昧" }
+    ],
+    "keepMark": true
   }
 ]

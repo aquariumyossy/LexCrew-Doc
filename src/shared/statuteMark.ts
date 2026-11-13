@@ -572,7 +572,7 @@ function lawWindow(chars: string[], citeStart: number, floor: number): string | 
     return null;
   }
   let raw = chars.slice(start, end).join("");
-  if (raw.endsWith("同法") && raw !== "同法" && isJoinerGap(raw.slice(0, raw.length - "同法".length))) {
+  if (raw.endsWith("同法") && raw !== "同法") {
     raw = "同法";
   }
   const lead = ["若しくは", "ならびに", "並びに", "あるいは", "および", "又は", "または", "及び", "、", "，", "・"].find((c) =>

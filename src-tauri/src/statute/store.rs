@@ -1332,6 +1332,30 @@ mod tests {
     }
 
     #[test]
+    fn no_seed_law_name_or_alias_ends_in_douhou() {
+        for entry in crate::statute::catalog::CATALOG {
+            for alias in entry.aliases {
+                assert!(!alias.ends_with("同法"), "{alias}");
+            }
+        }
+        let dir = TempDir::new();
+        let db = StatuteDb::open(&dir.path().join("statutes.db")).unwrap();
+        let conn = db.conn.lock();
+        let mut hits = Vec::new();
+        for (table, column) in [("law", "name"), ("law_name", "name"), ("law_alias", "alias")] {
+            let sql = format!("SELECT {column} FROM {table} WHERE {column} LIKE '%同法'");
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap();
+            for row in rows {
+                hits.push(row.unwrap());
+            }
+        }
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    #[test]
     fn update_list_keeps_the_newest_revision_date() {
         let (_dir, db) = temp_db();
         let row = |as_of: &str| ListedUpdate {

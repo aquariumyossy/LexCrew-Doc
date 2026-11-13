@@ -1746,9 +1746,9 @@ fn same_law_alias(
 }
 
 fn leading_connector_len(text: &str) -> Option<usize> {
-    // と、同法 / 及び、同法 / 、同法. とともに同法 is not a joiner.
+    // に基づき同法 / とともに同法 / ただし、同法. No stored law name ends in 同法.
     if let Some(prefix) = text.strip_suffix("同法") {
-        if !prefix.is_empty() && is_joiner_gap(prefix) {
+        if !prefix.is_empty() {
             return Some(prefix.chars().count());
         }
     }

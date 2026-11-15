@@ -8,8 +8,32 @@ use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::statute::catalog;
 use crate::statute::refresh::parse_ymd;
 use crate::statute::xmlparse::{article_spans, ListedUpdate, ParsedArticle};
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_ALIAS_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Next shared-alias sync fails once. Tests use this so a bad list does not
+/// turn statute features off.
+#[cfg(test)]
+pub(crate) fn fail_next_alias_sync() {
+    FAIL_NEXT_ALIAS_SYNC.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn take_alias_sync_failure() -> bool {
+    FAIL_NEXT_ALIAS_SYNC.with(|flag| {
+        let fail = flag.get();
+        if fail {
+            flag.set(false);
+        }
+        fail
+    })
+}
 
 /// Packed on 2026-11-11. Rebuild with `python3 scripts/fetch_statutes.py`.
 /// A missing article is 要確認 while offline, even for a bundled law.
@@ -144,29 +168,69 @@ impl StatuteDb {
     }
 
     pub fn import_seed(&self) -> Result<(), String> {
-        let conn = self.conn.lock();
-        let current = meta_locked(&conn, BUNDLE_VERSION_KEY)?.unwrap_or_default();
-        if current == BUNDLE_VERSION {
-            return Ok(());
+        {
+            let conn = self.conn.lock();
+            let current = meta_locked(&conn, BUNDLE_VERSION_KEY)?.unwrap_or_default();
+            if current != BUNDLE_VERSION {
+                let temp = seed_temp_path();
+                let decoded = (|| -> Result<(), String> {
+                    let mut file = File::create(&temp).map_err(|e| e.to_string())?;
+                    let mut decoder = flate2::read::GzDecoder::new(SEED);
+                    std::io::copy(&mut decoder, &mut file).map_err(|e| e.to_string())?;
+                    file.flush().map_err(|e| e.to_string())?;
+                    Ok(())
+                })();
+                if let Err(err) = decoded {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(err);
+                }
+                let import = import_attached(&conn, &temp);
+                let _ = std::fs::remove_file(&temp);
+                import?;
+                set_meta_locked(&conn, BUNDLE_VERSION_KEY, BUNDLE_VERSION)?;
+            }
         }
-        let temp = seed_temp_path();
-        let decoded = (|| -> Result<(), String> {
-            let mut file = File::create(&temp).map_err(|e| e.to_string())?;
-            let mut decoder = flate2::read::GzDecoder::new(SEED);
-            std::io::copy(&mut decoder, &mut file).map_err(|e| e.to_string())?;
-            file.flush().map_err(|e| e.to_string())?;
-            Ok(())
-        })();
-        if let Err(err) = decoded {
-            let _ = std::fs::remove_file(&temp);
-            return Err(err);
+        // Runs when the bundled seed was just copied and when it was already
+        // current, so an existing database picks up abbreviations without a new bundle.
+        // A failure here leaves the seed (or the user's existing rows) in place.
+        if let Err(err) = self.sync_shared_aliases() {
+            eprintln!("guri: statute alias list was not applied: {err}");
         }
-        let import = import_attached(&conn, &temp);
-        let _ = std::fs::remove_file(&temp);
-        import?;
-        set_meta_locked(&conn, BUNDLE_VERSION_KEY, BUNDLE_VERSION)?;
-        drop(conn);
         self.invalidate_aliases();
+        Ok(())
+    }
+
+    /// Upsert the shared abbreviation list and split comma-joined e-Gov abbrevs.
+    /// Safe to run more than once. A failure is logged by the caller and does
+    /// not turn statute features off.
+    fn sync_shared_aliases(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if take_alias_sync_failure() {
+            return Err("略称リストの取り込みに失敗しました".into());
+        }
+        let list = catalog::alias_list()?;
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        split_saved_alias_blobs(&tx, &list.group_labels)?;
+        for entry in &list.entries {
+            if !entry.bundle {
+                tx.execute(
+                    "INSERT INTO law (law_id, name, law_num, as_of, checked_on, source)
+                     VALUES (?1, ?2, '', '', '', 'alias')
+                     ON CONFLICT(law_id) DO UPDATE SET
+                       name = CASE WHEN law.name = '' THEN excluded.name ELSE law.name END,
+                       law_num = CASE WHEN law.law_num = '' THEN excluded.law_num ELSE law.law_num END",
+                    params![entry.law_id, entry.name],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            insert_aliases(&tx, &entry.law_id, &entry.name, &entry.aliases)?;
+        }
+        for label in &list.group_labels {
+            tx.execute("DELETE FROM law_alias WHERE alias = ?1", [label])
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -210,7 +274,11 @@ impl StatuteDb {
             .meta(&format!("probe_fail:{law_id}:{key}"))
             .unwrap_or_default();
         let note = raw.split_once('\n').map(|(_, note)| note.to_string())?;
-        if note.is_empty() { None } else { Some(note) }
+        if note.is_empty() {
+            None
+        } else {
+            Some(note)
+        }
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
@@ -351,8 +419,10 @@ impl StatuteDb {
         bump_rev_locked(&tx)?;
         tx.commit().map_err(|e| e.to_string())?;
         drop(conn);
-        let new_keys: std::collections::HashSet<&str> =
-            articles.iter().map(|article| article.key.as_str()).collect();
+        let new_keys: std::collections::HashSet<&str> = articles
+            .iter()
+            .map(|article| article.key.as_str())
+            .collect();
         let removed = old_keys
             .into_iter()
             .filter(|key| !new_keys.contains(key.as_str()))
@@ -502,7 +572,9 @@ impl StatuteDb {
         }
         let found = self.law_ref_db(law_id)?;
         if let Some(law) = &found {
-            self.law_cache.lock().insert(law.law_id.clone(), law.clone());
+            self.law_cache
+                .lock()
+                .insert(law.law_id.clone(), law.clone());
         }
         Ok(found)
     }
@@ -562,13 +634,21 @@ impl StatuteDb {
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| e.to_string())?);
+            for alias in split_alias_list(&row.map_err(|e| e.to_string())?) {
+                if !out.contains(&alias) {
+                    out.push(alias);
+                }
+            }
         }
+        out.sort_by_key(|alias| std::cmp::Reverse(alias.chars().count()));
         Ok(out)
     }
 
     /// Rightmost alias in `text`, with no boundary check. Offsets are in chars.
-    pub fn rightmost_alias_anywhere(&self, text: &str) -> Result<Option<(usize, usize, String)>, String> {
+    pub fn rightmost_alias_anywhere(
+        &self,
+        text: &str,
+    ) -> Result<Option<(usize, usize, String)>, String> {
         self.ensure_alias_cache()?;
         let cache = self.aliases.lock();
         let Some(entries) = cache.as_ref() else {
@@ -624,7 +704,9 @@ impl StatuteDb {
                     let end = abs + hit.alias.len();
                     let replace = match &best {
                         None => true,
-                        Some((at, alen, _, _)) => end > *at || (end == *at && hit.alias.len() > *alen),
+                        Some((at, alen, _, _)) => {
+                            end > *at || (end == *at && hit.alias.len() > *alen)
+                        }
                     };
                     if replace {
                         best = Some((end, hit.alias.len(), hit.law_id.clone(), hit.name.clone()));
@@ -693,7 +775,11 @@ impl StatuteDb {
         self.law_with_fallback(&law_id, &fallback_name)
     }
 
-    fn law_with_fallback(&self, law_id: &str, fallback_name: &str) -> Result<Option<LawRef>, String> {
+    fn law_with_fallback(
+        &self,
+        law_id: &str,
+        fallback_name: &str,
+    ) -> Result<Option<LawRef>, String> {
         let mut law = self.law_ref(law_id)?;
         if let Some(law) = law.as_mut() {
             if law.name.is_empty() {
@@ -741,7 +827,10 @@ impl StatuteDb {
     fn law_from_split_alias(&self, name: &str) -> Result<Option<LawRef>, String> {
         self.ensure_alias_cache()?;
         let cache = self.aliases.lock();
-        let Some(hit) = cache.as_ref().and_then(|entries| entries.iter().find(|hit| hit.alias == name)) else {
+        let Some(hit) = cache
+            .as_ref()
+            .and_then(|entries| entries.iter().find(|hit| hit.alias == name))
+        else {
             return Ok(None);
         };
         let law_id = hit.law_id.clone();
@@ -787,7 +876,12 @@ impl StatuteDb {
         Ok(out)
     }
 
-    pub fn store_updates(&self, day: &str, today: &str, rows: &[ListedUpdate]) -> Result<(), String> {
+    pub fn store_updates(
+        &self,
+        day: &str,
+        today: &str,
+        rows: &[ListedUpdate],
+    ) -> Result<(), String> {
         let today_d = parse_ymd(today);
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -947,7 +1041,7 @@ fn insert_aliases(
         .map_err(|e| e.to_string())?;
     let mut seen = Vec::new();
     if !name.is_empty() {
-        seen.push(normalize_alias(name));
+        seen.extend(split_alias_list(name));
     }
     for alias in aliases {
         seen.extend(split_alias_list(alias));
@@ -994,18 +1088,58 @@ fn set_meta_locked(conn: &Connection, key: &str, value: &str) -> Result<(), Stri
 }
 
 pub fn normalize_alias(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_whitespace() && *c != '　')
-        .collect()
+    catalog::normalize_alias(text)
 }
 
 /// e-Gov sometimes stores several abbreviations in one cell (`労災法,労災保険法`).
+/// ASCII `,` separates them. Japanese `、` stays inside a name. Group labels
+/// such as 労働三法 are not aliases.
 pub fn split_alias_list(alias: &str) -> Vec<String> {
-    alias
-        .split([',', '、', '，'])
-        .map(normalize_alias)
-        .filter(|alias| alias.chars().count() >= 2)
-        .collect()
+    match catalog::alias_list() {
+        Ok(list) => catalog::split_alias(alias, &list.group_labels),
+        Err(_) => alias
+            .split(',')
+            .map(normalize_alias)
+            .filter(|alias| alias.chars().count() >= 2)
+            .collect(),
+    }
+}
+
+/// Break alias rows that still store several e-Gov abbreviations in one string.
+/// Pieces that already exist keep their law id. The joined row is removed.
+fn split_saved_alias_blobs(conn: &Connection, groups: &[String]) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT alias, law_id FROM law_alias WHERE instr(alias, ',') > 0")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut blobs = Vec::new();
+    for row in rows {
+        blobs.push(row.map_err(|e| e.to_string())?);
+    }
+    drop(stmt);
+    let mut insert = conn
+        .prepare(
+            "INSERT INTO law_alias (alias, law_id) VALUES (?1, ?2)
+             ON CONFLICT(alias) DO NOTHING",
+        )
+        .map_err(|e| e.to_string())?;
+    for (alias, law_id) in &blobs {
+        for part in catalog::split_alias(alias, groups) {
+            insert
+                .execute(params![part, law_id])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    drop(insert);
+    for (alias, _) in &blobs {
+        conn.execute("DELETE FROM law_alias WHERE alias = ?1", [alias])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// The alias is a suffix, and the character before it is a real boundary
@@ -1059,7 +1193,10 @@ fn alias_prefix_ok(before: &str) -> bool {
             return rest.is_empty() || rest.chars().last().is_some_and(is_name_boundary);
         }
     }
-    if NAME_PARTICLES.iter().any(|particle| before.ends_with(particle)) {
+    if NAME_PARTICLES
+        .iter()
+        .any(|particle| before.ends_with(particle))
+    {
         return true;
     }
     // 及び / 又は / 並びに may separate a law name (`本件及び民法`).
@@ -1072,9 +1209,17 @@ fn alias_prefix_ok(before: &str) -> bool {
 }
 
 fn joiner_boundary(before: &str) -> bool {
-    ["並びに", "ならびに", "および", "または", "及び", "又は", "と"]
-        .iter()
-        .any(|conn| before.ends_with(conn))
+    [
+        "並びに",
+        "ならびに",
+        "および",
+        "または",
+        "及び",
+        "又は",
+        "と",
+    ]
+    .iter()
+    .any(|conn| before.ends_with(conn))
 }
 
 /// Drops a particle glued to the front of a law name (`契約による民法` → `民法`).
@@ -1142,7 +1287,6 @@ fn is_name_boundary(c: char) -> bool {
                 | 'か'
         )
 }
-
 
 const SEED_IMPORT_SQL: &str = "
 BEGIN;
@@ -1367,8 +1511,8 @@ mod tests {
 
     #[test]
     fn no_seed_law_name_or_alias_ends_in_douhou() {
-        for entry in crate::statute::catalog::CATALOG {
-            for alias in entry.aliases {
+        for entry in crate::statute::catalog::catalog().unwrap() {
+            for alias in &entry.aliases {
                 assert!(!alias.ends_with("同法"), "{alias}");
             }
         }
@@ -1376,12 +1520,14 @@ mod tests {
         let db = StatuteDb::open(&dir.path().join("statutes.db")).unwrap();
         let conn = db.conn.lock();
         let mut hits = Vec::new();
-        for (table, column) in [("law", "name"), ("law_name", "name"), ("law_alias", "alias")] {
+        for (table, column) in [
+            ("law", "name"),
+            ("law_name", "name"),
+            ("law_alias", "alias"),
+        ] {
             let sql = format!("SELECT {column} FROM {table} WHERE {column} LIKE '%同法'");
             let mut stmt = conn.prepare(&sql).unwrap();
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .unwrap();
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
             for row in rows {
                 hits.push(row.unwrap());
             }
@@ -1472,12 +1618,48 @@ mod tests {
             "2026-11-11",
             "bundle",
             &["労災法,労災保険法".into()],
-            &[article],
+            &[article.clone()],
         )
         .unwrap();
         let law = db.resolve_name("労災法").unwrap().expect("労災法");
         assert_eq!(law.law_id, "322AC0000000050");
         assert!(db.resolve_name("労災保険法").unwrap().is_some());
+        db.replace_law(
+            "324AC0000000174",
+            "労働組合法",
+            "",
+            "2026-11-11",
+            "2026-11-11",
+            "bundle",
+            &[
+                "労組法,労働三法".into(),
+                "訪問販売、通信販売、マルチ販売等法".into(),
+            ],
+            &[article.clone()],
+        )
+        .unwrap();
+        let aliases = db.aliases_of("324AC0000000174").unwrap();
+        assert!(aliases.iter().any(|alias| alias == "労組法"), "{aliases:?}");
+        assert!(
+            aliases
+                .iter()
+                .any(|alias| alias == "訪問販売、通信販売、マルチ販売等法"),
+            "{aliases:?}"
+        );
+        assert!(
+            aliases.iter().all(|alias| alias != "労働三法"),
+            "{aliases:?}"
+        );
+        assert!(
+            aliases.iter().all(|alias| !alias.contains(',')),
+            "{aliases:?}"
+        );
+        assert!(db.resolve_name("労働三法").unwrap().is_none());
+        let kept = db
+            .resolve_name("訪問販売、通信販売、マルチ販売等法")
+            .unwrap()
+            .expect("japanese comma stays inside one alias");
+        assert_eq!(kept.law_id, "324AC0000000174");
     }
 
     #[test]
@@ -1513,10 +1695,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("置き換えません"), "{err}");
-        assert!(db
-            .lookup_article("129AC0000000089", "1")
-            .unwrap()
-            .is_some());
+        assert!(db.lookup_article("129AC0000000089", "1").unwrap().is_some());
     }
 
     #[test]
@@ -1600,5 +1779,72 @@ mod tests {
             .unwrap();
         assert!(!db.pending_due("129AC0000000089", "2026-11-11").unwrap());
         assert!(db.pending_due("129AC0000000089", "2026-11-12").unwrap());
+    }
+
+    #[test]
+    fn shared_alias_list_is_applied_when_the_database_opens() {
+        let dir = TempDir::new();
+        let path = dir.path().join("statutes.db");
+        let db = StatuteDb::open(&path).unwrap();
+        let expect = [
+            ("自賠法", "330AC0000000097", "自動車損害賠償保障法"),
+            ("自賠責法", "330AC0000000097", "自動車損害賠償保障法"),
+            (
+                "フリーランス法",
+                "505AC0000000025",
+                "特定受託事業者に係る取引の適正化等に関する法律",
+            ),
+            (
+                "個人情報保護法",
+                "415AC0000000057",
+                "個人情報の保護に関する法律",
+            ),
+            (
+                "取適法",
+                "331AC0000000120",
+                "製造委託等に係る中小受託事業者に対する代金の支払の遅延等の防止に関する法律",
+            ),
+            ("PL法", "406AC0000000085", "製造物責任法"),
+            ("ＰＬ法", "406AC0000000085", "製造物責任法"),
+            ("宅建法", "327AC1000000176", "宅地建物取引業法"),
+            ("労組法", "324AC0000000174", "労働組合法"),
+            ("入管法", "326CO0000000319", "出入国管理及び難民認定法"),
+        ];
+        for (alias, law_id, name) in expect {
+            let law = db.resolve_name(alias).unwrap().expect(alias);
+            assert_eq!(law.law_id, law_id, "{alias}");
+            assert_eq!(law.name, name, "{alias}");
+        }
+        assert!(db.resolve_name("労働三法").unwrap().is_none());
+        assert!(db.resolve_name("組織犯罪対策三法").unwrap().is_none());
+        assert!(db.resolve_name("保安四法").unwrap().is_none());
+        let kept = db
+            .resolve_name("訪問販売、通信販売、マルチ販売等法")
+            .unwrap()
+            .expect("japanese comma stays inside one alias");
+        assert_eq!(kept.law_id, "351AC0000000057");
+        assert!(db.resolve_name("労災法,労災保険法").unwrap().is_none());
+        let commas: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM law_alias WHERE instr(alias, ',') > 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(commas, 0);
+        let count: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM law_alias", [], |row| row.get(0))
+            .unwrap();
+        db.import_seed().unwrap();
+        let again: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM law_alias", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(again, count, "applying the alias list twice changed rows");
     }
 }

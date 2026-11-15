@@ -29,7 +29,8 @@ pub(crate) static EAGER_NOTES: std::sync::atomic::AtomicBool =
 const UNCONFIRMED_MATCH_LABEL: &str = "一致";
 
 pub(crate) const DENY_LAW_NAME: &[&str] = &[
-    "方法", "手法", "療法", "用法", "違法", "適法", "合法", "魔法", "司法", "立法", "憲法改正", "不法",
+    "方法", "手法", "療法", "用法", "違法", "適法", "不適法", "非適法", "合法", "魔法", "司法", "立法",
+    "憲法改正", "不法",
 ];
 
 /// Whole phrases that are not law titles even with words in front.
@@ -1293,9 +1294,7 @@ fn is_generic_houritsu(text: &str) -> bool {
 }
 
 fn known_law_name(db: &StatuteDb, name: &str) -> bool {
-    super::catalog::CATALOG
-        .iter()
-        .any(|entry| entry.aliases.contains(&name))
+    crate::statute::catalog::is_listed_name(name)
         || db.match_law_in_text(name).ok().flatten().is_some()
 }
 
@@ -1410,6 +1409,9 @@ fn douhou_boundary_ok(prefix: &str) -> bool {
 }
 
 fn deny_tail(head: &str) -> bool {
+    if listed_name_wins(head) {
+        return false;
+    }
     DENY_LAW_NAME.iter().any(|deny| head.ends_with(deny))
         || DENY_LAW_ENDING.iter().any(|deny| head.ends_with(deny))
 }
@@ -1532,10 +1534,40 @@ fn is_law_char(c: char) -> bool {
             | '\u{3400}'..='\u{4DBF}'
             | '\u{3040}'..='\u{309F}'
             | '\u{30A0}'..='\u{30FF}'
+            | 'A'..='Z'
+            | 'a'..='z'
+            | '\u{FF21}'..='\u{FF3A}'
+            | '\u{FF41}'..='\u{FF5A}'
             | '々'
             | '、'
             | '，'
     )
+}
+
+/// A shared law name at the end of the window wins over a deny word, so 取適法
+/// is kept even though it ends with 適法.
+fn listed_name_wins(window: &str) -> bool {
+    let Some(name) = crate::statute::catalog::longest_listed_name_suffix(window) else {
+        return false;
+    };
+    !DENY_LAW_NAME.contains(&name) && !DENY_LAW_ENDING.contains(&name)
+}
+
+/// A longer statute title is not the short deny word it happens to end with.
+/// 協同組合法 ends with 合法, and 行手法 ends with 手法.
+fn longer_statute_title(name: &str) -> bool {
+    ["法律", "規則", "条例", "憲法", "法", "令"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix) && name.chars().count() > suffix.chars().count())
+}
+
+fn deny_phrase(name: &str) -> bool {
+    if DENY_LAW_ENDING.iter().any(|deny| name.ends_with(deny)) {
+        return true;
+    }
+    DENY_LAW_NAME.iter().any(|deny| {
+        name == *deny || (name.ends_with(deny) && !longer_statute_title(name))
+    })
 }
 
 fn denied(db: &StatuteDb, window: &str) -> bool {
@@ -1543,13 +1575,10 @@ fn denied(db: &StatuteDb, window: &str) -> bool {
         .strip_prefix("改正")
         .or_else(|| window.strip_prefix("現行"))
         .unwrap_or(window);
-    if known_law_name(db, name) {
+    if listed_name_wins(name) || known_law_name(db, name) {
         return false;
     }
-    if DENY_LAW_NAME.contains(&name) {
-        return true;
-    }
-    DENY_LAW_ENDING.iter().any(|deny| name.ends_with(deny))
+    deny_phrase(name)
 }
 
 fn alias_offset(window: &str, db: &StatuteDb, law: &LawRef) -> usize {
@@ -2440,9 +2469,18 @@ mod tests {
 
     #[test]
     fn catalog_lists_the_short_names() {
-        assert!(catalog::aliases_for("408AC0000000109").contains(&"民訴法"));
-        assert!(catalog::aliases_for("322AC0000000049").contains(&"労基法"));
-        assert!(catalog::aliases_for("322AC0000000054").contains(&"独禁法"));
+        assert!(catalog::aliases_for("408AC0000000109")
+            .unwrap()
+            .iter()
+            .any(|alias| alias == "民訴法"));
+        assert!(catalog::aliases_for("322AC0000000049")
+            .unwrap()
+            .iter()
+            .any(|alias| alias == "労基法"));
+        assert!(catalog::aliases_for("322AC0000000054")
+            .unwrap()
+            .iter()
+            .any(|alias| alias == "独禁法"));
     }
 
     #[test]
@@ -3423,11 +3461,11 @@ mod tests {
         let cases: Vec<GlueCase> =
             serde_json::from_str(include_str!("../../../src/shared/statuteGlueCases.json")).unwrap();
         let db = db();
-        for entry in crate::statute::catalog::CATALOG {
-            let aliases: Vec<String> = entry.aliases.iter().map(|s| (*s).to_string()).collect();
+        for entry in crate::statute::catalog::catalog().unwrap() {
+            let aliases = entry.aliases.clone();
             let _ = db.replace_law(
-                entry.law_id,
-                entry.aliases[0],
+                &entry.law_id,
+                &entry.name,
                 "",
                 "2020-01-01",
                 "2020-01-01",
@@ -3527,6 +3565,58 @@ mod tests {
         };
         assert_eq!(labels(&eager), labels(&lazy), "{eager:?} {lazy:?}");
         assert!(lazy.iter().any(|hit| hit.reason.contains("曖昧")), "{lazy:?}");
+    }
+
+    #[test]
+    fn shared_abbreviations_are_checked_and_group_labels_are_not() {
+        let dir = std::env::temp_dir().join(format!(
+            "guri-alias-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = StatuteDb::open(&dir.join("statutes.db")).unwrap();
+        let today = "2026-11-13";
+        for (text, alias) in [
+            ("自賠法第3条", "自賠法"),
+            ("フリーランス法第3条", "フリーランス法"),
+        ] {
+            let hits = check_text(&db, &OfflineEgov, text, today, false);
+            assert_eq!(hits.len(), 1, "{text} {hits:?}");
+            assert_eq!(hits[0].label, "要確認", "{text} {hits:?}");
+            assert_eq!(hits[0].reason, "未取得（オフライン）", "{text} {hits:?}");
+            assert!(hits[0].citation.contains(alias), "{text} {hits:?}");
+            assert!(!hits[0].reason.contains("特定できません"), "{text} {hits:?}");
+        }
+        for (text, alias, snippet) in [
+            ("個人情報保護法第27条", "個人情報保護法", "本人の同意"),
+            ("取適法第3条", "取適法", "支払期日"),
+            ("ＰＬ法第3条", "ＰＬ法", "製造業者"),
+            ("PL法第3条", "PL法", "製造業者"),
+        ] {
+            let hits = check_text(&db, &OfflineEgov, text, today, false);
+            assert_eq!(hits.len(), 1, "{text} {hits:?}");
+            assert_eq!(hits[0].label, "一致", "{text} {hits:?}");
+            assert!(hits[0].citation.contains(alias), "{text} {hits:?}");
+            assert!(hits[0].article_text.contains(snippet), "{text} {hits:?}");
+            assert_eq!(hits[0].offline_note, OFFLINE_NOTE, "{text} {hits:?}");
+        }
+        for text in ["不適法第1条。", "非適法第1条。"] {
+            let hits = check_text(&db, &OfflineEgov, text, today, false);
+            assert!(hits.is_empty(), "{text} {hits:?}");
+        }
+        let group = check_text(&db, &OfflineEgov, "労働三法第1条", today, false);
+        assert_eq!(group.len(), 1, "{group:?}");
+        assert!(group[0].reason.contains("特定できません"), "{group:?}");
+        assert!(!group[0].citation.contains("労働組合法"), "{group:?}");
+        assert!(db.resolve_name("労働三法").unwrap().is_none());
+        assert!(db.resolve_name("組織犯罪対策三法").unwrap().is_none());
+        assert!(db.resolve_name("保安四法").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { GROUP_LABELS, splitAlias } from "./statuteAliases";
 import {
   markAnswer,
   markDelivered,
@@ -205,4 +206,43 @@ describe("markUnverified", () => {
     expect(markUnverified("施行法第1条", known)).toContain("（要確認）");
     expect(markUnverified("整備法第1条", known)).toContain("（要確認）");
   });
+
+  it("resolves shared abbreviations and does not treat deny words or group labels as laws", () => {
+    const unverified = [
+      "自賠法第3条は運行供用者の責任です。",
+      "個人情報保護法第27条は第三者提供です。",
+      "フリーランス法第3条は報酬です。",
+      "取適法第3条は支払時期です。",
+      "PL法第3条は欠陥の責任です。",
+      "ＰＬ法第3条は欠陥の責任です。",
+    ];
+    for (const sample of unverified) {
+      expect(markUnverified(sample, []), sample).toContain("（要確認）");
+    }
+    const verified = [
+      ["自賠法第3条は運行供用者の責任です。", ["自動車損害賠償保障法", "自賠法"], "3"],
+      ["個人情報保護法第27条は第三者提供です。", ["個人情報の保護に関する法律"], "27"],
+      ["フリーランス法第3条は報酬です。", ["特定受託事業者に係る取引の適正化等に関する法律", "フリーランス法"], "3"],
+      ["取適法第3条は支払時期です。", ["製造委託等に係る中小受託事業者に対する代金の支払の遅延等の防止に関する法律"], "3"],
+      ["PL法第3条は欠陥の責任です。", ["製造物責任法", "PL法"], "3"],
+      ["ＰＬ法第3条は欠陥の責任です。", ["製造物責任法", "ＰＬ法"], "3"],
+    ] as const;
+    for (const [sample, names, key] of verified) {
+      expect(markUnverified(sample, [verifiedCite(names, key)]), sample).not.toContain("要確認");
+    }
+    expect(markUnverified("不適法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("非適法第1条。", [])).not.toContain("要確認");
+    const group = markUnverified("労働三法第1条。", [verifiedCite(["労働組合法", "労組法"], "1")]);
+    expect(group).toContain("労働三法第1条（要確認）");
+    expect(GROUP_LABELS).toContain("労働三法");
+    expect(GROUP_LABELS).toContain("組織犯罪対策三法");
+    expect(GROUP_LABELS).toContain("保安四法");
+    expect(
+      splitAlias("労組法,労働三法,労安衛法,保安四法,安衛法,訪問販売、通信販売、マルチ販売等法")
+    ).toEqual(["労組法", "労安衛法", "安衛法", "訪問販売、通信販売、マルチ販売等法"]);
+  });
 });
+
+function verifiedCite(names: readonly string[], key: string): VerifiedCite {
+  return { names: [...names], key };
+}

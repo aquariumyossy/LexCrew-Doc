@@ -1,159 +1,264 @@
-//! Laws shipped in full, plus a few aliases for laws fetched on demand.
+//! Statute names and abbreviations.
 //!
-//! Official names that differ from the e-Gov list label are included as aliases.
-//! The list label is also stored when the bundle is built.
+//! The shared list is `src/shared/statute_aliases.json`. The chat marker
+//! imports that same file. `statuteAliasExtras.json` adds titles that contain
+//! 及び and are not in the shared list. `bundle: false` only records the name,
+//! the same way 金融商品取引法 is shipped.
 
-#[derive(Clone, Copy)]
-pub struct CatalogEntry {
-    pub law_id: &'static str,
-    /// Full text is packed into the app. `false` only adds the alias so a later
-    /// fetch can resolve the name.
-    #[allow(dead_code)]
-    pub bundle: bool,
-    pub aliases: &'static [&'static str],
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+
+use serde::Deserialize;
+
+const ALIAS_JSON: &str = include_str!("../../../src/shared/statute_aliases.json");
+const EXTRAS_JSON: &str = include_str!("../../../src/shared/statuteAliasExtras.json");
+
+#[derive(Debug, Clone, Deserialize)]
+struct AliasFile {
+    #[serde(default)]
+    group_labels: Vec<String>,
+    entries: Vec<CatalogEntryRaw>,
 }
 
-pub static CATALOG: &[CatalogEntry] = &[
-    entry("321CONSTITUTION", true, &["日本国憲法", "憲法"]),
-    entry("129AC0000000089", true, &["民法"]),
-    entry("132AC0000000048", true, &["商法"]),
-    entry("417AC0000000086", true, &["会社法"]),
-    entry("140AC0000000045", true, &["刑法"]),
-    entry("323AC0000000131", true, &["刑事訴訟法", "刑訴法"]),
-    entry("408AC0000000109", true, &["民事訴訟法", "民訴法"]),
-    entry("354AC0000000004", true, &["民事執行法"]),
-    entry("401AC0000000091", true, &["民事保全法"]),
-    entry("416AC0000000075", true, &["破産法"]),
-    entry("411AC0000000225", true, &["民事再生法"]),
-    entry("414AC0000000154", true, &["会社更生法"]),
-    entry("403AC0000000090", true, &["借地借家法"]),
-    entry("322AC0000000049", true, &["労働基準法", "労基法"]),
-    entry("419AC0000000128", true, &["労働契約法"]),
-    entry("324AC0000000174", true, &["労働組合法", "労組法"]),
-    entry(
-        "322AC0000000054",
-        true,
-        &[
-            "私的独占の禁止及び公正取引の確保に関する法律",
-            "独占禁止法",
-            "独禁法",
-        ],
-    ),
-    entry("405AC0000000047", true, &["不正競争防止法"]),
-    entry("334AC0000000121", true, &["特許法"]),
-    entry("334AC0000000123", true, &["実用新案法"]),
-    entry("334AC0000000125", true, &["意匠法"]),
-    entry("334AC0000000127", true, &["商標法"]),
-    entry("345AC0000000048", true, &["著作権法"]),
-    entry("337AC0000000139", true, &["行政事件訴訟法", "行訴法"]),
-    entry("405AC0000000088", true, &["行政手続法"]),
-    entry("426AC0000000068", true, &["行政不服審査法"]),
-    entry("322AC0000000125", true, &["国家賠償法", "国賠法"]),
-    entry("329AC0000000100", true, &["利息制限法"]),
-    entry("412AC0000000061", true, &["消費者契約法"]),
-    entry(
-        "351AC0000000057",
-        true,
-        &["特定商取引に関する法律", "特定商取引法", "特商法"],
-    ),
-    entry(
-        "415AC0000000057",
-        true,
-        &["個人情報の保護に関する法律", "個人情報保護法"],
-    ),
-    entry("416AC0000000123", true, &["不動産登記法"]),
-    entry(
-        "337AC0000000069",
-        true,
-        &["建物の区分所有等に関する法律", "区分所有法"],
-    ),
-    entry("406AC0000000085", true, &["製造物責任法"]),
-    entry("420AC0000000056", true, &["保険法"]),
-    entry("307AC0000000020", true, &["手形法"]),
-    entry("308AC0000000057", true, &["小切手法"]),
-    entry("418AC0000000108", true, &["信託法"]),
-    entry(
-        "418AC0000000048",
-        true,
-        &["一般社団法人及び一般財団法人に関する法律", "一般社団法人法"],
-    ),
-    entry("423AC0000000052", true, &["家事事件手続法"]),
-    entry("415AC0000000109", true, &["人事訴訟法"]),
-    entry(
-        "331AC0000000120",
-        true,
-        &[
-            "製造委託等に係る中小受託事業者に対する代金の支払の遅延等の防止に関する法律",
-            "下請代金支払遅延等防止法",
-            "下請法",
-            "取適法",
-        ],
-    ),
-    entry("323AC0000000168", true, &["少年法"]),
-    entry("324AC1000000205", true, &["弁護士法"]),
-    entry("326AC1000000222", true, &["民事調停法"]),
-    entry("322AC0000000224", true, &["戸籍法"]),
-    entry(
-        "411AC0000000136",
-        true,
-        &[
-            "組織的な犯罪の処罰及び犯罪収益の規制等に関する法律",
-            "組織的犯罪処罰法",
-        ],
-    ),
-    entry("415AC0000000138", true, &["仲裁法"]),
-    entry(
-        "413AC0000000137",
-        true,
-        &[
-            "特定電気通信による情報の流通によって発生する権利侵害等への対処に関する法律",
-            "プロバイダ責任制限法",
-            "情報流通プラットフォーム対処法",
-        ],
-    ),
-    entry(
-        "322AC0000000050",
-        true,
-        &["労働者災害補償保険法", "労災保険法", "労災法"],
-    ),
-    entry(
-        "347AC0000000113",
-        true,
-        &[
-            "雇用の分野における男女の均等な機会及び待遇の確保等に関する法律",
-            "男女雇用機会均等法",
-            "均等法",
-        ],
-    ),
-    entry(
-        "403AC0000000076",
-        true,
-        &[
-            "育児休業、介護休業等育児又は家族介護を行う労働者の福祉に関する法律",
-            "育児介護休業法",
-        ],
-    ),
-    // Full text is large. The name still resolves so a missing article can be fetched.
-    entry("323AC0000000025", false, &["金融商品取引法", "金商法"]),
-    // Names that contain 及び. They are not in the packed seed; the chat and
-    // the button still have to keep the whole name, not the part after 及び.
-    entry("326CO0000000319", false, &["出入国管理及び難民認定法", "入管法"]),
-    entry("324AC0000000228", false, &["外国為替及び外国貿易法", "外為法"]),
-    entry("337AC0000000134", false, &["不当景品類及び不当表示防止法", "景表法"]),
-    entry("325AC0000000303", false, &["毒物及び劇物取締法", "毒劇法"]),
-    entry("328AC0000000014", false, &["麻薬及び向精神薬取締法", "麻向法"]),
-];
-
-const fn entry(
-    law_id: &'static str,
+#[derive(Debug, Clone, Deserialize)]
+struct CatalogEntryRaw {
+    law_id: String,
+    name: String,
+    #[serde(default)]
     bundle: bool,
-    aliases: &'static [&'static str],
-) -> CatalogEntry {
-    CatalogEntry {
-        law_id,
-        bundle,
-        aliases,
+    #[serde(default)]
+    aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogEntry {
+    pub law_id: String,
+    pub name: String,
+    /// Full text is packed into the app. `false` only adds the name so a later
+    /// fetch can resolve it.
+    pub bundle: bool,
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AliasList {
+    pub group_labels: Vec<String>,
+    pub entries: Vec<CatalogEntry>,
+}
+
+static LIST: OnceLock<AliasList> = OnceLock::new();
+
+pub fn alias_list() -> Result<&'static AliasList, String> {
+    if let Some(list) = LIST.get() {
+        return Ok(list);
     }
+    let mut list = parse_alias_list(ALIAS_JSON)?;
+    append_entries(&mut list, EXTRAS_JSON)?;
+    Ok(LIST.get_or_init(|| list))
+}
+
+#[cfg(test)]
+pub fn catalog() -> Result<&'static [CatalogEntry], String> {
+    Ok(alias_list()?.entries.as_slice())
+}
+
+#[cfg(test)]
+pub fn aliases_for(law_id: &str) -> Result<Vec<String>, String> {
+    Ok(alias_list()?
+        .entries
+        .iter()
+        .find(|entry| entry.law_id == law_id)
+        .map(|entry| entry.aliases.clone())
+        .unwrap_or_default())
+}
+
+pub fn is_listed_name(name: &str) -> bool {
+    listed_names().iter().any(|alias| *alias == name)
+}
+
+/// Longest shared law name that is the whole window or exactly its tail.
+pub fn longest_listed_name_suffix(window: &str) -> Option<&'static str> {
+    listed_names()
+        .iter()
+        .copied()
+        .find(|name| name.chars().count() >= 2 && (window == *name || window.ends_with(name)))
+}
+
+fn listed_names() -> &'static [&'static str] {
+    static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            let Ok(list) = alias_list() else {
+                return Vec::new();
+            };
+            let mut names = Vec::new();
+            for entry in &list.entries {
+                names.push(entry.name.as_str());
+                names.extend(entry.aliases.iter().map(String::as_str));
+            }
+            names.sort_by(|left, right| {
+                right
+                    .chars()
+                    .count()
+                    .cmp(&left.chars().count())
+                    .then_with(|| left.cmp(right))
+            });
+            names.dedup();
+            names
+        })
+        .as_slice()
+}
+
+pub fn normalize_alias(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && *c != '　')
+        .collect()
+}
+
+/// Split an e-Gov `LawTitle@Abbrev` value. ASCII `,` separates aliases.
+/// Japanese `、` stays inside a name. Group labels are dropped.
+pub fn split_alias(raw: &str, group_labels: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let norm = normalize_alias(part);
+        if norm.chars().count() < 2 {
+            continue;
+        }
+        if group_labels.iter().any(|label| label == &norm) {
+            continue;
+        }
+        if !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+    out
+}
+
+fn parse_alias_list(raw: &str) -> Result<AliasList, String> {
+    let file: AliasFile = serde_json::from_str(raw)
+        .map_err(|err| format!("法令略称リストを読めませんでした: {err}"))?;
+    if file.entries.is_empty() {
+        return Err("法令略称リストが空です".into());
+    }
+    let mut group_labels = Vec::new();
+    for label in &file.group_labels {
+        let norm = normalize_alias(label);
+        if norm.chars().count() < 2 {
+            return Err(format!("総称が短すぎます: {label}"));
+        }
+        if !group_labels.contains(&norm) {
+            group_labels.push(norm);
+        }
+    }
+    let mut entries = Vec::with_capacity(file.entries.len());
+    let mut seen_ids = HashSet::new();
+    let mut seen_alias: HashMap<String, String> = HashMap::new();
+    for entry in file.entries {
+        push_entry(
+            &mut entries,
+            &mut seen_ids,
+            &mut seen_alias,
+            &group_labels,
+            entry,
+        )?;
+    }
+    Ok(AliasList {
+        group_labels,
+        entries,
+    })
+}
+
+fn append_entries(list: &mut AliasList, raw: &str) -> Result<(), String> {
+    let extra = parse_alias_list(raw)?;
+    let mut seen_ids: HashSet<String> = list
+        .entries
+        .iter()
+        .map(|entry| entry.law_id.clone())
+        .collect();
+    let mut seen_alias: HashMap<String, String> = HashMap::new();
+    for entry in &list.entries {
+        for alias in &entry.aliases {
+            seen_alias.insert(alias.clone(), entry.law_id.clone());
+        }
+    }
+    for entry in extra.entries {
+        let raw = CatalogEntryRaw {
+            law_id: entry.law_id,
+            name: entry.name,
+            bundle: entry.bundle,
+            aliases: entry.aliases,
+        };
+        push_entry(
+            &mut list.entries,
+            &mut seen_ids,
+            &mut seen_alias,
+            &list.group_labels,
+            raw,
+        )?;
+    }
+    Ok(())
+}
+
+fn push_entry(
+    entries: &mut Vec<CatalogEntry>,
+    seen_ids: &mut HashSet<String>,
+    seen_alias: &mut HashMap<String, String>,
+    group_labels: &[String],
+    entry: CatalogEntryRaw,
+) -> Result<(), String> {
+    let law_id = entry.law_id.trim().to_string();
+    let name = normalize_alias(&entry.name);
+    if law_id.is_empty() || name.is_empty() {
+        return Err("法令略称リストに law_id または name が空の行があります".into());
+    }
+    if !seen_ids.insert(law_id.clone()) {
+        return Err(format!(
+            "法令略称リストの law_id が重複しています: {law_id}"
+        ));
+    }
+    if group_labels.iter().any(|label| label == &name) {
+        return Err(format!("総称は一つの法令の名称にできません: {name}"));
+    }
+    let mut aliases = Vec::new();
+    {
+        let mut push_alias = |norm: String| -> Result<(), String> {
+            if norm.chars().count() < 2 {
+                return Err(format!("略称が短すぎます: {norm} ({law_id})"));
+            }
+            if group_labels.iter().any(|label| label == &norm) {
+                return Err(format!("総称は一つの法令の略称にできません: {norm}"));
+            }
+            if let Some(other) = seen_alias.get(&norm) {
+                if other != &law_id {
+                    return Err(format!(
+                        "略称 {norm} が {other} と {law_id} の両方にあります"
+                    ));
+                }
+            } else {
+                seen_alias.insert(norm.clone(), law_id.clone());
+            }
+            if !aliases.contains(&norm) {
+                aliases.push(norm);
+            }
+            Ok(())
+        };
+        push_alias(name.clone())?;
+        for alias in &entry.aliases {
+            if alias.contains(',') {
+                return Err(format!(
+                    "略称リストに ASCII カンマがあります（分割は保存時に行います）: {alias}"
+                ));
+            }
+            push_alias(normalize_alias(alias))?;
+        }
+    }
+    entries.push(CatalogEntry {
+        law_id,
+        name,
+        bundle: entry.bundle,
+        aliases,
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -161,24 +266,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_shared_json_is_this_catalog() {
-        let file: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../src/shared/lawCatalog.json"
-        ))
-        .unwrap();
-        let laws = file["laws"].as_array().unwrap();
-        assert_eq!(laws.len(), CATALOG.len());
-        for (row, entry) in laws.iter().zip(CATALOG.iter()) {
-            assert_eq!(row["id"].as_str().unwrap(), entry.law_id);
-            assert_eq!(row["bundle"].as_bool().unwrap(), entry.bundle);
-            let aliases: Vec<&str> = row["aliases"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap())
-                .collect();
-            assert_eq!(aliases, entry.aliases);
-        }
+    fn deny_lists_match_the_shared_json() {
+        let file: serde_json::Value =
+            serde_json::from_str(include_str!("../../../src/shared/lawCatalog.json")).unwrap();
         let deny = file["deny"].as_array().unwrap();
         let got: Vec<&str> = deny.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(got, crate::statute::check::DENY_LAW_NAME);
@@ -186,12 +276,54 @@ mod tests {
         let got: Vec<&str> = ending.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(got, crate::statute::check::DENY_LAW_ENDING);
     }
-}
 
-pub fn aliases_for(law_id: &str) -> &'static [&'static str] {
-    CATALOG
-        .iter()
-        .find(|e| e.law_id == law_id)
-        .map(|e| e.aliases)
-        .unwrap_or(&[])
+    #[test]
+    fn shared_list_loads_without_group_labels_or_commas() {
+        let list = alias_list().unwrap();
+        assert!(list.group_labels.iter().any(|label| label == "労働三法"));
+        assert!(list
+            .group_labels
+            .iter()
+            .any(|label| label == "組織犯罪対策三法"));
+        assert!(list.group_labels.iter().any(|label| label == "保安四法"));
+        assert!(list.entries.len() >= 60, "{}", list.entries.len());
+        let mut bundled = 0;
+        for entry in &list.entries {
+            if entry.bundle {
+                bundled += 1;
+            }
+            for alias in &entry.aliases {
+                assert!(!alias.contains(','), "{alias}");
+                assert!(
+                    !list.group_labels.iter().any(|label| label == alias),
+                    "{alias}"
+                );
+            }
+        }
+        assert!(bundled >= 50, "bundled entries {bundled}");
+        let pieces = split_alias(
+            "労組法,労働三法,労安衛法,保安四法,安衛法,訪問販売、通信販売、マルチ販売等法",
+            &list.group_labels,
+        );
+        assert_eq!(
+            pieces,
+            vec![
+                "労組法".to_string(),
+                "労安衛法".to_string(),
+                "安衛法".to_string(),
+                "訪問販売、通信販売、マルチ販売等法".to_string(),
+            ]
+        );
+        assert!(is_listed_name("自賠法"));
+        assert!(is_listed_name("自賠責法"));
+        assert!(is_listed_name("個人情報保護法"));
+        assert!(is_listed_name("フリーランス法"));
+        assert!(is_listed_name("取適法"));
+        assert!(is_listed_name("PL法"));
+        assert!(is_listed_name("ＰＬ法"));
+        assert!(is_listed_name("宅建法"));
+        assert!(is_listed_name("入管法"));
+        assert!(!is_listed_name("労働三法"));
+        assert_eq!(longest_listed_name_suffix("取適法"), Some("取適法"));
+    }
 }

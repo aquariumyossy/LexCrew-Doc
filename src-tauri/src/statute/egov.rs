@@ -13,7 +13,11 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 pub const API_ORIGIN: &str = "https://laws.e-gov.go.jp/api/1";
-const USER_AGENT: &str = "GURI/1.3.3 (LexCrew-Doc statute cache; e-Gov law API v2)";
+const USER_AGENT: &str = concat!(
+    "GURI/",
+    env!("CARGO_PKG_VERSION"),
+    " (LexCrew-Doc statute cache; e-Gov law API v2)"
+);
 const V2_ORIGIN: &str = "https://laws.e-gov.go.jp/api/2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,9 +239,7 @@ mod tests {
     fn live_requests_use_law_id_and_article_number_only() {
         let legacy = article_url("129AC0000000089", "第3条の2");
         let url = v2_url(&legacy).unwrap();
-        assert!(url.starts_with(
-            "https://laws.e-gov.go.jp/api/2/law_data/129AC0000000089?"
-        ));
+        assert!(url.starts_with("https://laws.e-gov.go.jp/api/2/law_data/129AC0000000089?"));
         assert!(url.contains("elm=MainProvision-Article_3_2"));
         assert!(url.contains("response_format=xml"));
         assert!(!url.contains("第"));
@@ -254,5 +256,13 @@ mod tests {
         assert!(egress_url("https://evil.example/api/1/updatelawlists/20261111").is_err());
         assert!(egress_url(&format!("{}extra", update_list_url("20261111"))).is_err());
         assert!(egress_url(&format!("{}/more", update_list_url("20261111"))).is_err());
+    }
+
+    #[test]
+    fn user_agent_uses_the_app_version() {
+        assert!(super::USER_AGENT.starts_with("GURI/"));
+        assert!(super::USER_AGENT.contains(env!("CARGO_PKG_VERSION")));
+        assert!(super::USER_AGENT.contains("LexCrew-Doc statute cache"));
+        assert!(!super::USER_AGENT.contains("1.3.3"));
     }
 }

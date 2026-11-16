@@ -53,7 +53,10 @@ pub fn alias_list() -> Result<&'static AliasList, String> {
         return Ok(list);
     }
     let mut list = parse_alias_list(ALIAS_JSON)?;
-    append_entries(&mut list, EXTRAS_JSON)?;
+    // A bad extra row must not throw away the main list.
+    if let Err(err) = append_entries(&mut list, EXTRAS_JSON) {
+        eprintln!("guri: extra statute aliases were not applied: {err}");
+    }
     Ok(LIST.get_or_init(|| list))
 }
 
@@ -182,19 +185,22 @@ fn append_entries(list: &mut AliasList, raw: &str) -> Result<(), String> {
         }
     }
     for entry in extra.entries {
+        let law_id = entry.law_id.clone();
         let raw = CatalogEntryRaw {
             law_id: entry.law_id,
             name: entry.name,
             bundle: entry.bundle,
             aliases: entry.aliases,
         };
-        push_entry(
+        if let Err(err) = push_entry(
             &mut list.entries,
             &mut seen_ids,
             &mut seen_alias,
             &list.group_labels,
             raw,
-        )?;
+        ) {
+            eprintln!("guri: skipped an extra statute alias ({law_id}): {err}");
+        }
     }
     Ok(())
 }
@@ -325,5 +331,25 @@ mod tests {
         assert!(is_listed_name("入管法"));
         assert!(!is_listed_name("労働三法"));
         assert_eq!(longest_listed_name_suffix("取適法"), Some("取適法"));
+    }
+
+    #[test]
+    fn a_duplicate_extra_keeps_the_main_list() {
+        let main = r#"{"entries":[{"law_id":"A","name":"民法","bundle":true,"aliases":["民法","自賠法"]}]}"#;
+        let extra = r#"{"entries":[
+            {"law_id":"A","name":"民法","aliases":["民法","景表法"]},
+            {"law_id":"B","name":"入管法","aliases":["入管法"]}
+        ]}"#;
+        let list = load_for_test(main, extra).unwrap();
+        assert!(list.entries.iter().any(|entry| entry.aliases.iter().any(|alias| alias == "自賠法")));
+        assert_eq!(list.entries.iter().filter(|entry| entry.law_id == "A").count(), 1);
+        assert!(list.entries.iter().any(|entry| entry.law_id == "B"));
+        assert!(load_for_test(main, "{").unwrap().entries.iter().any(|entry| entry.law_id == "A"));
+    }
+
+    fn load_for_test(main: &str, extra: &str) -> Result<AliasList, String> {
+        let mut list = parse_alias_list(main)?;
+        let _ = append_entries(&mut list, extra);
+        Ok(list)
     }
 }

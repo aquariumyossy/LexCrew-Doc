@@ -3,7 +3,7 @@
  * Law names come from the same catalog the Rust checker uses.
  */
 import catalog from "./lawCatalog.json";
-import { CATALOG_ALIASES, listedNameWins, type CatalogAlias } from "./statuteAliases";
+import { CATALOG_ALIASES, listedNameWins, longestListedName, type CatalogAlias } from "./statuteAliases";
 
 export const TOOL_RESULT_OMITTED = "（文脈の上限に達したため、この結果は省略しました）";
 export const TOOL_RESULT_TRUNCATION_NOTE = "…（長いので省略しました）";
@@ -595,7 +595,7 @@ function lawWindow(
   if (lead) {
     raw = raw.slice(lead.length);
   }
-  const name = lawNameAfterParticle(raw);
+  const name = peelLatinBeforeListedLaw(lawNameAfterParticle(raw));
   if (Array.from(name).length < 2) {
     return null;
   }
@@ -1178,6 +1178,42 @@ function isListMarker(inner: string): boolean {
 
 function isCircled(c: string): boolean {
   return /[①-⑳❶-❿㉑-㉟]/u.test(c);
+}
+
+function isLatinLetter(c: string): boolean {
+  return /[A-Za-z\uFF21-\uFF3A\uFF41-\uFF5A]/u.test(c);
+}
+
+/** `X民法` keeps 民法. `PL法` stays whole because that whole name is listed. */
+function peelLatinBeforeListedLaw(name: string): string {
+  if (CATALOG_ALIASES.some((hit) => hit.alias === name)) {
+    return name;
+  }
+  const listed = longestListedName(name);
+  if (!listed || listed === name) {
+    return peelLeadingLatinDeny(name);
+  }
+  const prefix = name.slice(0, name.length - listed.length);
+  const last = Array.from(prefix).pop() ?? "";
+  if (isLatinLetter(last)) {
+    return listed;
+  }
+  return peelLeadingLatinDeny(name);
+}
+
+function peelLeadingLatinDeny(name: string): string {
+  const chars = Array.from(name);
+  let latin = 0;
+  while (latin < chars.length && isLatinLetter(chars[latin])) {
+    latin += 1;
+  }
+  if (latin > 0 && latin < chars.length) {
+    const rest = chars.slice(latin).join("");
+    if (denyPhrase(rest)) {
+      return rest;
+    }
+  }
+  return name;
 }
 
 function isLawChar(c: string): boolean {

@@ -1001,6 +1001,16 @@ impl StatuteDb {
                 map.entry(alias).or_insert_with(|| law_id.clone());
             }
         }
+        // The shared list still resolves when the upsert could not write,
+        // for example a read-only database. Rows already stored win.
+        if let Ok(list) = catalog::alias_list() {
+            for entry in &list.entries {
+                for alias in &entry.aliases {
+                    map.entry(alias.clone())
+                        .or_insert_with(|| entry.law_id.clone());
+                }
+            }
+        }
         let mut entries: Vec<AliasHit> = map
             .into_iter()
             .map(|(alias, law_id)| AliasHit {

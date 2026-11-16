@@ -1380,6 +1380,7 @@ fn law_window(db: &StatuteDb, chars: &[char], cite_start: usize, floor: usize) -
     if text.chars().count() < 2 || is_connector(&text) {
         return None;
     }
+    let (text, start) = peel_latin_before_listed_law(text, start);
     let adjusted = adjust_douhou_window(db, chars, floor, end, start, text);
     Some(Window {
         start: adjusted.start,
@@ -1392,6 +1393,41 @@ struct DouhouAdjust {
     text: String,
     start: usize,
     force_ambiguous: bool,
+}
+
+fn is_latin_letter(c: char) -> bool {
+    matches!(
+        c,
+        'A'..='Z' | 'a'..='z' | '\u{FF21}'..='\u{FF3A}' | '\u{FF41}'..='\u{FF5A}'
+    )
+}
+
+/// `X民法` keeps 民法. `A違法` falls back to 違法 so the deny list still applies.
+/// `PL法` stays whole because that whole name is listed.
+fn peel_latin_before_listed_law(text: String, start: usize) -> (String, usize) {
+    if crate::statute::catalog::is_listed_name(&text) {
+        return (text, start);
+    }
+    if let Some(name) = crate::statute::catalog::longest_listed_name_suffix(&text) {
+        if name != text {
+            let prefix_bytes = text.len() - name.len();
+            if text.is_char_boundary(prefix_bytes) {
+                let prefix = &text[..prefix_bytes];
+                if prefix.chars().next_back().is_some_and(is_latin_letter) {
+                    let skip = prefix.chars().count();
+                    return (name.to_string(), start + skip);
+                }
+            }
+        }
+    }
+    let skipped = text.chars().take_while(|c| is_latin_letter(*c)).count();
+    if skipped > 0 {
+        let rest: String = text.chars().skip(skipped).collect();
+        if !rest.is_empty() && deny_phrase(&rest) {
+            return (rest, start + skipped);
+        }
+    }
+    (text, start)
 }
 
 fn is_cjk(c: char) -> bool {
@@ -1869,7 +1905,8 @@ fn matching_open_same_line(chars: &[char], close_at: usize, floor: usize) -> Opt
 
 fn paren_is_only_a_note(inner: &str) -> bool {
     let rest = strip_alias_clauses(&strip_promulgation_numbers(inner));
-    !rest.chars().any(is_law_char)
+    // Latin in a gloss such as （Subcontract Act） is still a note.
+    !rest.chars().any(|c| is_law_char(c) && !is_latin_letter(c))
 }
 
 fn same_law_alias(
@@ -3629,6 +3666,42 @@ mod tests {
         let kept = check_text(&db, &OfflineEgov, "取適法第3条", "2026-11-13", false);
         assert_eq!(kept.len(), 1, "{kept:?}");
         assert!(kept[0].citation.contains("取適法"), "{kept:?}");
+    }
+
+    #[test]
+    fn a_latin_letter_before_a_law_name_does_not_swallow_it() {
+        let db = db();
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2026-11-11",
+            "2026-11-11",
+            "bundle",
+            &["民法".into()],
+            &[article("709", "第709条", "不法行為の本文。")],
+        )
+        .unwrap();
+        for text in ["X民法第709条", "原告X民法第709条", "AI民法第709条", "被告Y民法第709条", "民法（Act No. 89 of 1896）第709条"] {
+            let hits = check_text(&db, &OfflineEgov, text, "2026-11-13", false);
+            assert_eq!(hits.len(), 1, "{text} {hits:?}");
+            assert_eq!(hits[0].label, "一致", "{text} {hits:?}");
+            assert!(hits[0].citation.contains("民法"), "{text} {hits:?}");
+            assert!(!hits[0].citation.contains("X民法"), "{text} {hits:?}");
+        }
+        for text in ["A違法第1条", "A適法第1条", "A方法第1条", "PDCA手法第1条", "Ｂ方法第1条"] {
+            let hits = check_text(&db, &OfflineEgov, text, "2026-11-13", false);
+            assert!(hits.is_empty(), "{text} {hits:?}");
+        }
+        let gloss = check_text(&db, &OfflineEgov, "取適法（Subcontract Act）第3条", "2026-11-13", false);
+        assert_eq!(gloss.len(), 1, "{gloss:?}");
+        assert!(gloss[0].citation.contains("取適法"), "{gloss:?}");
+        let unknown = check_text(&db, &OfflineEgov, "ＸＹＺ法第1条", "2026-11-13", false);
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert!(unknown[0].citation.contains("ＸＹＺ法"), "{unknown:?}");
+        let pl = check_text(&db, &OfflineEgov, "PL法第3条", "2026-11-13", false);
+        assert_eq!(pl.len(), 1, "{pl:?}");
+        assert!(pl[0].citation.contains("PL法"), "{pl:?}");
     }
 
     #[test]

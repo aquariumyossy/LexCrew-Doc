@@ -151,7 +151,11 @@ mod tests {
         assert!(service.enabled.load(Ordering::Relaxed));
         let civil = service.db.resolve_name("民法").unwrap().expect("民法");
         assert_eq!(civil.law_id, "129AC0000000089");
-        assert!(service.db.resolve_name("自賠法").unwrap().is_none());
+        let jibai = service.db.resolve_name("自賠法").unwrap().expect("自賠法");
+        assert_eq!(jibai.law_id, "330AC0000000097");
+        let hits = check_text(&service.db, &OfflineEgov, "自賠法第3条", "2026-11-13", false);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].reason, "未取得（オフライン）", "{hits:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -43,8 +43,13 @@ export function splitAlias(raw: string): string[] {
 function loadEntries(entries: Entry[]): CatalogAlias[] {
   const out: CatalogAlias[] = [];
   const seen = new Set<string>();
+  const seenIds = new Set<string>();
   for (const entry of entries) {
     const id = entry.law_id.trim();
+    if (seenIds.has(id)) {
+      continue;
+    }
+    seenIds.add(id);
     const canonical = normalizeAlias(entry.name);
     const aliases = [canonical, ...(entry.aliases ?? []).flatMap((alias) => splitAlias(alias))];
     for (const alias of aliases) {

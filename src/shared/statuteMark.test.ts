@@ -237,6 +237,16 @@ describe("markUnverified", () => {
     expect(markUnverified("方法第1条。", [])).not.toContain("要確認");
     expect(markUnverified("寫法第1条。", [])).not.toContain("要確認");
     expect(markUnverified("写法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("X民法第709条", [{ names: ["民法"], key: "709" }])).not.toContain("要確認");
+    expect(markUnverified("原告X民法第709条", [{ names: ["民法"], key: "709" }])).not.toContain("要確認");
+    expect(markUnverified("被告Y民法第709条", [{ names: ["民法"], key: "709" }])).not.toContain("要確認");
+    expect(markUnverified("A取適法第3条", [{ names: ["取適法"], key: "3" }])).not.toContain("要確認");
+    expect(markUnverified("民法（Act No. 89 of 1896）第709条", [{ names: ["民法"], key: "709" }])).not.toContain("要確認");
+    expect(markUnverified("A違法第1条", [])).not.toContain("要確認");
+    expect(markUnverified("PDCA手法第1条", [])).not.toContain("要確認");
+    expect(markUnverified("Ｂ方法第1条", [])).not.toContain("要確認");
+    expect(markUnverified("ＸＹＺ法第1条。", [])).toContain("ＸＹＺ法第1条（要確認）");
+    expect(markUnverified("PL法第3条。", [])).toContain("PL法第3条（要確認）");
     const group = markUnverified("労働三法第1条。", [verifiedCite(["労働組合法", "労組法"], "1")]);
     expect(group).toContain("労働三法第1条（要確認）");
     expect(GROUP_LABELS).toContain("労働三法");

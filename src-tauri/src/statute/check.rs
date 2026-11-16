@@ -3724,6 +3724,19 @@ mod tests {
                 assert!(hits.is_empty(), "{text} {hits:?}");
             }
         }
+        for (text, name) in [
+            ("は農業協同組合法第1条。", "農業協同組合法"),
+            ("は独禁法第1条。", "独禁法"),
+            ("は協同組合法第1条。", "協同組合法"),
+            ("は行手法第1条。", "行手法"),
+        ] {
+            let hits = check_text(&db, &OfflineEgov, text, "2026-11-13", false);
+            assert_eq!(hits.len(), 1, "{text} {hits:?}");
+            assert!(hits[0].citation.contains(name), "{text} {hits:?}");
+        }
+        let first = catalog::alias_list().unwrap() as *const _;
+        let second = catalog::alias_list().unwrap() as *const _;
+        assert_eq!(first, second);
     }
 
     #[test]

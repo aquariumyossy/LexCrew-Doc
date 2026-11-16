@@ -258,6 +258,10 @@ describe("markUnverified", () => {
       expect(markUnverified(sample, []), sample).toBe(sample);
     }
     expect(markUnverified("は取適法第3条。", [])).toContain("取適法第3条（要確認）");
+    expect(markUnverified("は農業協同組合法第1条。", [])).toContain("農業協同組合法第1条（要確認）");
+    expect(markUnverified("は独禁法第1条。", [])).toContain("独禁法第1条（要確認）");
+    expect(markUnverified("は協同組合法第1条。", [])).toContain("協同組合法第1条（要確認）");
+    expect(markUnverified("は行手法第1条。", [])).toContain("行手法第1条（要確認）");
     expect(
       markUnverified("民法第709条（取適法の適用を除く。）及び同法第710条", [
         { names: ["民法"], key: "709" },

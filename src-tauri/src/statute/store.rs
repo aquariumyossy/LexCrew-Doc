@@ -1926,12 +1926,33 @@ mod tests {
             assert!(db.resolve_name("自賠法").unwrap().is_some());
             let started = std::time::Instant::now();
             db.import_seed().unwrap();
+            db.set_meta("guri_probe", "still-writable").unwrap();
+            assert_eq!(db.meta("guri_probe").unwrap(), "still-writable");
             let elapsed = started.elapsed();
             eprintln!("second alias sync {elapsed:?}");
-        assert!(
-            elapsed.as_millis() < 2_000,
-            "second sync took {elapsed:?}"
-        );
+            assert!(
+                elapsed.as_millis() < 2_000,
+                "second sync took {elapsed:?}"
+            );
+        }
+        {
+            let db = StatuteDb::open(&path).unwrap();
+            db.set_meta("guri_probe", "reopened-writable").unwrap();
+            assert_eq!(db.meta("guri_probe").unwrap(), "reopened-writable");
+        }
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let opened = StatuteDb::open(&path);
+        match &opened {
+            Ok(db) => {
+                assert!(db.resolve_name("民法").unwrap().is_some());
+                assert!(db.resolve_name("自賠法").unwrap().is_some());
+            }
+            Err(err) => {
+                panic!("read-only statute db disabled open: {err}");
+            }
+        }
     }
 
     #[test]
@@ -1963,19 +1984,9 @@ mod tests {
             db.resolve_name("入管法").unwrap().unwrap().law_id,
             "326CO0000000319"
         );
-    }
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&path, perms).unwrap();
-        let opened = StatuteDb::open(&path);
-        match &opened {
-            Ok(db) => {
-                assert!(db.resolve_name("民法").unwrap().is_some());
-                assert!(db.resolve_name("自賠法").unwrap().is_some());
-            }
-            Err(err) => {
-                panic!("read-only statute db disabled open: {err}");
-            }
-        }
+        assert_eq!(
+            db.resolve_name("独禁法").unwrap().unwrap().law_id,
+            "322AC0000000054"
+        );
     }
 }

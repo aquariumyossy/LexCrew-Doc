@@ -232,6 +232,11 @@ describe("markUnverified", () => {
     }
     expect(markUnverified("不適法第1条。", [])).not.toContain("要確認");
     expect(markUnverified("非適法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("違法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("適法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("方法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("寫法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("写法第1条。", [])).not.toContain("要確認");
     const group = markUnverified("労働三法第1条。", [verifiedCite(["労働組合法", "労組法"], "1")]);
     expect(group).toContain("労働三法第1条（要確認）");
     expect(GROUP_LABELS).toContain("労働三法");

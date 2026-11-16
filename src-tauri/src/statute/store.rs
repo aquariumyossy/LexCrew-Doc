@@ -1847,4 +1847,36 @@ mod tests {
             .unwrap();
         assert_eq!(again, count, "applying the alias list twice changed rows");
     }
+
+    #[test]
+    fn a_second_sync_is_fast_and_a_read_only_file_stays_usable() {
+        let dir = TempDir::new();
+        let path = dir.path().join("statutes.db");
+        {
+            let db = StatuteDb::open(&path).unwrap();
+            assert!(db.resolve_name("民法").unwrap().is_some());
+            assert!(db.resolve_name("自賠法").unwrap().is_some());
+            let started = std::time::Instant::now();
+            db.import_seed().unwrap();
+            let elapsed = started.elapsed();
+            eprintln!("second alias sync {elapsed:?}");
+            assert!(
+                elapsed.as_millis() < 2_000,
+                "second sync took {elapsed:?}"
+            );
+        }
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let opened = StatuteDb::open(&path);
+        match &opened {
+            Ok(db) => {
+                assert!(db.resolve_name("民法").unwrap().is_some());
+                assert!(db.resolve_name("自賠法").unwrap().is_some());
+            }
+            Err(err) => {
+                panic!("read-only statute db disabled open: {err}");
+            }
+        }
+    }
 }

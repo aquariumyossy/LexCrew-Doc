@@ -29,7 +29,7 @@ pub(crate) static EAGER_NOTES: std::sync::atomic::AtomicBool =
 const UNCONFIRMED_MATCH_LABEL: &str = "一致";
 
 pub(crate) const DENY_LAW_NAME: &[&str] = &[
-    "方法", "手法", "療法", "用法", "違法", "適法", "不適法", "非適法", "合法", "魔法", "司法", "立法",
+    "方法", "手法", "寫法", "写法", "療法", "用法", "違法", "適法", "不適法", "非適法", "合法", "魔法", "司法", "立法",
     "憲法改正", "不法",
 ];
 
@@ -3617,6 +3617,18 @@ mod tests {
         assert!(db.resolve_name("組織犯罪対策三法").unwrap().is_none());
         assert!(db.resolve_name("保安四法").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ordinary_words_are_not_law_citations() {
+        let db = db();
+        for word in ["不適法", "非適法", "違法", "適法", "方法", "寫法", "写法"] {
+            let hits = check_text(&db, &OfflineEgov, &format!("{word}第1条"), "2026-11-13", false);
+            assert!(hits.is_empty(), "{word} {hits:?}");
+        }
+        let kept = check_text(&db, &OfflineEgov, "取適法第3条", "2026-11-13", false);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].citation.contains("取適法"), "{kept:?}");
     }
 
     #[test]

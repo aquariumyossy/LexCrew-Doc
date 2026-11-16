@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { GROUP_LABELS, splitAlias } from "./statuteAliases";
 import {
   markAnswer,
   markDelivered,
@@ -205,4 +206,90 @@ describe("markUnverified", () => {
     expect(markUnverified("施行法第1条", known)).toContain("（要確認）");
     expect(markUnverified("整備法第1条", known)).toContain("（要確認）");
   });
+
+  it("resolves shared abbreviations and does not treat deny words or group labels as laws", () => {
+    const unverified = [
+      "自賠法第3条は運行供用者の責任です。",
+      "個人情報保護法第27条は第三者提供です。",
+      "フリーランス法第3条は報酬です。",
+      "取適法第3条は支払時期です。",
+      "PL法第3条は欠陥の責任です。",
+      "ＰＬ法第3条は欠陥の責任です。",
+    ];
+    for (const sample of unverified) {
+      expect(markUnverified(sample, []), sample).toContain("（要確認）");
+    }
+    const verified = [
+      ["自賠法第3条は運行供用者の責任です。", ["自動車損害賠償保障法", "自賠法"], "3"],
+      ["個人情報保護法第27条は第三者提供です。", ["個人情報の保護に関する法律"], "27"],
+      ["フリーランス法第3条は報酬です。", ["特定受託事業者に係る取引の適正化等に関する法律", "フリーランス法"], "3"],
+      ["取適法第3条は支払時期です。", ["製造委託等に係る中小受託事業者に対する代金の支払の遅延等の防止に関する法律"], "3"],
+      ["PL法第3条は欠陥の責任です。", ["製造物責任法", "PL法"], "3"],
+      ["ＰＬ法第3条は欠陥の責任です。", ["製造物責任法", "ＰＬ法"], "3"],
+    ] as const;
+    for (const [sample, names, key] of verified) {
+      expect(markUnverified(sample, [verifiedCite(names, key)]), sample).not.toContain("要確認");
+    }
+    expect(markUnverified("不適法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("非適法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("違法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("適法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("方法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("寫法第1条。", [])).not.toContain("要確認");
+    expect(markUnverified("写法第1条。", [])).not.toContain("要確認");
+    for (const [sample, names, key] of [
+      ["X民法第709条", ["民法"], "709"],
+      ["原告X民法第709条", ["民法"], "709"],
+      ["被告Y民法第709条", ["民法"], "709"],
+      ["AI民法第709条", ["民法"], "709"],
+      ["JR会社法第1条", ["会社法"], "1"],
+      ["US特許法第101条", ["特許法"], "101"],
+      ["A取適法第3条", ["取適法"], "3"],
+    ] as const) {
+      expect(markUnverified(sample, [{ names: [...names], key }]), sample).toContain(`${sample}（要確認）`);
+    }
+    expect(markUnverified("民法（Act No. 89 of 1896）第709条", [{ names: ["民法"], key: "709" }])).not.toContain("要確認");
+    expect(markUnverified("A違法第1条", [])).not.toContain("要確認");
+    expect(markUnverified("PDCA手法第1条", [])).not.toContain("要確認");
+    expect(markUnverified("Ｂ方法第1条", [])).not.toContain("要確認");
+    expect(markUnverified("ＸＹＺ法第1条。", [])).toContain("ＸＹＺ法第1条（要確認）");
+    expect(markUnverified("PL法第3条。", [])).toContain("PL法第3条（要確認）");
+    for (const sample of [
+      "訴えは不適法第1条。",
+      "手続は非適法第1条。",
+      "行為は違法第1条。",
+      "処分は適法第1条。",
+      "契約の方法第1条。",
+      "この寫法第1条。",
+    ]) {
+      expect(markUnverified(sample, []), sample).toBe(sample);
+    }
+    expect(markUnverified("は取適法第3条。", [])).toContain("取適法第3条（要確認）");
+    expect(markUnverified("は農業協同組合法第1条。", [])).toContain("農業協同組合法第1条（要確認）");
+    expect(markUnverified("は独禁法第1条。", [])).toContain("独禁法第1条（要確認）");
+    expect(markUnverified("は協同組合法第1条。", [])).toContain("協同組合法第1条（要確認）");
+    expect(markUnverified("は行手法第1条。", [])).toContain("行手法第1条（要確認）");
+    expect(
+      markUnverified("民法第709条（取適法の適用を除く。）及び同法第710条", [
+        { names: ["民法"], key: "709" },
+        { names: ["民法"], key: "710" },
+      ])
+    ).toContain("同法第710条（要確認）");
+    expect(markUnverified("行手法第1条。", [])).toContain("行手法第1条（要確認）");
+    expect(markUnverified("民法第1条。『入管法』は重要である。同法第1条。", [{ names: ["民法"], key: "1" }])).toContain(
+      "同法第1条（要確認）"
+    );
+    const group = markUnverified("労働三法第1条。", [verifiedCite(["労働組合法", "労組法"], "1")]);
+    expect(group).toContain("労働三法第1条（要確認）");
+    expect(GROUP_LABELS).toContain("労働三法");
+    expect(GROUP_LABELS).toContain("組織犯罪対策三法");
+    expect(GROUP_LABELS).toContain("保安四法");
+    expect(
+      splitAlias("労組法,労働三法,労安衛法,保安四法,安衛法,訪問販売、通信販売、マルチ販売等法")
+    ).toEqual(["労組法", "労安衛法", "安衛法", "訪問販売、通信販売、マルチ販売等法"]);
+  });
 });
+
+function verifiedCite(names: readonly string[], key: string): VerifiedCite {
+  return { names: [...names], key };
+}

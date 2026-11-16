@@ -3,24 +3,14 @@
  * Law names come from the same catalog the Rust checker uses.
  */
 import catalog from "./lawCatalog.json";
+import { CATALOG_ALIASES, listedNameWins, type CatalogAlias } from "./statuteAliases";
 
 export const TOOL_RESULT_OMITTED = "（文脈の上限に達したため、この結果は省略しました）";
 export const TOOL_RESULT_TRUNCATION_NOTE = "…（長いので省略しました）";
 
 const DENY_LAW_NAME = catalog.deny;
 const DENY_LAW_ENDING = catalog.denyEnding;
-
-type CatalogAlias = { alias: string; id: string; canonical: string };
-
-const CATALOG_ALIASES: CatalogAlias[] = catalog.laws
-  .flatMap((law) =>
-    law.aliases.map((alias) => ({
-      alias,
-      id: law.id,
-      canonical: law.aliases[0],
-    }))
-  )
-  .sort((a, b) => Array.from(b.alias).length - Array.from(a.alias).length);
+const DENY_ALL = [...DENY_LAW_NAME, ...DENY_LAW_ENDING];
 
 export type VerifiedCite = { names: string[]; key: string };
 
@@ -309,7 +299,9 @@ export function markUnverified(answer: string, verified: VerifiedCite[]): string
     }
     const ok =
       !suppl &&
-      verified.some((item) => item.key === span.key && item.names.some((candidate) => candidate === name));
+      verified.some(
+        (item) => item.key === span.key && item.names.some((candidate) => sameVerifiedName(candidate, name))
+      );
     if (!ok && !alreadyMarked(chars, span.end)) {
       inserts.push(span.end);
     }
@@ -353,19 +345,52 @@ export function markAnswer(answer: string, toolResults: string[]): string {
   );
 }
 
+function sameVerifiedName(candidate: string, name: string): boolean {
+  if (candidate === name) {
+    return true;
+  }
+  const left = resolveCatalog(candidate);
+  const right = resolveCatalog(name);
+  return Boolean(left && right && left.id === right.id);
+}
+
 function deniedToken(window: string): boolean {
   const name = window.startsWith("改正")
     ? window.slice(2)
     : window.startsWith("現行")
       ? window.slice(2)
       : window;
-  if (resolveCatalog(name)) {
+  if (listedNameWins(name, DENY_ALL) || resolveCatalog(name)) {
     return false;
   }
-  if (DENY_LAW_NAME.includes(name)) {
+  return denyPhrase(name);
+}
+
+const STATUTE_TITLE_SUFFIX = ["法律", "規則", "条例", "憲法", "法", "令"];
+
+function longerStatuteTitle(name: string): boolean {
+  const count = Array.from(name).length;
+  return STATUTE_TITLE_SUFFIX.some((suffix) => name.endsWith(suffix) && count > Array.from(suffix).length);
+}
+
+function denyPhrase(name: string): boolean {
+  if (DENY_LAW_ENDING.some((deny) => name.endsWith(deny))) {
     return true;
   }
-  return DENY_LAW_ENDING.some((deny) => name.endsWith(deny));
+  return DENY_LAW_NAME.some((deny) => {
+    if (name === deny) {
+      return true;
+    }
+    if (!name.endsWith(deny)) {
+      return false;
+    }
+    const prefix = name.slice(0, name.length - deny.length);
+    const before = Array.from(prefix).pop() ?? "";
+    if (isKanji(before)) {
+      return !longerStatuteTitle(name);
+    }
+    return true;
+  });
 }
 
 function douhouIsAmbiguous(stack: EnumFrame[]): boolean {
@@ -408,7 +433,7 @@ function prefixOk(before: string): boolean {
   }
   if (before.endsWith("改正") || before.endsWith("現行") || before.endsWith("新")) {
     const rest = before.replace(/(改正|現行|新)$/u, "");
-    return rest.length === 0 || /[。、，・（）「」\sはをにがとのやもへでか]/u.test(rest.slice(-1));
+    return rest.length === 0 || /[。、，・（）「」『』\sはをにがとのやもへでか]/u.test(rest.slice(-1));
   }
   if (NAME_PARTICLES.some((particle) => before.endsWith(particle))) {
     return true;
@@ -416,7 +441,7 @@ function prefixOk(before: string): boolean {
   if (JOINERS.some((conn) => before.endsWith(conn))) {
     return true;
   }
-  return /[。、，・（）「」\sはをにがとのやもへでか]/u.test(before.slice(-1));
+  return /[。、，・（）「」『』\sはをにがとのやもへでか]/u.test(before.slice(-1));
 }
 
 function resolveCatalog(window: string): CatalogAlias | null {
@@ -583,7 +608,7 @@ function lawWindow(
   if (lead) {
     raw = raw.slice(lead.length);
   }
-  const name = lawNameAfterParticle(raw);
+  const name = peelLatinBeforeListedLaw(lawNameAfterParticle(raw));
   if (Array.from(name).length < 2) {
     return null;
   }
@@ -609,6 +634,9 @@ function douhouBoundary(prefix: string): boolean {
 }
 
 function denyTail(head: string): boolean {
+  if (listedNameWins(head, DENY_ALL)) {
+    return false;
+  }
   return DENY_LAW_NAME.some((deny) => head.endsWith(deny)) || DENY_LAW_ENDING.some((deny) => head.endsWith(deny));
 }
 
@@ -1067,10 +1095,24 @@ function stripNestedNotes(text: string): string {
 
 function withoutDenied(text: string): string {
   let out = text;
+  const saved: { token: string; name: string }[] = [];
+  const names = CATALOG_ALIASES.map((hit) => hit.alias)
+    .filter((alias) => DENY_LAW_NAME.some((deny) => alias.includes(deny)))
+    .sort((a, b) => Array.from(b).length - Array.from(a).length);
+  names.forEach((name, index) => {
+    if (out.includes(name)) {
+      const token = `\uE000${index}\uE001`;
+      out = out.split(name).join(token);
+      saved.push({ token, name });
+    }
+  });
   for (const deny of DENY_LAW_NAME) {
     if (out.includes(deny)) {
       out = out.split(deny).join(" ");
     }
+  }
+  for (const item of saved) {
+    out = out.split(item.token).join(item.name);
   }
   return out;
 }
@@ -1165,8 +1207,35 @@ function isCircled(c: string): boolean {
   return /[①-⑳❶-❿㉑-㉟]/u.test(c);
 }
 
+function isLatinLetter(c: string): boolean {
+  return /[A-Za-z\uFF21-\uFF3A\uFF41-\uFF5A]/u.test(c);
+}
+
+/** `PL法` stays whole because that whole name is listed. `JR会社法` and `X民法` stay whole too. */
+function peelLatinBeforeListedLaw(name: string): string {
+  if (CATALOG_ALIASES.some((hit) => hit.alias === name)) {
+    return name;
+  }
+  return peelLeadingLatinDeny(name);
+}
+
+function peelLeadingLatinDeny(name: string): string {
+  const chars = Array.from(name);
+  let latin = 0;
+  while (latin < chars.length && isLatinLetter(chars[latin])) {
+    latin += 1;
+  }
+  if (latin > 0 && latin < chars.length) {
+    const rest = chars.slice(latin).join("");
+    if (denyPhrase(rest)) {
+      return rest;
+    }
+  }
+  return name;
+}
+
 function isLawChar(c: string): boolean {
-  return /[\u3400-\u9fff\u3040-\u30ff々、，]/u.test(c);
+  return /[\u3400-\u9fff\u3040-\u30ff々、，A-Za-z\uFF21-\uFF3A\uFF41-\uFF5A]/u.test(c);
 }
 
 function alreadyMarked(chars: string[], end: number): boolean {

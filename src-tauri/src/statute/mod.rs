@@ -132,4 +132,30 @@ mod tests {
         assert!(!service.enabled.load(Ordering::Relaxed));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn a_failed_alias_sync_does_not_disable_statutes() {
+        let dir = std::env::temp_dir().join(format!(
+            "guri-statute-alias-sync-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = StatuteService::open_offline(&dir).unwrap();
+        super::store::fail_next_alias_sync();
+        prepare_service(&service).unwrap();
+        assert!(service.enabled.load(Ordering::Relaxed));
+        let civil = service.db.resolve_name("民法").unwrap().expect("民法");
+        assert_eq!(civil.law_id, "129AC0000000089");
+        let jibai = service.db.resolve_name("自賠法").unwrap().expect("自賠法");
+        assert_eq!(jibai.law_id, "330AC0000000097");
+        let hits = check_text(&service.db, &OfflineEgov, "自賠法第3条", "2026-11-13", false);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].reason, "未取得（オフライン）", "{hits:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

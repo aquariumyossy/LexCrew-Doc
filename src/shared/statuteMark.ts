@@ -377,7 +377,20 @@ function denyPhrase(name: string): boolean {
   if (DENY_LAW_ENDING.some((deny) => name.endsWith(deny))) {
     return true;
   }
-  return DENY_LAW_NAME.some((deny) => name === deny || (name.endsWith(deny) && !longerStatuteTitle(name)));
+  return DENY_LAW_NAME.some((deny) => {
+    if (name === deny) {
+      return true;
+    }
+    if (!name.endsWith(deny)) {
+      return false;
+    }
+    const prefix = name.slice(0, name.length - deny.length);
+    const before = Array.from(prefix).pop() ?? "";
+    if (isKanji(before)) {
+      return !longerStatuteTitle(name);
+    }
+    return true;
+  });
 }
 
 function douhouIsAmbiguous(stack: EnumFrame[]): boolean {
@@ -420,7 +433,7 @@ function prefixOk(before: string): boolean {
   }
   if (before.endsWith("改正") || before.endsWith("現行") || before.endsWith("新")) {
     const rest = before.replace(/(改正|現行|新)$/u, "");
-    return rest.length === 0 || /[。、，・（）「」\sはをにがとのやもへでか]/u.test(rest.slice(-1));
+    return rest.length === 0 || /[。、，・（）「」『』\sはをにがとのやもへでか]/u.test(rest.slice(-1));
   }
   if (NAME_PARTICLES.some((particle) => before.endsWith(particle))) {
     return true;
@@ -428,7 +441,7 @@ function prefixOk(before: string): boolean {
   if (JOINERS.some((conn) => before.endsWith(conn))) {
     return true;
   }
-  return /[。、，・（）「」\sはをにがとのやもへでか]/u.test(before.slice(-1));
+  return /[。、，・（）「」『』\sはをにがとのやもへでか]/u.test(before.slice(-1));
 }
 
 function resolveCatalog(window: string): CatalogAlias | null {
@@ -1082,10 +1095,24 @@ function stripNestedNotes(text: string): string {
 
 function withoutDenied(text: string): string {
   let out = text;
+  const saved: { token: string; name: string }[] = [];
+  const names = CATALOG_ALIASES.map((hit) => hit.alias)
+    .filter((alias) => DENY_LAW_NAME.some((deny) => alias.includes(deny)))
+    .sort((a, b) => Array.from(b).length - Array.from(a).length);
+  names.forEach((name, index) => {
+    if (out.includes(name)) {
+      const token = `\uE000${index}\uE001`;
+      out = out.split(name).join(token);
+      saved.push({ token, name });
+    }
+  });
   for (const deny of DENY_LAW_NAME) {
     if (out.includes(deny)) {
       out = out.split(deny).join(" ");
     }
+  }
+  for (const item of saved) {
+    out = out.split(item.token).join(item.name);
   }
   return out;
 }

@@ -46,18 +46,23 @@ pub struct AliasList {
     pub entries: Vec<CatalogEntry>,
 }
 
-static LIST: OnceLock<AliasList> = OnceLock::new();
+static LIST: OnceLock<Result<AliasList, String>> = OnceLock::new();
 
 pub fn alias_list() -> Result<&'static AliasList, String> {
-    if let Some(list) = LIST.get() {
-        return Ok(list);
+    let stored = LIST.get_or_init(|| match parse_alias_list(ALIAS_JSON) {
+        Ok(mut list) => {
+            // A bad extra row must not throw away the main list.
+            if let Err(err) = append_entries(&mut list, EXTRAS_JSON) {
+                eprintln!("guri: extra statute aliases were not applied: {err}");
+            }
+            Ok(list)
+        }
+        Err(err) => Err(err),
+    });
+    match stored {
+        Ok(list) => Ok(list),
+        Err(err) => Err(err.clone()),
     }
-    let mut list = parse_alias_list(ALIAS_JSON)?;
-    // A bad extra row must not throw away the main list.
-    if let Err(err) = append_entries(&mut list, EXTRAS_JSON) {
-        eprintln!("guri: extra statute aliases were not applied: {err}");
-    }
-    Ok(LIST.get_or_init(|| list))
 }
 
 #[cfg(test)]

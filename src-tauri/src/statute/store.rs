@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::statute::catalog;
 use crate::statute::refresh::parse_ymd;
@@ -130,6 +130,8 @@ pub struct StatuteDb {
     aliases: Mutex<Option<Vec<AliasHit>>>,
     law_cache: Mutex<HashMap<String, LawRef>>,
     dirty: Mutex<IndexDirty>,
+    probe_notes: Mutex<HashMap<String, (i64, String)>>,
+    probed_on: Mutex<HashMap<String, String>>,
 }
 
 #[allow(dead_code)]
@@ -142,29 +144,29 @@ impl StatuteDb {
 
     pub fn open_empty(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if std::fs::create_dir_all(parent).is_err() && !path.exists() {
+                return Err("法令DBのフォルダを作れませんでした".into());
+            }
         }
-        let conn = Connection::open(path).map_err(|e| e.to_string())?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| e.to_string())?;
-        conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-            aliases: Mutex::new(None),
-            law_cache: Mutex::new(HashMap::new()),
-            dirty: Mutex::new(IndexDirty::default()),
-        })
+        let conn = open_statute_connection(path)?;
+        Ok(Self::from_connection(conn))
     }
 
     pub fn open_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-        Ok(Self {
+        Ok(Self::from_connection(conn))
+    }
+
+    fn from_connection(conn: Connection) -> Self {
+        Self {
             conn: Mutex::new(conn),
             aliases: Mutex::new(None),
             law_cache: Mutex::new(HashMap::new()),
             dirty: Mutex::new(IndexDirty::default()),
-        })
+            probe_notes: Mutex::new(HashMap::new()),
+            probed_on: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn import_seed(&self) -> Result<(), String> {
@@ -246,14 +248,24 @@ impl StatuteDb {
     }
 
     pub fn note_probe_failure(&self, law_id: &str, key: &str, note: &str) -> Result<(), String> {
+        let stamp = chrono::Utc::now().timestamp();
+        self.probe_notes
+            .lock()
+            .insert(format!("{law_id}:{key}"), (stamp, note.to_string()));
         self.set_meta(
             &format!("probe_fail:{law_id}:{key}"),
-            &format!("{}\n{note}", chrono::Utc::now().timestamp()),
+            &format!("{stamp}\n{note}"),
         )
     }
 
     /// A failed currency probe. The next check inside an hour reuses the saved text.
     pub fn probe_failure_is_fresh(&self, law_id: &str, key: &str) -> bool {
+        let memory_key = format!("{law_id}:{key}");
+        if let Some((checked, _)) = self.probe_notes.lock().get(&memory_key) {
+            if chrono::Utc::now().timestamp().saturating_sub(*checked) < 60 * 60 {
+                return true;
+            }
+        }
         let raw = self
             .meta(&format!("probe_fail:{law_id}:{key}"))
             .unwrap_or_default();
@@ -269,6 +281,11 @@ impl StatuteDb {
     pub fn probe_failure_note(&self, law_id: &str, key: &str) -> Option<String> {
         if !self.probe_failure_is_fresh(law_id, key) {
             return None;
+        }
+        if let Some((_, note)) = self.probe_notes.lock().get(&format!("{law_id}:{key}")) {
+            if !note.is_empty() {
+                return Some(note.clone());
+            }
         }
         let raw = self
             .meta(&format!("probe_fail:{law_id}:{key}"))
@@ -500,6 +517,9 @@ impl StatuteDb {
     }
 
     pub fn mark_probed(&self, law_id: &str, key: &str, today: &str) -> Result<(), String> {
+        self.probed_on
+            .lock()
+            .insert(format!("{law_id}:{key}"), today.to_string());
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE article SET probed_on = ?3 WHERE law_id = ?1 AND article_key = ?2",
@@ -526,14 +546,24 @@ impl StatuteDb {
 
     pub fn lookup_article(&self, law_id: &str, key: &str) -> Result<Option<ArticleRow>, String> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT law_id, article_key, article_num, heading, body, as_of, probed_on, suppl
-             FROM article WHERE law_id = ?1 AND article_key = ?2",
-            params![law_id, key],
-            read_article,
-        )
-        .optional()
-        .map_err(|e| e.to_string())
+        let mut row = conn
+            .query_row(
+                "SELECT law_id, article_key, article_num, heading, body, as_of, probed_on, suppl
+                 FROM article WHERE law_id = ?1 AND article_key = ?2",
+                params![law_id, key],
+                read_article,
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        drop(conn);
+        if let Some(article) = row.as_mut() {
+            if article.probed_on.is_empty() {
+                if let Some(day) = self.probed_on.lock().get(&format!("{law_id}:{key}")) {
+                    article.probed_on = day.clone();
+                }
+            }
+        }
+        Ok(row)
     }
 
     pub fn articles_for(&self, law_id: &str) -> Result<Vec<ArticleRow>, String> {
@@ -1263,6 +1293,34 @@ pub(crate) fn law_name_after_particle(text: &str) -> &str {
     }
 }
 
+fn open_statute_connection(path: &Path) -> Result<Connection, String> {
+    if let Ok(conn) = Connection::open(path) {
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        if conn.execute_batch(SCHEMA).is_ok() {
+            return Ok(conn);
+        }
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| e.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    let ready: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'law'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(false);
+    if ready {
+        Ok(conn)
+    } else {
+        Err("法令DBを開けませんでした".into())
+    }
+}
+
 fn is_name_boundary(c: char) -> bool {
     c.is_whitespace()
         || matches!(
@@ -1870,11 +1928,42 @@ mod tests {
             db.import_seed().unwrap();
             let elapsed = started.elapsed();
             eprintln!("second alias sync {elapsed:?}");
-            assert!(
-                elapsed.as_millis() < 2_000,
-                "second sync took {elapsed:?}"
-            );
+        assert!(
+            elapsed.as_millis() < 2_000,
+            "second sync took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_seed_file_still_resolves_shared_aliases() {
+        let dir = TempDir::new();
+        let path = dir.path().join("statutes.db");
+        {
+            let mut decoder = flate2::read::GzDecoder::new(SEED);
+            let mut file = std::fs::File::create(&path).unwrap();
+            std::io::copy(&mut decoder, &mut file).unwrap();
         }
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let db = StatuteDb::open(&path).unwrap();
+        assert_eq!(
+            db.resolve_name("民法").unwrap().unwrap().law_id,
+            "129AC0000000089"
+        );
+        assert_eq!(
+            db.resolve_name("自賠法").unwrap().unwrap().law_id,
+            "330AC0000000097"
+        );
+        assert_eq!(
+            db.resolve_name("行手法").unwrap().unwrap().law_id,
+            "405AC0000000088"
+        );
+        assert_eq!(
+            db.resolve_name("入管法").unwrap().unwrap().law_id,
+            "326CO0000000319"
+        );
+    }
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_readonly(true);
         std::fs::set_permissions(&path, perms).unwrap();

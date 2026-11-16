@@ -840,10 +840,33 @@ fn strip_nested_notes(text: &str) -> String {
 
 fn without_denied(text: &str) -> String {
     let mut out = text.to_string();
+    let mut saved = Vec::new();
+    if let Ok(list) = crate::statute::catalog::alias_list() {
+        let mut names = Vec::new();
+        for entry in &list.entries {
+            for alias in &entry.aliases {
+                if DENY_LAW_NAME.iter().any(|deny| alias.contains(deny)) {
+                    names.push(alias.as_str());
+                }
+            }
+        }
+        names.sort_by_key(|name| std::cmp::Reverse(name.len()));
+        names.dedup();
+        for (index, name) in names.iter().enumerate() {
+            if out.contains(name) {
+                let token = format!("\u{E000}{index}\u{E001}");
+                out = out.replace(name, &token);
+                saved.push((token, (*name).to_string()));
+            }
+        }
+    }
     for deny in DENY_LAW_NAME {
         if out.contains(deny) {
             out = out.replace(deny, " ");
         }
+    }
+    for (token, name) in saved {
+        out = out.replace(&token, &name);
     }
     out
 }
@@ -1602,8 +1625,26 @@ fn deny_phrase(name: &str) -> bool {
         return true;
     }
     DENY_LAW_NAME.iter().any(|deny| {
-        name == *deny || (name.ends_with(deny) && !longer_statute_title(name))
+        if name == *deny {
+            return true;
+        }
+        if !name.ends_with(deny) {
+            return false;
+        }
+        // 訴えは不適法 is the deny word after は. 協同組合法 keeps 合法 inside the title.
+        if char_before_suffix_is_cjk(name, deny) {
+            return !longer_statute_title(name);
+        }
+        true
     })
+}
+
+fn char_before_suffix_is_cjk(name: &str, suffix: &str) -> bool {
+    let prefix_bytes = name.len() - suffix.len();
+    if !name.is_char_boundary(prefix_bytes) {
+        return false;
+    }
+    name[..prefix_bytes].chars().next_back().is_some_and(is_cjk)
 }
 
 fn denied(db: &StatuteDb, window: &str) -> bool {
@@ -3666,6 +3707,64 @@ mod tests {
         let kept = check_text(&db, &OfflineEgov, "取適法第3条", "2026-11-13", false);
         assert_eq!(kept.len(), 1, "{kept:?}");
         assert!(kept[0].citation.contains("取適法"), "{kept:?}");
+        for text in [
+            "訴えは不適法第1条。",
+            "手続は非適法第1条。",
+            "行為は違法第1条。",
+            "処分は適法第1条。",
+            "契約の方法第1条。",
+            "この寫法第1条。",
+            "は取適法第3条。",
+        ] {
+            let hits = check_text(&db, &OfflineEgov, text, "2026-11-13", false);
+            if text.starts_with("は取適法") {
+                assert_eq!(hits.len(), 1, "{text} {hits:?}");
+                assert!(hits[0].citation.contains("取適法"), "{text} {hits:?}");
+            } else {
+                assert!(hits.is_empty(), "{text} {hits:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn toriteki_inside_a_note_makes_the_following_douhou_ambiguous() {
+        let db = db();
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2026-11-11",
+            "2026-11-11",
+            "bundle",
+            &["民法".into()],
+            &[
+                article("709", "第709条", "不法行為の本文。"),
+                article("710", "第710条", "財産以外の損害。"),
+            ],
+        )
+        .unwrap();
+        db.replace_law(
+            "331AC0000000120",
+            "製造委託等に係る中小受託事業者に対する代金の支払の遅延等の防止に関する法律",
+            "",
+            "2026-11-11",
+            "2026-11-11",
+            "bundle",
+            &["取適法".into()],
+            &[article("1", "第1条", "取適の本文。")],
+        )
+        .unwrap();
+        let hits = check_text(
+            &db,
+            &OfflineEgov,
+            "民法第709条（取適法の適用を除く。）及び同法第710条",
+            "2026-11-13",
+            false,
+        );
+        assert!(
+            hits.iter().any(|hit| hit.reason.contains("曖昧")),
+            "{hits:?}"
+        );
     }
 
     #[test]

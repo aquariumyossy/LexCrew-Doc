@@ -21,7 +21,11 @@ export function normalizeAlias(text: string): string {
     .join("");
 }
 
-export const GROUP_LABELS: string[] = (shared.group_labels ?? [])
+const sharedGroups = Array.isArray(shared.group_labels) ? shared.group_labels : [];
+const sharedEntries = Array.isArray(shared.entries) ? (shared.entries as Entry[]) : [];
+const extraEntries = Array.isArray(extras.entries) ? (extras.entries as Entry[]) : [];
+
+export const GROUP_LABELS: string[] = sharedGroups
   .map((label) => normalizeAlias(label))
   .filter((label) => Array.from(label).length >= 2);
 
@@ -66,10 +70,7 @@ function loadEntries(entries: Entry[]): CatalogAlias[] {
   return out;
 }
 
-export const CATALOG_ALIASES: CatalogAlias[] = loadEntries([
-  ...(shared.entries as Entry[]),
-  ...(extras.entries as Entry[]),
-]);
+export const CATALOG_ALIASES: CatalogAlias[] = loadEntries([...sharedEntries, ...extraEntries]);
 
 /** Longest shared law name that is the whole window or its tail. */
 export function longestListedName(window: string): string | null {

@@ -289,16 +289,8 @@ fn store_fetched(
     };
     // One article does not make the rest of the law current.
     let stored_as_of = today.to_string();
-    if db
-        .upsert_article(&law.law_id, &article, &stored_as_of)
-        .is_err()
-    {
-        return miss(
-            law_query,
-            article_query,
-            "取得した条文を保存できませんでした。",
-        );
-    }
+    // A read-only database still returns the text we just fetched.
+    let _ = db.upsert_article(&law.law_id, &article, &stored_as_of);
     let _ = as_of;
     let mut names = db.aliases_of(&law.law_id).unwrap_or_default();
     if !names.iter().any(|n| n == &name) {

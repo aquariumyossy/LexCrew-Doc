@@ -1425,23 +1425,12 @@ fn is_latin_letter(c: char) -> bool {
     )
 }
 
-/// `X民法` keeps 民法. `A違法` falls back to 違法 so the deny list still applies.
-/// `PL法` stays whole because that whole name is listed.
+/// `PL法` stays whole because that whole name is listed. `JR会社法` and `X民法`
+/// stay whole too, so they are not reduced to the inner law. `A違法` falls back
+/// to 違法 so the deny list still applies.
 fn peel_latin_before_listed_law(text: String, start: usize) -> (String, usize) {
     if crate::statute::catalog::is_listed_name(&text) {
         return (text, start);
-    }
-    if let Some(name) = crate::statute::catalog::longest_listed_name_suffix(&text) {
-        if name != text {
-            let prefix_bytes = text.len() - name.len();
-            if text.is_char_boundary(prefix_bytes) {
-                let prefix = &text[..prefix_bytes];
-                if prefix.chars().next_back().is_some_and(is_latin_letter) {
-                    let skip = prefix.chars().count();
-                    return (name.to_string(), start + skip);
-                }
-            }
-        }
     }
     let skipped = text.chars().take_while(|c| is_latin_letter(*c)).count();
     if skipped > 0 {
@@ -3794,13 +3783,30 @@ mod tests {
             &[article("709", "第709条", "不法行為の本文。")],
         )
         .unwrap();
-        for text in ["X民法第709条", "原告X民法第709条", "AI民法第709条", "被告Y民法第709条", "民法（Act No. 89 of 1896）第709条"] {
+        for (text, name) in [
+            ("X民法第709条", "X民法"),
+            ("原告X民法第709条", "原告X民法"),
+            ("AI民法第709条", "AI民法"),
+            ("被告Y民法第709条", "被告Y民法"),
+            ("JR会社法第1条", "JR会社法"),
+            ("US特許法第101条", "US特許法"),
+            ("A取適法第3条", "A取適法"),
+        ] {
             let hits = check_text(&db, &OfflineEgov, text, "2026-11-13", false);
             assert_eq!(hits.len(), 1, "{text} {hits:?}");
-            assert_eq!(hits[0].label, "一致", "{text} {hits:?}");
-            assert!(hits[0].citation.contains("民法"), "{text} {hits:?}");
-            assert!(!hits[0].citation.contains("X民法"), "{text} {hits:?}");
+            assert_eq!(hits[0].label, "要確認", "{text} {hits:?}");
+            assert!(hits[0].reason.contains("特定できません"), "{text} {hits:?}");
+            assert!(hits[0].citation.contains(name), "{text} {hits:?}");
         }
+        let glossed = check_text(
+            &db,
+            &OfflineEgov,
+            "民法（Act No. 89 of 1896）第709条",
+            "2026-11-13",
+            false,
+        );
+        assert_eq!(glossed.len(), 1, "{glossed:?}");
+        assert_eq!(glossed[0].label, "一致", "{glossed:?}");
         for text in ["A違法第1条", "A適法第1条", "A方法第1条", "PDCA手法第1条", "Ｂ方法第1条"] {
             let hits = check_text(&db, &OfflineEgov, text, "2026-11-13", false);
             assert!(hits.is_empty(), "{text} {hits:?}");

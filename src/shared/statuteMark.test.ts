@@ -237,10 +237,17 @@ describe("markUnverified", () => {
     expect(markUnverified("方法第1条。", [])).not.toContain("要確認");
     expect(markUnverified("寫法第1条。", [])).not.toContain("要確認");
     expect(markUnverified("写法第1条。", [])).not.toContain("要確認");
-    expect(markUnverified("X民法第709条", [{ names: ["民法"], key: "709" }])).not.toContain("要確認");
-    expect(markUnverified("原告X民法第709条", [{ names: ["民法"], key: "709" }])).not.toContain("要確認");
-    expect(markUnverified("被告Y民法第709条", [{ names: ["民法"], key: "709" }])).not.toContain("要確認");
-    expect(markUnverified("A取適法第3条", [{ names: ["取適法"], key: "3" }])).not.toContain("要確認");
+    for (const [sample, names, key] of [
+      ["X民法第709条", ["民法"], "709"],
+      ["原告X民法第709条", ["民法"], "709"],
+      ["被告Y民法第709条", ["民法"], "709"],
+      ["AI民法第709条", ["民法"], "709"],
+      ["JR会社法第1条", ["会社法"], "1"],
+      ["US特許法第101条", ["特許法"], "101"],
+      ["A取適法第3条", ["取適法"], "3"],
+    ] as const) {
+      expect(markUnverified(sample, [{ names: [...names], key }]), sample).toContain(`${sample}（要確認）`);
+    }
     expect(markUnverified("民法（Act No. 89 of 1896）第709条", [{ names: ["民法"], key: "709" }])).not.toContain("要確認");
     expect(markUnverified("A違法第1条", [])).not.toContain("要確認");
     expect(markUnverified("PDCA手法第1条", [])).not.toContain("要確認");

@@ -3,7 +3,7 @@
  * Law names come from the same catalog the Rust checker uses.
  */
 import catalog from "./lawCatalog.json";
-import { CATALOG_ALIASES, listedNameWins, longestListedName, type CatalogAlias } from "./statuteAliases";
+import { CATALOG_ALIASES, listedNameWins, type CatalogAlias } from "./statuteAliases";
 
 export const TOOL_RESULT_OMITTED = "（文脈の上限に達したため、この結果は省略しました）";
 export const TOOL_RESULT_TRUNCATION_NOTE = "…（長いので省略しました）";
@@ -1211,19 +1211,10 @@ function isLatinLetter(c: string): boolean {
   return /[A-Za-z\uFF21-\uFF3A\uFF41-\uFF5A]/u.test(c);
 }
 
-/** `X民法` keeps 民法. `PL法` stays whole because that whole name is listed. */
+/** `PL法` stays whole because that whole name is listed. `JR会社法` and `X民法` stay whole too. */
 function peelLatinBeforeListedLaw(name: string): string {
   if (CATALOG_ALIASES.some((hit) => hit.alias === name)) {
     return name;
-  }
-  const listed = longestListedName(name);
-  if (!listed || listed === name) {
-    return peelLeadingLatinDeny(name);
-  }
-  const prefix = name.slice(0, name.length - listed.length);
-  const last = Array.from(prefix).pop() ?? "";
-  if (isLatinLetter(last)) {
-    return listed;
   }
   return peelLeadingLatinDeny(name);
 }

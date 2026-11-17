@@ -214,6 +214,17 @@ describe("foreign Han in tool arguments", () => {
     beginToolTurn();
   });
 
+  it("writes JIS and CP932 names such as 髙橋 and 𠮷田", async () => {
+    const signal = new AbortController().signal;
+    const result = await executeToolCall(
+      insertCall({ blocks: [{ type: "body", text: "甲は髙橋および𠮷田姜砺薮疱碍涛とする。" }] }),
+      DEFAULT_SETTINGS,
+      signal
+    );
+    expect(result.ok).toBe(true);
+    expect(insertDraftParagraphs).toHaveBeenCalledTimes(1);
+  });
+
   it("refuses insert_blocks that mix simplified Chinese and does not count the attempt", async () => {
     const signal = new AbortController().signal;
     const rejected = await executeToolCall(

@@ -64,10 +64,15 @@ describe("ChatPane tool names", () => {
 
 describe("ChatPane foreign character notice", () => {
   it("warns when the assistant reply mixes simplified Chinese", () => {
-    const markup = html([message({ content: "这个条款を直しました。" })]);
+    const markup = html([message({ content: "这问条款を直しました。" })]);
     expect(markup).toContain("日本語で用いない文字");
     expect(markup).toContain("这");
-    expect(markup).toContain("个");
+    expect(markup).toContain("问");
+  });
+
+  it("does not warn on CP932 names or 𠮷", () => {
+    const markup = html([message({ content: "当事者は髙橋と𠮷田です。" })]);
+    expect(markup).not.toContain("日本語で用いない文字");
   });
 
   it("warns when the assistant reply slips into Korean", () => {
